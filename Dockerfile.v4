@@ -1,0 +1,117 @@
+From r-base:3.5.0
+RUN apt-get update
+#RUN apt-get update && apt-get install -y python3
+
+RUN apt-get -y install libxml2-dev python-pip python-dev git libcairo2-dev libxt-dev xorg openbox software-properties-common openssl libcurl4-openssl-dev libssl-dev wget net-tools default-jre default-jdk time curl
+
+RUN pip install --upgrade pip
+
+#install cmake
+RUN wget http://www.cmake.org/files/v3.12/cmake-3.12.1.tar.gz
+RUN tar -zxvf cmake-3.12.1.tar.gz
+RUN cd cmake-3.12.1 && ./bootstrap
+RUN cd cmake-3.12.1 && make && make install
+
+#install liknorm
+RUN git clone https://github.com/glimix/liknorm.git
+RUN cd liknorm && mkdir build && cd build && cmake .. && make && make install
+
+#install Python packages
+RUN pip install numpy
+RUN pip install scipy
+RUN pip install h5py
+
+#install HDF5
+RUN wget -O hdf5.tar.gz http://gecftools.epfl.ch/hdf5-1.10.4-linux-centos7-x86_64-gcc485-shared.tar.gz
+RUN tar -zxf hdf5.tar.gz
+
+ENV LD_LIBRARY_PATH=/hdf5-1.10.4-linux-centos7-x86_64-gcc485-shared/lib/
+ENV PATH=$PATH:/hdf5-1.10.4-linux-centos7-x86_64-gcc485-shared/bin
+
+RUN cd /hdf5-1.10.4-linux-centos7-x86_64-gcc485-shared/bin && ./h5redeploy -force
+
+#Install R packages
+RUN Rscript -e "install.packages('R6', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('bit64', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('Rtsne', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('networkD3', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('jsonlite', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('d3heatmap', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('data.table', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('devtools', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('flexmix', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('rPython', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('statmod', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('plotly', repos='http://stat.ethz.ch/CRAN/'); \
+install.packages('onlinePCA', repos='http://stat.ethz.ch/CRAN/'); \
+devtools::install_github(repo = 'mojaveazure/loomR', ref = 'develop'); \
+devtools::install_github('tallulandrews/M3Drop'); \
+devtools::install_github(repo = 'satijalab/seurat', ref = 'release/3.0'); \
+if (!requireNamespace('BiocManager', quietly = TRUE)) install.packages('BiocManager'); \
+BiocManager::install('sva', version = '3.8'); \ 
+BiocManager::install('DESeq2', version = '3.8'); \
+BiocManager::install('edgeR', version = '3.8'); \
+BiocManager::install('limma', version = '3.8'); \
+BiocManager::install('cluster', version = '3.8'); \
+BiocManager::install('Cairo', version = '3.8'); \
+BiocManager::install('scater', version = '3.8'); \
+BiocManager::install('SC3', version = '3.8'); \
+BiocManager::install('scde', version = '3.8'); \
+BiocManager::install('genefilter', version = '3.8'); \
+BiocManager::install('XVector', version = '3.8'); \
+"
+
+#Install hdf5r
+
+RUN wget -O hdf5r_1.0.1.tar.gz https://cran.r-project.org/src/contrib/hdf5r_1.0.1.tar.gz
+RUN R --no-site-file --no-environ --no-save --no-restore --quiet CMD INSTALL --configure-args="--with-hdf5=/hdf5-1.10.4-linux-centos7-x86_64-gcc485-shared/bin/h5cc" hdf5r_1.0.1.tar.gz
+
+RUN pip install leidenalg
+RUN pip install 'numba==0.42.0'
+RUN pip install scikit-learn
+RUN pip install umap-learn
+
+RUN echo 'deb http://deb.debian.org/debian bullseye main' > /etc/apt/sources.list
+RUN apt-get -y update
+RUN apt-get -y install python3-pip 
+
+#install Python3 packages
+RUN python3 -m pip install numpy
+RUN python3 -m pip install scipy
+RUN python3 -m pip install h5py
+RUN python3 -m pip install scikit-learn
+RUN python3 -m pip install pandas
+RUN python3 -m pip install matplotlib
+
+## patch reinstall LoomR
+#RUN Rscript -e "devtools::install_github(repo = 'mojaveazure/loomR', ref = 'develop')"
+
+RUN Rscript -e "install.packages('future.apply')"
+#RUN Rscript -e "BiocManager::install('grimbough/rhdf5')"
+RUN Rscript -e "devtools::install_github('grimbough/rhdf5')"
+
+ENV USER=rvmuser USER_ID=1006 USER_GID=1006
+
+# now creating user NO NEED IN LAST INSTALL
+RUN groupadd --gid "${USER_GID}" "${USER}" && \
+    useradd \
+      --uid ${USER_ID} \
+      --gid ${USER_GID} \
+      --create-home \
+      --shell /bin/bash \
+${USER}
+
+USER ${USER}
+#COPY user_mapping.sh /
+#RUN chmod u+x user_mapping.sh
+
+#ENTRYPOINT ["/user_mapping.sh"]
+
+LABEL maintainer="Fabrice P.A. David <fabrice.david@epfl.ch>"
+
+ARG DUMMY=unknown
+RUN DUMMY=${DUMMY}
+COPY srv /srv
+WORKDIR /srv
+#RUN apt-get -y install postgresql postgresql-contrib postgresql-client
+
