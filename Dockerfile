@@ -85,9 +85,9 @@ COPY lib/hdf5-1.10.6-linux-centos7-x86_64-shared.tar.gz hdf5.tar.gz
 RUN tar -zxf hdf5.tar.gz
 #RUN wget -O hdf5.tar.gz http://gecftools.epfl.ch/share/fab/hdf5-1.10.6-linux-centos7-x86_64-shared.tar.gz; tar -zxf hdf5.tar.gz
 #RUN tar -zxf hdf5.tar.gz
-ENV LD_LIBRARY_PATH=/hdf5-1.10.6-linux-centos7-x86_64-gcc485-shared/lib/
-ENV PATH=$PATH:/hdf5-1.10.6-linux-centos7-x86_64-gcc485-shared/bin
-RUN cd /hdf5-1.10.6-linux-centos7-x86_64-shared/bin && ./h5redeploy -force && cd / && rm hdf5.tar.gz && rm -rf hdf5-1.10.6-linux-centos7-x86_64-shared
+ENV LD_LIBRARY_PATH=/hdf5/lib/
+ENV PATH=$PATH:/hdf5/bin
+RUN cd /hdf5/bin && ./h5redeploy -force && cd / && rm hdf5.tar.gz && rm -rf hdf5
 
 #Install R packages
 
