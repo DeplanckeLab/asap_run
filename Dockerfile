@@ -87,7 +87,7 @@ RUN tar -zxf hdf5.tar.gz
 #RUN tar -zxf hdf5.tar.gz
 ENV LD_LIBRARY_PATH=/hdf5/lib/
 ENV PATH=$PATH:/hdf5/bin
-RUN cd /hdf5/bin && ./h5redeploy -force && cd / && rm hdf5.tar.gz && rm -rf hdf5
+RUN cd /hdf5/bin && ./h5redeploy -force && cd / && rm hdf5.tar.gz
 
 #Install R packages
 
