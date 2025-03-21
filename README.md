@@ -14,5 +14,6 @@ docker pull fabdavid/asap_run:v7
 ```
 
 # How to extract the list of R package versions from a docker
-```grep -Ri "^version:" /usr/local/lib/R/site-library/ | grep DESCRIPTION
+```bash
+grep -Ri "^version:" /usr/local/lib/R/library/ | grep DESCRIPTION
 ```
