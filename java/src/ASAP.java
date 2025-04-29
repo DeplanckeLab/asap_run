@@ -38,7 +38,7 @@ import tools.Utils;
 /**
  * @author Vincent Gardeux
  */
-public class ASAP 
+public class ASAP
 {
 	public static Mode m = null;
 	
