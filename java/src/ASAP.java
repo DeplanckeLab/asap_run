@@ -36,7 +36,7 @@ import scaling.Scaling;
 import tools.Utils;
 
 /**
- * @author gardeux
+ * @author Vincent Gardeux
  */
 public class ASAP 
 {
