@@ -41,17 +41,19 @@ import tools.Utils;
 public class ASAP
 {
 	public static Mode m = null;
+	public static final String MATCHING_DATA_DB_NAME = "asap2_data_v7";
+	public static final String MATCHING_ANNOT_DB_NAME = "asap2_development";
 	
 	public static void main(String[] args)
 	{
 		DBManager.JDBC_DRIVER = Config.driver;
-		DBManager.URL = Config.ConfigMAIN().getURL("asap2_data_v7");
+		DBManager.URL = Config.ConfigMAIN().getURL(MATCHING_DATA_DB_NAME);
 		
 		if(args.length == 0) readMode(args);
 		
 		// Check if debug mode
 		String[] args2 = isDebug(args);
-		if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL("asap2_data_v7");
+		if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL(MATCHING_DATA_DB_NAME);
 		
 		// Check which tool is called
 		args2 = readMode(args2);
@@ -84,7 +86,13 @@ public class ASAP
 				DE.performDE();
 				break;
 			case FindMarkers:
-				DE.findMarkers();
+				// Recuperate the indexes of all categories for this metadata
+				if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL(MATCHING_ANNOT_DB_NAME); // Annotations/Metadata are not in same DB
+				else DBManager.URL = Config.ConfigMAIN().getURL(MATCHING_ANNOT_DB_NAME);
+				DBManager.connect();
+				HashMap<String, Integer> categories = DBManager.getListCatJSON(Parameters.id);
+				DBManager.disconnect();
+				DE.findMarkers(categories);
 				break;
 			case Normalization: 
 				Normalization.runNormalization();
@@ -109,10 +117,10 @@ public class ASAP
 				break;
 			case IndexByCell:			
 				// Recuperate the indexes of all categories for this metadata
-				if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL("asap2_development"); // Annotations/Metadata are not in same DB
-				else DBManager.URL = Config.ConfigMAIN().getURL("asap2_development");
+				if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL(MATCHING_ANNOT_DB_NAME); // Annotations/Metadata are not in same DB
+				else DBManager.URL = Config.ConfigMAIN().getURL(MATCHING_ANNOT_DB_NAME);
 				DBManager.connect();
-				HashMap<String, Integer> categories = DBManager.getListCatJSON(Parameters.id);
+				categories = DBManager.getListCatJSON(Parameters.id);
 				DBManager.disconnect();
 				
 				// Reading Loom with metadata to index
@@ -172,8 +180,8 @@ public class ASAP
 				break;
 			case GetIndex:
 				// Handle correct DB
-				if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL("asap2_development"); // Annotations/Metadata are not in same DB
-				else DBManager.URL = Config.ConfigMAIN().getURL("asap2_development");
+				if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL(MATCHING_ANNOT_DB_NAME); // Annotations/Metadata are not in same DB
+				else DBManager.URL = Config.ConfigMAIN().getURL(MATCHING_ANNOT_DB_NAME);
 				
 				// First, recuperate the list of cells (stable_ids)
 				long[] cellsToCheck = FilterCellsJSON.parseJSON(Parameters.JSONFileName).selected_cells; // Stable_ids
@@ -266,8 +274,8 @@ public class ASAP
 				if(Parameters.id != -1) // Then Parameters.index is also set
 				{
 					// Handle correct DB
-					if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL("asap2_development"); // Annotations/Metadata are not in same DB
-					else DBManager.URL = Config.ConfigMAIN().getURL("asap2_development");
+					if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL(MATCHING_ANNOT_DB_NAME); // Annotations/Metadata are not in same DB
+					else DBManager.URL = Config.ConfigMAIN().getURL(MATCHING_ANNOT_DB_NAME);
 									
 					// Recuperate the indexes of all categories for this metadata
 					DBManager.connect();

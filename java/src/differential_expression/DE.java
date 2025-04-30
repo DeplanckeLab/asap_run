@@ -58,16 +58,9 @@ public class DE
 		catch(IOException ioe) { new ErrorJSON(ioe.getMessage()); }
 	}
 	
-	public static void findMarkers()
+	public static void findMarkers(HashMap<String, Integer> categories)
 	{
 		long nber_genes = 0;
-		
-		// Recuperate the indexes of all categories for this metadata
-		if(Parameters.debugMode) DBManager.URL = Config.ConfigDEV().getURL("asap2_development"); // Annotations/Metadata are not in same DB
-		else DBManager.URL = Config.ConfigMAIN().getURL("asap2_development");
-		DBManager.connect();
-		HashMap<String, Integer> categories = DBManager.getListCatJSON(Parameters.id);
-		DBManager.disconnect();
 		
     	// Open Loom file in read-only and read metadata
     	loom = new LoomFile("r", Parameters.loomFile);
