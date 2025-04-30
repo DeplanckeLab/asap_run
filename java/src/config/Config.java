@@ -1,64 +1,52 @@
 package config;
 
-import java.io.InputStream;
-import java.util.Properties;
-
 import json.ErrorJSON;
 
 public class Config 
 {
-	private Properties configFile;
-	private String dbHost = "postgres:5434"; // Local access from the machine
+	private String dbHost = "postgres:5434"; // Default local host and port
 	public static final String driver = "org.postgresql.Driver";
-	
-	private Config(String config_file, String dbHost)
+
+	private Config() {}
+
+	private Config(String dbHost)
 	{
-		this(config_file);
 		this.dbHost = dbHost;
 	}
-	
-	private Config(String config_file)
-	{
-		this.configFile = new java.util.Properties();
-		try 
-		{
-			InputStream is = Config.class.getClassLoader().getResourceAsStream(config_file);
-			if(is == null) is = Config.class.getClassLoader().getResourceAsStream("config/" + config_file);
-			this.configFile.load(is);
-		}
-		catch(Exception eta)
-		{
-		    new ErrorJSON(eta.getMessage());
-		}
-	}
-	
+
 	public static Config ConfigMAIN()
 	{
-		return new Config("asap.conf");
+		return new Config();
 	}
-	
+
 	public static Config ConfigDEV()
 	{
-		return new Config("asap.conf", "updeplasrv4-new.epfl.ch:5433"); // Access via intranet - No internet access
+		return new Config("updeplasrv4-new.epfl.ch:5433"); // Access via intranet
 	}
-		
-	private String getValue(String key) 
+
+	public String getHost()
 	{
-		return configFile.getProperty(key);
+		return this.dbHost;
 	}
 	
-	public String getProperty(String key)
+	private String getEnv(String key, boolean required)
 	{
-		return this.getValue(key);
+		String value = System.getenv(key);
+		if (required && (value == null || value.isEmpty())) new ErrorJSON("Missing required environment variable: " + key);
+		return value;
 	}
-	
+
 	public String getURL(String dbName)
 	{
-		return "jdbc:postgresql://" + this.dbHost + "/" + dbName + "?user=" + this.getProperty("mDbUser") + "&password=" + this.getProperty("mDbPwds");
+		String user = getEnv("POSTGRES_USER", true);
+		String password = getEnv("POSTGRES_PASSWORD", true);
+		return "jdbc:postgresql://" + this.dbHost + "/" + dbName + "?user=" + user + "&password=" + password;
 	}
-	
+
 	public String getURLFromHost(String dbHostName)
 	{
-		return "jdbc:postgresql://" + dbHostName + "?user=" + this.getProperty("mDbUser") + "&password=" + this.getProperty("mDbPwds");
+		String user = getEnv("POSTGRES_USER", true);
+		String password = getEnv("POSTGRES_PASSWORD", true);
+		return "jdbc:postgresql://" + dbHostName + "?user=" + user + "&password=" + password;
 	}
 }
