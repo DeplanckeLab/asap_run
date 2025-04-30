@@ -1,5 +1,3 @@
-/config/asap.conf
-/.gitignore
 /ASAP.class
 /bigarrays/
 /compression/
@@ -9,6 +7,7 @@
 /dim_reduction/
 /enrichment/
 /filtering/
+/hdf5/
 /json/
 /model/
 /module_score/

@@ -2620,16 +2620,16 @@ public class Parameters
 				System.out.println("-adj %s \tStatitical adjustment method for multiple comparision [bonferroni, fdr, or none, default = fdr].");
 				System.out.println("-min %i \tMinimum number of genes in a pathway for being taken into consideration [default = 15].");
 				System.out.println("-max %i \tMaximum number of genes in a pathway for being taken into consideration [default = 500].");
-				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getProperty("mDbHost") + ")");
-				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getProperty("mDbHost") + ")");
+				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getHost() + ")");
+				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getHost() + ")");
 				break;
 			case MarkerEnrichment: 
 				System.out.println("MarkerEnrichment Mode\n\nOptions:");
 				System.out.println("-o | --output-folder %s \t[Required] Output folder");
 				System.out.println("-i | --input-folder %s \t\t[Required] The folder path containing the FindMarker's output");
 				System.out.println("--genesets %i,%i,... \t\t[Required]Id of the gene_sets to use for enrichment in the DB (separated by comma, if multiple).");
-				if(Parameters.debugMode) System.out.println("-h %s \t\t\t\tTo change specific host (default is " + Config.ConfigDEV().getProperty("mDbHost") + ")");
-				else System.out.println("-h %s \t\t\t\tTo change specific host (default is " + Config.ConfigMAIN().getProperty("mDbHost") + ")");
+				if(Parameters.debugMode) System.out.println("-h %s \t\t\t\tTo change specific host (default is " + Config.ConfigDEV().getHost() + ")");
+				else System.out.println("-h %s \t\t\t\tTo change specific host (default is " + Config.ConfigMAIN().getHost() + ")");
 				break;
 			case ModuleScore: 
 				System.out.println("ModuleScore Mode\n\nOptions:");
@@ -2644,8 +2644,8 @@ public class Parameters
 				System.out.println("-nBackgroundGenes %i \tNumber of background gene to take randomly (with replacement) from one features' same bin (default = 100)");
 				System.out.println("-nBins %i \tNumber of bins to generate (default = 24)");
 				System.out.println("-sel %s \tIn case of a metadata, name of the reference selection");
-				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getProperty("mDbHost") + ")");
-				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getProperty("mDbHost") + ")");
+				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getHost() + ")");
+				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getHost() + ")");
 				break;
 			case Preparsing: 
 				System.out.println("Preparsing Mode\n\nOptions:");
@@ -2658,8 +2658,8 @@ public class Parameters
 				System.out.println("-d %s \t\tDelimiter.");
 				System.out.println("--row-names %s\tMetadata to use for row names of main matrix");
 				System.out.println("--col-names %s\tMetadata to use for row names of main matrix");
-				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getProperty("mDbHost") + ")");
-				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getProperty("mDbHost") + ")");
+				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getHost() + ")");
+				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getHost() + ")");
 				break;
 			case Parsing: 
 				System.out.println("Parsing Mode\n\nOptions:");
@@ -2675,8 +2675,8 @@ public class Parameters
 				System.out.println("-d %s \t\tDelimiter.");
 				System.out.println("--row-names %s\tMetadata to use for row names of main matrix");
 				System.out.println("--col-names %s\tMetadata to use for col names of main matrix");
-				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getProperty("mDbHost") + ")");
-				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getProperty("mDbHost") + ")");
+				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getHost() + ")");
+				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getHost() + ")");
 				break;
 			case PreparseMetadata: 
 				System.out.println("Preparse Metadata Mode\n\nOptions:");
@@ -2798,8 +2798,8 @@ public class Parameters
 			case UpdateEnsemblDB:
 				System.out.println("UpdateEnsemblDB\n\nOptions:");
 				System.out.println("-o %s \t\tOutput folder.");
-				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getProperty("mDbHost") + ")");
-				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getProperty("mDbHost") + ")");
+				if(Parameters.debugMode) System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigDEV().getHost() + ")");
+				else System.out.println("-h %s \t\tTo change specific host (default is " + Config.ConfigMAIN().getHost() + ")");
 				break;
 			case CreateKeggDB:
 				System.out.println("CreateKeggDB\n\nOptions:");
