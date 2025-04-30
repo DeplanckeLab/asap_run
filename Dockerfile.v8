@@ -65,7 +65,7 @@ LABEL maintainer="Fabrice P.A. David <fabrice.david@epfl.ch>"
 # Copy data to image
 COPY R /srv
 COPY python /srv
-COPY java /srv
+COPY java/bin /srv
 COPY bin /srv
 
 # Working directory
