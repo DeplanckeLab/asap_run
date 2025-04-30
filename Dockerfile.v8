@@ -48,6 +48,17 @@ RUN rm /tmp/*.tar.gz
 # User
 ENV USER=rvmuser USER_ID=1006 USER_GID=1006
 
+# now creating user NO NEED IN LAST INSTALL
+RUN groupadd --gid "${USER_GID}" "${USER}" && \
+    useradd \
+      --uid ${USER_ID} \
+      --gid ${USER_GID} \
+      --create-home \
+      --shell /bin/bash \
+${USER}
+
+USER ${USER}
+
 # Maintainer
 LABEL maintainer="Fabrice P.A. David <fabrice.david@epfl.ch>"
 

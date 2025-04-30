@@ -100,7 +100,7 @@ data.seurat <- ScaleData(data.seurat, features = rownames(data.seurat), verbose 
 data.seurat <- RunPCA(data.seurat, features = VariableFeatures(data.seurat), verbose = F, npcs = input_n_pcs)
 
 # Run Harmony
-png(output_convergence_plot, width = 800, height = 800)
+png(output_convergence_plot, width = 800, height = 800, type = "cairo")
 data.seurat <- RunHarmony(object = data.seurat, group.by.vars = "orig.ident", plot_convergence = TRUE, early_stop = T, reduction.use = "pca", dims.use = 1:input_n_pcs)
 #data.seurat <- RunHarmony(object = data.seurat, group.by.vars = "orig.ident", plot_convergence = TRUE, max_iter = 100, early_stop = F, reduction.use = "pca", dims.use = 1:input_n_pcs)
 dev.off()
