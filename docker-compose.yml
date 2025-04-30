@@ -1,0 +1,9 @@
+### need to change the tag of the image when the Dockerfile links to a new version of asap_run
+
+services:
+  asap_run:
+    build: .
+    image: fabdavid/asap_run:v8
+    env_file:
+      - '.env'
+    

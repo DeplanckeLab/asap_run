@@ -1,3 +1,13 @@
+# Building asap_run
+
+Edit new Dockerfile.vX
+Update Dockerfile symlink
+Edit image tag in docker-compose.yml
+
+docker-compose build
+
+### OLD
+
 # asap_run
 ASAP container for running all pipeline code
 
