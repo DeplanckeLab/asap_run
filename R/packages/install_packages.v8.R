@@ -28,6 +28,7 @@ install.cran <- function(package, version, host="cran.r-project.org") {
 install.bioconductor <- function(package, version, bioconductor_version, source = "bioc"){
   main_url <- paste0("https://www.bioconductor.org/packages/release/",source,"/src/contrib/",package,"_",version,".tar.gz")
   archive_url <- paste0("https://www.bioconductor.org/packages/",bioconductor_version,"/",source,"/src/contrib/Archive/",package,"/",package,"_",version,".tar.gz")
+  archive_url_2 <- paste0("https://www.bioconductor.org/packages/",bioconductor_version,"/",source,"/src/contrib/",package,"_",version,".tar.gz")
  
   tmp_file <- tempfile(fileext = ".tar.gz")
 
@@ -45,8 +46,17 @@ install.bioconductor <- function(package, version, bioconductor_version, source 
           install.packages(tmp_file, repos = NULL, type = "source")
           unlink(tmp_file)
         }, error = function(e) {
-          message("Both installation attempts failed: ", e$message)
-		  quit(status = 1)
+		  message("Second attempt failed: ", e$message)
+		  message("Trying to install from Bioconductor archive 2...")
+
+		  tryCatch({
+			  suppressWarnings(download.file(archive_url_2, tmp_file, mode = "wb"))
+			  install.packages(tmp_file, repos = NULL, type = "source")
+			  unlink(tmp_file)
+			}, error = function(e) {
+			  message("3 installation attempts failed: ", e$message)
+			  quit(status = 1)
+			})
         })
     })
 }
