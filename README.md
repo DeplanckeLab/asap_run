@@ -23,6 +23,23 @@ You can pull any version by using the pull commmand:
 docker pull fabdavid/asap_run:v7
 ```
 
+# How to run a command from a container:
+
+- You can open a shell in a Docker, and for example run "Rscript" from within the container
+```bash
+docker run -it fabdavid/asap_run:v8 bash
+```
+Then run
+```bash
+Rscript myscript.R
+```
+
+- You can also directly run the command from within the container, but without entering the container per se
+```bash
+docker run --rm fabdavid/asap_run:v8 Rscript myscript.R
+```
+Note: Use the -v option to mount any volume on the Docker container, so that you can access the necessary files
+  
 # How to extract the list of R package versions from a docker
 ```bash
 grep -Ri "^version:" /usr/local/lib/R/library/ | grep DESCRIPTION

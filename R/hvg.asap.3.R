@@ -2,11 +2,13 @@
 ## Project: ASAP
 ## Script purpose: HVG calculation v3
 ## Date: 2023 October 13
+## Updated: 2025-05-07
 ## Author: Vincent Gardeux (vincent.gardeux@epfl.ch)
 ##################################################
 
 # Parameters handling
 options(echo=TRUE)
+options(bitmapType='cairo') # Else, ggplotly tries to call png() and it throws a X11 exception
 args <- commandArgs(trailingOnly = TRUE)
 
 # Libraries
@@ -30,13 +32,13 @@ output_dir <- args[5]
 method <- args[6] # vst, dispersion, mean.var.plot
 n_features <- as.numeric(args[7]) # Number of features to select as top variable features; only used when selection.method is set to 'dispersion' or 'vst'
 
-#input_loom <- "grrpvn_parsing_output.loom"
+#input_loom <- "/data/gardeux/psf775_cell_filtering_677451_output.loom"
 #raw_dataset_path <- "/matrix"
-#norm_dataset_path <- "/layers/normalized"
-#output_dataset_path <- "/row_attrs/variable_features"
-#output_dir <- "./"
+#norm_dataset_path <- "/layers/norm_1_seurat"
+#output_dataset_path <- "/row_attrs/hvg_1_vst"
+#output_dir <- "/data/gardeux/psf775_cell_filtering_677451"
+#method <- "vst"
 #n_features <- 2000 # Default
-#method <- "mean.var.plot"
 
 # Parameters
 set.seed(42)
@@ -81,9 +83,9 @@ variableFeatures <- VariableFeatures(data.seurat)
 
 # Plot variable gene graphics
 p <- VariableFeaturePlot(data.seurat, raster = F)
-ggsave(plot = p, bg = "white", filename = paste0(output_dir,"hvg.seurat.png"), width = 8, height = 5)
+ggsave(plot = p, bg = "white", filename = paste0(output_dir,"hvg.seurat.png"), width = 8, height = 5, create.dir = TRUE)
 ggsave(plot = p, bg = "white", filename = paste0(output_dir,"hvg.seurat.pdf"), width = 8, height = 5)
-write(serialize(ggplotly(p)), file = paste0(output_dir,"hvg.seurat.json"), append=F)
+write(serialize(ggplotly(p)), file = paste0(output_dir,"hvg.seurat.json"), append = FALSE)
 
 # Writing the hvg in the loom file
 data.loom <- open_with_lock(input_loom, "r+")
