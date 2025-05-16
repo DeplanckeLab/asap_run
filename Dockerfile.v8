@@ -63,10 +63,10 @@ USER ${USER}
 LABEL maintainer="Fabrice P.A. David <fabrice.david@epfl.ch>"
 
 # Copy data to image
-COPY R /srv
-COPY python /srv
-COPY java/bin /srv
-COPY bin /srv
+COPY R/*.R /srv
+COPY python/*.py /srv
+COPY java/bin/*.jar /srv
+COPY bin/* /srv
 
 # Working directory
 WORKDIR /srv
