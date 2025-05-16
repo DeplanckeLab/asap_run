@@ -11,8 +11,6 @@ import org.apache.commons.math3.stat.inference.MannWhitneyUTest;
 import bigarrays.DoubleArray64;
 import bigarrays.LongArray64;
 import bigarrays.StringArray64;
-import config.Config;
-import db.DBManager;
 import hdf5.loom.LoomFile;
 import json.ErrorJSON;
 import json.WarningJSON;

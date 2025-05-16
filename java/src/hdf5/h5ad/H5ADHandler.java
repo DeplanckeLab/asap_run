@@ -245,7 +245,10 @@ public class H5ADHandler
 					{
 						// CATEGORICAL
 						float[] modified_values = new float[codes.length];
-						for(int i = 0; i < modified_values.length; i++) modified_values[i] = values[codes[i]];
+						for(int i = 0; i < modified_values.length; i++) {
+							if(codes[i] != -1) modified_values[i] = values[codes[i]];
+							else modified_values[i] = Float.NaN;
+						}
 						m.categories = new HashSet<String>();
 						for(float v:values) m.categories.add(""+v);
 						values = modified_values;
@@ -276,7 +279,10 @@ public class H5ADHandler
 					{
 						// CATEGORICAL
 						int[] modified_values = new int[codes.length];
-						for(int i = 0; i < modified_values.length; i++) modified_values[i] = values[codes[i]];
+						for(int i = 0; i < modified_values.length; i++) {
+							if(codes[i] != -1) modified_values[i] = values[codes[i]];
+							else modified_values[i] = -1;
+						}
 						m.categories = new HashSet<String>();
 						for(int v:values) m.categories.add(""+v);
 						values = modified_values;
@@ -303,7 +309,10 @@ public class H5ADHandler
 						{
 							// CATEGORICAL
 							String[] modified_values = new String[codes.length];
-							for(int i = 0; i < modified_values.length; i++) modified_values[i] = values[codes[i]];
+							for(int i = 0; i < modified_values.length; i++) {
+								if(codes[i] != -1) modified_values[i] = values[codes[i]];
+								else modified_values[i] = "__NA__";
+							}
 							m.categories = new HashSet<String>();
 							for(String v:values) m.categories.add(v);
 							values = modified_values;
@@ -320,7 +329,10 @@ public class H5ADHandler
 					{
 						// CATEGORICAL
 						String[] modified_values = new String[codes.length];
-						for(int i = 0; i < modified_values.length; i++) modified_values[i] = values[codes[i]];
+						for(int i = 0; i < modified_values.length; i++) {
+							if(codes[i] != -1) modified_values[i] = values[codes[i]];
+							else modified_values[i] = "__NA__";
+						}
 						m.categories = new HashSet<String>();
 						for(String v:values) m.categories.add(v);
 						values = modified_values;
