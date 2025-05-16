@@ -41,7 +41,7 @@ import tools.Utils;
 public class ASAP
 {
 	public static Mode m = null;
-	public static final String MATCHING_DATA_DB_NAME = "asap2_data_v7";
+	public static final String MATCHING_DATA_DB_NAME = "asap2_data_v8";
 	public static final String MATCHING_ANNOT_DB_NAME = "asap2_development";
 	
 	public static void main(String[] args)
