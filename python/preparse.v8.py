@@ -1,19 +1,10 @@
-import argparse
-import sys
-import os
-import h5py
-#import loompy
-import zipfile
-import tarfile
-import gzip
-import bz2
-import csv
-import json
-import subprocess
-import io
-import numpy as np
-from pathlib import Path
-from dataclasses import dataclass
+import argparse # Needed to parse arguments
+import sys # Needed for ErrorJSON
+import os # Needed for pathjoin and path/create dirs
+import h5py # Needed for parsing hdf5 files
+import json # For writing output files
+import numpy as np # For diverse array calculations
+from pathlib import Path # Needed for file extension manipulation
 
 custom_help = """
 Preparsing Mode
@@ -22,8 +13,8 @@ Options:
   -f %s             File to preparse.
   -o %s             Output folder.
   --organism %i     ID of the organism.
-  --header %s       The file has a header [true, false].
-  --col %s          Name Column [none, first, last].
+  --header %s       The file has a header [true, false] (default: true).
+  --col %s          Name Column [none, first, last] (default: first).
   --sel %s          Name of entry to load from archive or HDF5 (if multiple groups).
   --delim %s        Delimiter (default: tab).
   --row-names %s    Metadata column for row names of the main matrix.
@@ -36,34 +27,189 @@ class FileType:
     H5_10X = 'H5_10X'
     H5AD = 'H5AD'
     LOOM = 'LOOM'
+    RDS = 'RDS'
+    MTX = 'MTX'
     ARCHIVE = 'ARCHIVE'
     RAW_TEXT = 'RAW_TEXT'
     UNKNOWN = 'UNKNOWN'
 
-def decompress_if_needed(file_path):
-    suffix = Path(file_path).suffix.lower()
-    if suffix == '.gz':
-        p = subprocess.Popen(['pigz', '-dc', file_path], stdout=subprocess.PIPE, bufsize=10**8)
-        decompressed_data = p.stdout.read()
-        p.stdout.close()
-        p.wait()
-        return io.BytesIO(decompressed_data)
-    elif suffix in ['.bz2', '.bzip2']:
-        return bz2.open(file_path, 'rb')
-    elif suffix == '.zip':
+def extract_from_archive(file_path, sel):
+    with open(file_path, 'rb') as f:
+        magic = f.read(264)
+    
+    # zip (can contain multiple files)
+    if magic.startswith(b'PK\x03\x04'):
+        import zipfile, shutil
         with zipfile.ZipFile(file_path, 'r') as z:
-            names = z.namelist()
-            if len(names) != 1:
-                raise ValueError(f"ZIP archive must contain exactly one file, found: {names}")
-            return io.BytesIO(z.read(names[0]))
-    return open(file_path, 'rb')
+            # Filter only files (exclude directories)
+            file_paths = [f for f in z.namelist() if not f.endswith('/')]
+            if sel in file_paths:
+                # Extract the single file
+                extracted_path = z.extract(sel, path='.')
+                # Move the file to current dir, stripping folders
+                final_path = Path('.').resolve() / Path(sel).name
+                shutil.move(extracted_path, final_path)
+                # Optionally, remove the now-empty folder structure
+                file_path, archive_path = decompress_if_needed(str(final_path), sel)
+                return file_path[0]
+            else:
+                return None
 
-def check_file_type_from_stream(stream):
-    # Ensure stream at start
-    stream.seek(0)
-    # Try reading as HDF5
+    # tar (can contain multiple files)
+    if magic[257:262] == b'ustar':
+        import tarfile, shutil
+        with tarfile.open(file_path, mode='r:') as t:
+            # Filter only files (exclude directories)
+            file_paths = [m.name for m in t.getmembers() if m.isfile()]
+            if sel in file_paths:
+                # Extract the single file
+                t.extract(sel, path='.', filter='data')
+                extracted_path = Path('.') / sel
+                # Move the file to current dir, stripping folders
+                final_path = Path('.').resolve() / Path(sel).name
+                shutil.move(extracted_path, final_path)
+                # Optionally, remove the now-empty folder structure
+                file_path, archive_path = decompress_if_needed(str(final_path), sel)
+                return file_path[0]
+            else:
+                return None
+
+def decompress_if_needed(file_path, sel):
+    with open(file_path, 'rb') as f:
+        magic = f.read(264)
+
+    # gzip (cannot contain multiple files)
+    if magic.startswith(b'\x1f\x8b'):
+        import subprocess
+        output_path = Path(file_path).with_suffix('')
+        if output_path == Path(file_path):
+            output_path = output_path.with_name(output_path.name + '.out')
+        with open(output_path, 'wb') as f_out:
+            subprocess.run(["pigz", "-d", '-k', '-f', "-c", file_path], stdout=f_out, check=True)
+        return decompress_if_needed(str(output_path), sel)
+
+    # bzip2 (cannot contain multiple files)
+    if magic.startswith(b'BZh'):
+        import subprocess
+        output_path = Path(file_path).with_suffix('')
+        if output_path == Path(file_path):
+            output_path = output_path.with_name(output_path.name + '.out')
+        with open(output_path, 'wb') as f_out:
+            subprocess.run(["pbzip2", "-d", "-k", "-f", "-c", file_path], stdout=f_out, check=True)
+        return decompress_if_needed(str(output_path), sel)
+        
+    # xz (cannot contain multiple files)
+    if magic.startswith(b'\xfd7zXZ\x00'):
+        import subprocess
+        output_path = Path(file_path).with_suffix('')
+        if output_path == Path(file_path):
+            output_path = output_path.with_name(output_path.name + '.out')
+        with open(output_path, 'wb') as f_out:
+            subprocess.run(["pixz", "-d", "-k", "-c", file_path], stdout=f_out, check=True)
+        return decompress_if_needed(str(output_path), sel)
+
+    # zip (can contain multiple files)
+    if magic.startswith(b'PK\x03\x04'):
+        import zipfile, shutil
+        with zipfile.ZipFile(file_path, 'r') as z:
+            # Filter only files (exclude directories)
+            file_paths = [f for f in z.namelist() if not f.endswith('/')]
+            if len(file_paths) == 1:
+                # Extract the single file
+                extracted_path = z.extract(file_paths[0], path='.')
+                # Move the file to current dir, stripping folders
+                final_path = Path('.').resolve() / Path(file_paths[0]).name
+                shutil.move(extracted_path, final_path)
+                # Optionally, remove the now-empty folder structure
+                return decompress_if_needed(str(final_path), sel)
+            else:
+                # Multiple files
+                if sel:
+                    # If sel is defined, extract the required file
+                    if sel in file_paths:
+                        # Extract the single file
+                        extracted_path = z.extract(sel, path='.')
+                        # Move the file to current dir, stripping folders
+                        final_path = Path('.').resolve() / Path(sel).name
+                        shutil.move(extracted_path, final_path)
+                        # Optionally, remove the now-empty folder structure
+                        return decompress_if_needed(str(final_path), sel)
+                    else:
+                        ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
+                else:
+                    # MTX format in a zip archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
+                    if len(file_paths) == 3 and {{Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "features.tsv"} or {Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "genes.tsv"}}:
+                        final_file_paths = []
+                        # Extract all three files
+                        for fname in file_paths:
+                            # Extract the single file
+                            extracted_path = z.extract(fname, path='.')
+                            final_path = Path('.').resolve() / Path(fname).name
+                            shutil.move(extracted_path, final_path)
+                            final_file_paths.append(str(final_path))
+                        # Return None for archive path (use this to check later that it is a MTX format)
+                        return final_file_paths, None
+                    else:
+                        # If not, then return the list of files in the archive + the archive path
+                        return file_paths, file_path
+
+    # tar (can contain multiple files)
+    if magic[257:262] == b'ustar':
+        import tarfile, shutil
+        with tarfile.open(file_path, mode='r:') as t:
+            # Filter only files (exclude directories)
+            file_paths = [m.name for m in t.getmembers() if m.isfile()]
+            if len(file_paths) == 1:
+                # Extract the single file
+                t.extract(file_paths[0], path='.', filter='data')
+                extracted_path = Path('.') / file_paths[0]
+                final_path = Path('.').resolve() / Path(file_paths[0]).name
+                shutil.move(extracted_path, final_path)
+                return decompress_if_needed(str(final_path), sel)
+            else:
+                # Multiple files
+                if sel:
+                    # If sel is defined, extract the required file
+                    if sel in file_paths:
+                        # Extract the single file
+                        t.extract(sel, path='.', filter='data')
+                        extracted_path = Path('.') / sel
+                        # Move the file to current dir, stripping folders
+                        final_path = Path('.').resolve() / Path(sel).name
+                        shutil.move(extracted_path, final_path)
+                        # Optionally, remove the now-empty folder structure
+                        return decompress_if_needed(str(final_path), sel)
+                    else:
+                        ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
+                else:
+                    # MTX format in a tar archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
+                    if len(file_paths) == 3 and {{Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "features.tsv"} or {Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "genes.tsv"}}:
+                        final_file_paths = []
+                        # Extract all three files
+                        for fname in file_paths:
+                            t.extract(fname, path='.', filter='data')
+                            extracted_path = Path('.') / fname
+                            final_path = Path('.').resolve() / Path(fname).name
+                            shutil.move(extracted_path, final_path)
+                            final_file_paths.append(str(final_path))
+                        # Return None for archive path (use this to check later that it is a MTX format)
+                        return final_file_paths, None
+                    else:
+                        # If not, then return the list of files in the archive + the archive path
+                        return file_paths, file_path
+
+    # Uncompressed single file
+    return [file_path], None
+
+def check_file_type(file_path):   
+    with open(file_path, 'rb') as f:
+        magic = f.read(8)
+        if magic != b'\x89HDF\r\n\x1a\n':
+            return FileType.RAW_TEXT  # Not HDF5, no need to try h5py
+    
+    # It should be an HDF5
     try:
-        with h5py.File(stream, 'r') as f:
+        with h5py.File(file_path, 'r') as f:
             # 10x Genomics HDF5 Feature-Barcode Matrix detection
             root_groups = [key for key in f.keys() if isinstance(f[key], h5py.Group)]
             for group_name in root_groups:
@@ -82,83 +228,93 @@ def check_file_type_from_stream(stream):
             return FileType.UNKNOWN
     except (OSError, IOError, Exception):
         # Not a valid HDF5 or unable to read; fall through
-        pass
+        return FileType.UNKNOWN
 
-    # Default to raw text
-    stream.seek(0)
-    return FileType.RAW_TEXT
+def count_nonempty_lines(filepath):
+    import subprocess
+    result = subprocess.run(['wc', '-l', filepath], capture_output=True, text=True)
+    return int(result.stdout.strip().split()[0])
 
-def list_archive_contents(file_path):
-    if zipfile.is_zipfile(file_path):
-        with zipfile.ZipFile(file_path, 'r') as z:
-            return z.namelist()
-    elif tarfile.is_tarfile(file_path):
-        with tarfile.open(file_path, 'r') as t:
-            return t.getnames()
-    return None
-
-def count_nonempty_lines(buffered_reader):
-    return sum(1 for line in buffered_reader if line.strip())
+def is_rds_file(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            magic = f.read(5)
+            is_gzip = magic.startswith(b'\x1f\x8b')
+        if is_gzip:
+            with gzip.open(file_path, 'rb') as f:
+                header = f.read(5)
+        else:
+            with open(file_path, 'rb') as f:
+                header = f.read(5)
+        return header.startswith(b'RDX') or header.startswith(b'X\n') or header.startswith(b'A\n')
+    except Exception:
+        return False
 
 def preparse(args):
-    with decompress_if_needed(args.f) as stream:
-        try:
-            file_type = check_file_type_from_stream(stream)
-        except Exception:
-            file_type = FileType.RAW_TEXT
-        stream.seek(0)
-
-        if file_type == FileType.H5_10X:
-            H510xHandler.preparse(args, stream)
-        elif file_type == FileType.H5AD:
-            H5ADHandler.preparse(args, stream)
-        elif file_type == FileType.LOOM:
-            LoomHandler.preparse(args, stream)
-        else:
-            # Archive and plain text case
-            if not args.sel:
-                files = list_archive_contents(args.f)
-                if files is None: # Try plain text
-                    try:
-                        text_stream = io.TextIOWrapper(stream)
-                        n_rows = count_nonempty_lines(text_stream)
-                        stream.seek(0)
-                        TextHandler.preparse(args, stream)
-                        #preparse_text(n_rows, io.TextIOWrapper(stream))
-                    except ValueError:
-                        ErrorJSON("Non-numeric values detected. Did you forget a header?")
-                    except IOError:
-                        ErrorJSON("Failed to read file as plain text.")
-                elif len(files) == 0: # Empty archive
-                    ErrorJSON("Archive is empty or corrupted.")
-                elif len(files) == 1: # Archive with only one file
-                    args.sel = files[0]
-                    with open(args.f, 'rb') as archive:
-                        reader = ArchiveHandler.get_reader(archive, args.sel)
-                        n_rows = count_nonempty_lines(io.TextIOWrapper(reader))
-                        reader.seek(0)
-                        #preparse_text(n_rows, io.TextIOWrapper(reader))
-                        TextHandler.preparse(args, stream)
-                else: # Archive with multiple files
-                    ArchiveHandler.write_listing_json(files, FileType.ARCHIVE, args)
-            else:
-                with open(args.f, 'rb') as archive:
-                    reader = ArchiveHandler.get_reader(archive, args.sel)
-                    n_rows = count_nonempty_lines(io.TextIOWrapper(reader))
-                    reader.seek(0)
-                    preparse_text(n_rows, io.TextIOWrapper(reader))
+    if is_rds_file(args.f):
+        RdsHandler.preparse(args, args.f)
+    else:
+        # Decompress unique zip files, or treat as archive
+        list_files, archive_path = decompress_if_needed(args.f, args.sel)
+        if len(list_files) == 0: # Empty archive
+            ErrorJSON(f"Archive is empty or corrupted: {archive_path}")        
+        elif len(list_files) == 3 and archive_path == None: # MTX (10x)
+            MtxHandler.preparse(args, list_files)
+        elif len(list_files) > 1: # Archive with multiple files
+            ArchiveHandler.write_listing_json(args, archive_path, list_files)
+        else: # Unique file, decompressed if needed
+            file_path = list_files[0]
+            # Detect file type from magic bytes or hdf5 reader
+            file_type = check_file_type(file_path)
+            # Call appropriate handler
+            if file_type == FileType.H5_10X:
+                H510xHandler.preparse(args, file_path)
+            elif file_type == FileType.H5AD:
+                H5ADHandler.preparse(args, file_path)
+            elif file_type == FileType.LOOM:
+                LoomHandler.preparse(args, file_path)
+            elif file_type == FileType.RAW_TEXT:
+                # Check if MTX format
+                first_line = None
+                try:
+                    with open(file_path, 'r') as f:
+                        first_line = f.readline().strip()
+                except (Exception) as e:
+                    ErrorJSON(str(e).strip() + '. Format is not handled?')
+                if first_line.startswith("%%MatrixMarket matrix"):
+                    # It's a unique file. Did we miss barcodes.tsv and genes/features.tsv ?
+                    file_paths = [file_path]
+                    if args.sel: # If it comes from an archive
+                        p = Path(args.sel)
+                        barcode_path = str(p.parent / "barcodes.tsv") if p.parent != Path('.') else "barcodes.tsv"
+                        barcode_file = extract_from_archive(args.f, barcode_path)
+                        if barcode_file: # If barcode file is found
+                            file_paths.append(barcode_file)
+                        feature_path = str(p.parent / "features.tsv") if p.parent != Path('.') else "features.tsv"
+                        feature_file = extract_from_archive(args.f, feature_path)
+                        if not feature_file:
+                            feature_path = str(p.parent / "genes.tsv") if p.parent != Path('.') else "genes.tsv"
+                            feature_file = extract_from_archive(args.f, feature_path)
+                        if feature_file: # If feature file is found
+                            file_paths.append(feature_file)
+                    MtxHandler.preparse(args, file_paths)
+                else:
+                    TextHandler.preparse(args, file_path)
+            else: # Not detected
+                ErrorJSON(f"File format not detected.")
 
 class H510xHandler:
     @staticmethod
-    def preparse(args, stream):
+    def preparse(args, file_path):
         # build the JSON-able structure
         result = {
             "detected_format": FileType.H5_10X,
+            "file_path": file_path, # If it was compressed, it should be decompressed before
             "list_groups": []
         }
         
         # Detect groups
-        with h5py.File(stream, 'r') as f:
+        with h5py.File(file_path, 'r') as f:
             root_groups = [key for key in f.keys() if isinstance(f[key], h5py.Group)]
             for group_name in root_groups:
                 grp = f[group_name]
@@ -241,13 +397,14 @@ class H5ADHandler:
                 return [f"{path}:invalid_structure"]
     
     @staticmethod
-    def preparse(args, stream):
+    def preparse(args, file_path):
         result = {
             "detected_format": FileType.H5AD,
+            "file_path": file_path, # If it was compressed, it should be decompressed before
             "list_groups": []
         }
 
-        with h5py.File(stream, 'r') as f:
+        with h5py.File(file_path, 'r') as f:
             for group in ['/X', '/raw/X', '/raw.X']:
                 if group in f:                
                     # Get matrix dimensions
@@ -331,110 +488,358 @@ class H5ADHandler:
 
 class LoomHandler:
     @staticmethod
-    def preparse(args, stream):
-        print("LOOM")
-        pass
-
-class ArchiveHandler:
-    @staticmethod
-    def get_reader(archive, member):
-        if zipfile.is_zipfile(archive.name):
-            with zipfile.ZipFile(archive) as z:
-                return z.open(member, 'r')
-        elif tarfile.is_tarfile(archive.name):
-            with tarfile.open(fileobj=archive) as t:
-                return t.extractfile(member)
-        ErrorJSON("Unsupported archive format")
+    def decode_list(arr):
+        return [v.decode() if isinstance(v, bytes) else str(v) for v in arr]
     
     @staticmethod
-    def write_listing_json(files, file_type, args, loom_version=None):
-        data = {
-            "detected_format": file_type,
-            "list_files": [{"filename": f} for f in files]
+    def preparse(args, file_path):
+        result = {
+            "detected_format": FileType.LOOM,
+            "loom_version": "unknown",
+            "file_path": file_path, # If it was compressed, it should be decompressed before
+            "list_groups": []
         }
-        if file_type == "LOOM" and loom_version is not None:
-            data["loom_version"] = loom_version
 
-        output_path = os.path.join(args.o, "output.json")
-        try:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-        except IOError as ioe:
-           ErrorJSON(f"JSON writing error: {ioe}")
+        with h5py.File(file_path, 'r') as f:
+            if '/matrix' in f:
+                shape = f['/matrix'].shape
+                nGenes, nCells = int(shape[0]), int(shape[1])
+
+                max_genes = min(10, nGenes)
+                max_cells = min(10, nCells)
+                
+                # Extract 10x10 matrix (Dense)
+                matrix = f['/matrix'][:max_genes, :max_cells].astype(float).tolist()
+
+                # Loom version
+                if '/attrs/LOOM_SPEC_VERSION' in f:
+                    ds = f['/attrs/LOOM_SPEC_VERSION']
+                    val = ds[()]  # read scalar dataset
+                    result["loom_version"] = val.decode() if isinstance(val, bytes) else str(val)
+                elif 'LOOM_SPEC_VERSION' in f.attrs: # e.g. 2.0.0
+                    version = f.attrs['LOOM_SPEC_VERSION']
+                    result["loom_version"] = version.decode() if isinstance(version, bytes) else str(version)
+                elif 'version' in f.attrs: # e.g. 0.2.0
+                    version = f.attrs['version']
+                    result["loom_version"] = version.decode() if isinstance(version, bytes) else str(version)
+                
+                # Load gene names
+                if '/row_attrs/Gene' in f:   
+                    genes = LoomHandler.decode_list(f['/row_attrs/Gene'][:max_genes])
+                elif '/row_attrs/Accession' in f:   
+                    genes = LoomHandler.decode_list(f['/row_attrs/Accession'][:max_genes])
+                elif '/row_attrs/id' in f: # Very old
+                    genes = LoomHandler.decode_list(f['/row_attrs/id'][:max_genes])
+                elif '/row_attrs/GeneName' in f: # Seen in few datasets
+                    genes = LoomHandler.decode_list(f['/row_attrs/GeneName'][:max_genes])
+                else:
+                    genes = [f"Gene_{i+1}" for i in range(max_genes)]
+                
+                # Load cell names
+                if '/col_attrs/CellID' in f:   
+                    cells = LoomHandler.decode_list(f['/col_attrs/CellID'][:max_cells])
+                elif '/col_attrs/id' in f:
+                    cells = LoomHandler.decode_list(f['/col_attrs/id'][:max_cells])
+                else:
+                    cells = [f"Cell_{i+1}" for i in range(max_cells)]
+  
+                entry = {
+                    "group": "/matrix",
+                    "nber_cols": nCells,
+                    "nber_rows": nGenes,
+                    "is_count": int((np.array(matrix) % 1 == 0).all()),
+                    "genes": genes,
+                    "cells": cells,
+                    "matrix": matrix
+                }
+                result["list_groups"].append(entry)
+
+        json_str = json.dumps(result, ensure_ascii=False)
+
+        if args.o:
+            with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
+                out.write(json_str)
+        else:
+            print(json_str)
+
+class RdsHandler:
+    @staticmethod
+    def preparse(args, file_path):
+        result = {
+            "detected_format": FileType.RDS,
+            "file_path": file_path, # Does not change for RDS files
+            "list_groups": []
+        }
+        
+        # Import rpy2 for reading R objects in Python
+        import rpy2.rinterface_lib.callbacks
+        rpy2.rinterface_lib.callbacks.consolewrite_warnerror = lambda *args: None # Suppress console output from R
+        from rpy2.robjects.packages import importr
+        from rpy2.robjects import r
+        
+        # Import base package for reading RDS files
+        base = importr('base')
+
+        # Load R object
+        obj = base.readRDS(file_path)
+        obj_class = r['class'](obj)[0]
+        
+        # Check its type and apply conversion
+        if obj_class == "Seurat":
+            Matrix = importr('Matrix')
+            Seurat = importr('Seurat')
+            
+            # 10x10 matrix
+            matrix = np.array(Matrix.as_matrix(r('function(obj) GetAssayData(obj, slot = "count")[1:10, 1:10]')(obj))).tolist()
+            
+            # Global dims
+            nCells = int(list(r['ncol'](obj))[0])
+            nGenes = int(list(r['nrow'](obj))[0])
+            
+            # Gene and cell names
+            genes = list(r['rownames'](obj)[1:10])
+            cells = list(r['colnames'](obj)[1:10])
+                        
+            entry = {
+                "group": "seurat_object",
+                "nber_cols": nCells,
+                "nber_rows": nGenes,
+                "is_count": int((np.array(matrix) % 1 == 0).all()),
+                "genes": genes,
+                "cells": cells,
+                "matrix": matrix
+            }
+            result["list_groups"].append(entry)
+        elif obj_class == "data.frame":
+            print("Data Frame")
+            from rpy2.robjects import pandas2ri
+            pandas2ri.activate()
+            df = pandas2ri.rpy2py(obj)
+            n_rows = len(df)
+            entry = {
+                "group": "data_frame",
+                "nber_cols": nCells,
+                "nber_rows": nGenes,
+                "is_count": int((np.array(matrix) % 1 == 0).all()),
+                "genes": genes,
+                "cells": cells,
+                "matrix": matrix
+            }
+            result["list_groups"].append(entry)
+        
+        json_str = json.dumps(result, ensure_ascii=False)
+
+        if args.o:
+            with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
+                out.write(json_str)
+        else:
+            print(json_str)
+ 
+class ArchiveHandler:
+    @staticmethod
+    def write_listing_json(args, file_path, list_files):
+        result = {
+            "detected_format": FileType.ARCHIVE,
+            "file_path": file_path, # Path of the archive (should be decompressed already)
+            "list_files": [{"filename": f} for f in list_files]
+        }
+        json_str = json.dumps(result, ensure_ascii=False)
+        if args.o:
+            with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
+                out.write(json_str)
+        else:
+            print(json_str)
+
+class MtxHandler:
+    @staticmethod
+    def preparse(args, file_paths):
+        result = {
+            "detected_format": FileType.MTX,
+            "file_path": file_paths, # Could have been unzipped/unarchived
+            "list_groups": []
+        }
+        
+        # Cell names
+        cells = [f"Cell_{i+1}" for i in range(10)]
+        barcode_path = next((p for p in file_paths if Path(p).name == "barcodes.tsv"), None)
+        print(file_paths)
+        if barcode_path:
+            with open(barcode_path, "r") as f:
+                cells = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
+                
+        # Gene names
+        genes = [f"Gene_{i+1}" for i in range(10)]
+        feature_path = next((p for p in file_paths if Path(p).name == "features.tsv"), None)
+        if not feature_path:
+            feature_path = next((p for p in file_paths if Path(p).name == "genes.tsv"), None)
+        if feature_path:
+            with open(feature_path, "r") as f:
+                genes = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
+        
+        # MTX file
+        matrix_path = next((p for p in file_paths if Path(p).name not in {"barcodes.tsv", "features.tsv", "genes.tsv"}), None)
+        if not matrix_path: # This should not happen
+            ErrorJSON("No matrix found?")
+
+        # Read first 10 rows
+        nGenes = -1
+        nCells = -1
+        # Check MTX format
+        if "pattern" in open(matrix_path).readline():
+            pattern = True
+        else:
+            pattern = False
+        # Parse file
+        with open(matrix_path, 'r') as f:
+            # Skip comments and header
+            for line in f:
+                if line.startswith('%'):
+                    continue
+                else:
+                    nGenes, nCells, n_nz = map(int, line.strip().split())
+                    break
+
+            matrix = np.zeros((min(nGenes, 10), min(nCells, 10)))
+            for line in f:
+                parts = line.strip().split()
+                if pattern:
+                    if len(parts) != 2:
+                        continue
+                    i, j = map(int, parts)
+                    val = 1.0
+                else:
+                    if len(parts) != 3:
+                        continue
+                    i, j = map(int, parts[:2])
+                    val = float(parts[2])
+
+                i -= 1
+                j -= 1
+                if i < 10 and j < 10:
+                    matrix[i, j] = val
+            
+        # Restrict genes and cells to correct values
+        cells = cells[:min(nCells, 10)]
+        genes = genes[:min(nGenes, 10)]
+
+        entry = {
+                "group": Path(matrix_path).name,
+                "nber_cols": nCells,
+                "nber_rows": nGenes,
+                "is_count": int((np.array(matrix) % 1 == 0).all()),
+                "genes": genes,
+                "cells": cells,
+                "matrix": matrix.tolist()
+            }
+        result["list_groups"].append(entry)
+        
+        json_str = json.dumps(result, ensure_ascii=False)
+
+        if args.o:
+            with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
+                out.write(json_str)
+        else:
+            print(json_str)
+
 
 class TextHandler:
     @staticmethod
-    def preparse(args, stream):
-        print("TEXT")
-        reader = csv.reader(br, delimiter=Parameters.delimiter)
-        header = next(reader, None)
-        if not header:
-            ErrorJSON(f"Empty file or invalid encoding. Format: {Parameters.fileType}")
+    def preparse(args, file_path):
+        result = {
+            "warnings":[],
+            "detected_format": FileType.RAW_TEXT,
+            "file_path": file_path, # Could have been unzipped/unarchived
+            "list_groups": []
+        }
+        import pandas as pd
+        import warnings
+        
+        # Count n_rows
+        nGenes = count_nonempty_lines(file_path)
 
-        g = GroupPreparse(Parameters.selection or Parameters.fileName.split("/")[-1])
-        tokens = None
-
-        if Parameters.has_header:
-            data_row = next(reader, None)
-            if not data_row:
-                ErrorJSON(f"No data rows in file. Format: {Parameters.fileType}")
-            tokens = data_row
-            g.nbGenes = n_rows - 1
+        # Header
+        param_header = None
+        if args.header == 'true':
+            param_header = 0
+            nGenes = nGenes - 1
+        
+        # Row indexes
+        if args.col == 'first':
+            param_col = 0
         else:
-            tokens = header
-            g.nbGenes = n_rows
-            header = None
-
-        # Determine number of cells
-        if Parameters.name_column in ("FIRST", "LAST"):
-            base_len = len(header) if header else len(tokens) + 1
-            g.nbCells = base_len - 1
-        else:  # NONE
-            g.nbCells = len(header) if header else len(tokens)
-
-        # Assign cellNames if header exists
-        if header:
-            if Parameters.name_column == "FIRST":
-                start = 1
-                expected_len = g.nbCells + 1
-            elif Parameters.name_column == "LAST":
-                start = 0
-                expected_len = g.nbCells + 1
-            else:  # NONE
-                start = 0
-                expected_len = g.nbCells
-            if len(header) < start + min(10, g.nbCells):
-                ErrorJSON("Header length mismatch.")
-            g.cellNames = [header[i].replace('"', "")
-                           for i in range(start, start + min(10, g.nbCells))]
-
-        # Initialize storage limited to first 10 × 10
-        G = min(10, g.nbGenes)
-        C = min(10, g.nbCells)
-        if Parameters.name_column != "NONE":
-            g.geneNames = ["" for _ in range(G)]
-        g.matrix = [[0.0]*C for _ in range(G)]
-
-        # Process rows
-        for i in range(G):
-            if not tokens or len(tokens) != (g.nbCells + (1 if Parameters.name_column!="NONE" else 0)):
-                ErrorJSON(f"Row {i + (2 if header else 1)} element count mismatch.")
-            values = tokens.copy()
-            if Parameters.name_column == "FIRST":
-                g.geneNames[i] = values.pop(0).replace('"', "")
-            elif Parameters.name_column == "LAST":
-                g.geneNames[i] = values.pop(-1).replace('"', "")
-            # NONE means no geneNames
+            param_col = False
             
-            for j in range(C):
-                val = float(values[j].replace(",", "."))
-                g.matrix[i][j] = val
-                g.isCount &= val.is_integer()
+        # Decode escape characters in separator
+        param_delim = bytes(args.delim, "utf-8").decode("unicode_escape")
+        
+        # Read first 10 rows
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always", pd.errors.ParserWarning)
+            try:
+                matrix = pd.read_csv(file_path, sep=param_delim, header=param_header, index_col=param_col, nrows=10, engine='c')
+            except pd.errors.ParserError as e:
+                error_message = str(e).strip()
+                if 'Error tokenizing data' in error_message:
+                    error_message += '. Did you forget the header?'
+                ErrorJSON(error_message)
+            except ValueError as e:
+                error_message = str(e).strip()
+                if 'separators > 1 char' in error_message:
+                    error_message += '. Did you use multiple separator characters?'
+                ErrorJSON(error_message)
+            
+            for warning in w:
+                if issubclass(warning.category, pd.errors.ParserWarning):
+                    result["warnings"].append(f"WARNING: {str(warning.message)}")
 
-            tokens = next(reader, None)
+        if args.col == 'last':
+            matrix.index = matrix.iloc[:, -1]      # Set last column as row index
+            matrix = matrix.iloc[:, :-1]           # Remove last column
 
+        if args.col == 'none':
+            matrix.index = [f"Gene_{i+1}" for i in range(len(matrix))]
+            
+        if param_header == None:
+            matrix.columns = [f"Cell_{i+1}" for i in range(len(matrix.columns))]
+
+        if matrix.shape[1] == 0:
+            result["warnings"].append("No column is detected? Did you set the 'delimiter' parameter correctly?")
+            
+        if matrix.shape[1] == 1:
+            result["warnings"].append("Only one column is detected? Did you set the 'delimiter' parameter correctly?")
+
+        if not pd.api.types.is_numeric_dtype(matrix.values):
+            result["warnings"].append("Matrix is not numeric, is header / column name set correctly?")
+            is_count = int(0) # Or NA?
+        else:
+            is_count = int((np.array(matrix) % 1 == 0).all())
+
+        entry = {
+            "group": "text_file",
+            "nber_cols": int(matrix.shape[1]),
+            "nber_rows": int(nGenes),
+            "is_count": is_count,
+            "genes": str(matrix.index[0:10].tolist()),
+            "cells": str(matrix.columns[0:10].tolist()),
+            "matrix": np.array(matrix.iloc[0:10,0:10]).tolist()
+        }
+        result["list_groups"].append(entry)
+
+        if not matrix.index.is_unique:
+            result["warnings"].append("Gene names are not unique. Did you set the 'column index' parameter correctly?")
+
+        # Remove warnings of results if empty
+        if not result["warnings"]:
+            del result["warnings"]
+        
         # Write JSON output
-        ArchiveHandler.write_output_json([g])
+        json_str = json.dumps(result, ensure_ascii=False)
+        if args.o:
+            with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
+                out.write(json_str)
+        else:
+            #print("toto")
+            print(json_str)
 
 class ErrorJSON(Exception):
     def __init__(self, message: str, output: str = None):
@@ -462,8 +867,8 @@ def main():
     parser.add_argument('-f', metavar='INPUT_FILE', required=True)
     parser.add_argument('-o', metavar='OUTPUT_FOLDER', required=False)
     parser.add_argument('--organism', type=int, required=False)
-    parser.add_argument('--header', choices=['true', 'false'], required=False)
-    parser.add_argument('--col', choices=['none', 'first', 'last'], required=False)
+    parser.add_argument('--header', choices=['true', 'false'], default='true', required=False)
+    parser.add_argument('--col', choices=['none', 'first', 'last'], default='first', required=False)
     parser.add_argument('--sel', default=None)
     parser.add_argument('--delim', default='\t')
     parser.add_argument('--row-names', default=None)
