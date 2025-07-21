@@ -37,7 +37,7 @@ python -m pip install --no-cache-dir --upgrade leidenalg==0.10.2 texttable==1.7.
 # Define R *.so library paths (for rpy2 to find R libraries)
 ENV LD_LIBRARY_PATH=/usr/local/lib/R/lib:$LD_LIBRARY_PATH
 # Remove warning message when importing rimport with rpy2
-sed -i '1210,1214 s/^/##/' /usr/local/lib/python3.12/site-packages/rpy2/rinterface/__init__.py
+RUN sed -i '1210,1214 s/^/##/' /usr/local/lib/python3.12/site-packages/rpy2/rinterface/__init__.py
 
 # Install R packages
 COPY R/packages/install_packages.v8.R /tmp/install_packages.v8.R
