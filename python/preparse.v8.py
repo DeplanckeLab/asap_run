@@ -820,8 +820,8 @@ class TextHandler:
             "nber_cols": int(matrix.shape[1]),
             "nber_rows": int(nGenes),
             "is_count": is_count,
-            "genes": str(matrix.index[0:10].tolist()),
-            "cells": str(matrix.columns[0:10].tolist()),
+            "genes": matrix.index[0:10].tolist(),
+            "cells": matrix.columns[0:10].tolist(),
             "matrix": np.array(matrix.iloc[0:10,0:10]).tolist()
         }
         result["list_groups"].append(entry)
