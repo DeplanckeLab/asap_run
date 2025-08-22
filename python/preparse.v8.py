@@ -12,16 +12,17 @@ Preparsing Mode
 Options:
   -f %s             File to preparse.
   -o %s             Output folder.
-  --organism %i     ID of the organism.
   --header %s       The file has a header [true, false] (default: true).
   --col %s          Name Column [none, first, last] (default: first).
   --sel %s          Name of entry to load from archive or HDF5 (if multiple groups).
   --delim %s        Delimiter (default: tab).
-  --row-names %s    Metadata column for row names of the main matrix.
-  --col-names %s    Metadata column for column names of the main matrix.
-  --host %s         Host override (default: postgres:5434).
   --help            Show this help message and exit.
 """
+
+#   --organism %i     ID of the organism.
+#   --row-names %s    Metadata column for row names of the main matrix.
+#   --col-names %s    Metadata column for column names of the main matrix.
+#   --host %s         Host override (default: postgres:5434).
 
 class FileType:
     H5_10X = 'H5_10X'
@@ -866,14 +867,14 @@ def main():
     parser = argparse.ArgumentParser(description='Preparsing Mode Script', add_help=False)
     parser.add_argument('-f', metavar='INPUT_FILE', required=True)
     parser.add_argument('-o', metavar='OUTPUT_FOLDER', required=False)
-    parser.add_argument('--organism', type=int, required=False)
+    #parser.add_argument('--organism', type=int, required=False)
     parser.add_argument('--header', choices=['true', 'false'], default='true', required=False)
     parser.add_argument('--col', choices=['none', 'first', 'last'], default='first', required=False)
     parser.add_argument('--sel', default=None)
     parser.add_argument('--delim', default='\t')
-    parser.add_argument('--row-names', default=None)
-    parser.add_argument('--col-names', default=None)
-    parser.add_argument('--host', default='postgres:5434')
+    #parser.add_argument('--row-names', default=None)
+    #parser.add_argument('--col-names', default=None)
+    #parser.add_argument('--host', default='postgres:5434')
 
     args = parser.parse_args()
 
