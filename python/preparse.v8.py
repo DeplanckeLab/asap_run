@@ -4,6 +4,7 @@ import os # Needed for pathjoin and path/create dirs
 import h5py # Needed for parsing hdf5 files
 import json # For writing output files
 import numpy as np # For diverse array calculations
+import tarfile # To check if it's file is a TAR archive
 from pathlib import Path # Needed for file extension manipulation
 
 custom_help = """
@@ -57,8 +58,10 @@ def extract_from_archive(file_path, sel):
                 return None
 
     # tar (can contain multiple files)
-    if magic[257:262] == b'ustar':
-        import tarfile, shutil
+    #if magic[257:262] == b'ustar': # Not all possibilities
+    if tarfile.is_tarfile(file_path):
+        #import tarfile, shutil
+        import shutil
         with tarfile.open(file_path, mode='r:') as t:
             # Filter only files (exclude directories)
             file_paths = [m.name for m in t.getmembers() if m.isfile()]
@@ -155,8 +158,10 @@ def decompress_if_needed(file_path, sel):
                         return file_paths, file_path
 
     # tar (can contain multiple files)
-    if magic[257:262] == b'ustar':
-        import tarfile, shutil
+    #if magic[257:262] == b'ustar': # Not all possibilities
+    if tarfile.is_tarfile(file_path):
+        #import tarfile, shutil
+        import shutil
         with tarfile.open(file_path, mode='r:') as t:
             # Filter only files (exclude directories)
             file_paths = [m.name for m in t.getmembers() if m.isfile()]
