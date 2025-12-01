@@ -46,6 +46,15 @@ RUN Rscript /tmp/install_packages.v8.R
 RUN rm /tmp/install_packages.v8.R
 RUN rm /tmp/*.tar.gz
 
+# Copy data to image
+COPY R/*.R /srv
+COPY python/*.py /srv
+COPY java/bin/*.jar /srv
+COPY bin/* /srv
+
+# Set permissions
+RUN chmod -R 755 /srv
+
 # User
 ENV USER=rvmuser USER_ID=1006 USER_GID=1006
 
@@ -62,12 +71,6 @@ USER ${USER}
 
 # Maintainer
 LABEL maintainer="Fabrice P.A. David <fabrice.david@epfl.ch>"
-
-# Copy data to image
-COPY R/*.R /srv
-COPY python/*.py /srv
-COPY java/bin/*.jar /srv
-COPY bin/* /srv
 
 # Working directory
 WORKDIR /srv
