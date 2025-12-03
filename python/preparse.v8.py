@@ -17,6 +17,7 @@ Options:
   --col %s          Name Column [none, first, last] (default: first).
   --sel %s          Name of entry to load from archive or HDF5 (if multiple groups).
   --delim %s        Delimiter (default: tab).
+  --metadata        Export metadata fields (absent: false). Only working with certain formats.
   --help            Show this help message and exit.
 """
 
@@ -589,11 +590,11 @@ class RdsHandler:
         
         # Check its type and apply conversion
         if obj_class == "Seurat":
-            Matrix = importr('Matrix')
             Seurat = importr('Seurat')
             
-            # 10x10 matrix
-            matrix = np.array(Matrix.as_matrix(r('function(obj) GetAssayData(obj, slot = "count")[1:10, 1:10]')(obj))).tolist()
+            # 10x10 matrix            
+            matrix_r = r('function(obj) as(GetAssayData(obj, slot="count")[1:10, 1:10], "matrix")')(obj) # This throws a warning
+            matrix = np.array(matrix_r).tolist()
             
             # Global dims
             nCells = int(list(r['ncol'](obj))[0])
@@ -869,14 +870,11 @@ def main():
     parser = argparse.ArgumentParser(description='Preparsing Mode Script', add_help=False)
     parser.add_argument('-f', metavar='INPUT_FILE', required=True)
     parser.add_argument('-o', metavar='OUTPUT_FOLDER', required=False)
-    #parser.add_argument('--organism', type=int, required=False)
     parser.add_argument('--header', choices=['true', 'false'], default='true', required=False)
     parser.add_argument('--col', choices=['none', 'first', 'last'], default='first', required=False)
     parser.add_argument('--sel', default=None)
     parser.add_argument('--delim', default='\t')
-    #parser.add_argument('--row-names', default=None)
-    #parser.add_argument('--col-names', default=None)
-    #parser.add_argument('--host', default='postgres:5434')
+    parser.add_argument('--metadata', action='store_true')
 
     args = parser.parse_args()
 
@@ -889,4 +887,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
