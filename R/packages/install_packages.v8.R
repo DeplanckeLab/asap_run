@@ -321,8 +321,16 @@ install.cran("scattermore", version="1.2")
 install.cran("sctransform", version="0.4.1")
 install.cran("plotly", version="4.10.4")
 install.cran("leiden", version="0.4.3.1")
-install.cran("SeuratObject", version="4.1.4") # Old version. Because v5 changes too many things.
-install.cran("Seurat", version="4.4.0") # Old version. Because v5 changes too many things.
+#install.cran("SeuratObject", version="4.1.4") # Old version. Because v5 changes too many things.
+#install.cran("Seurat", version="4.4.0") # Old version. Because v5 changes too many things.
+install.cran("SeuratObject", version="5.2.0")
+install.cran("Seurat", version="5.3.1")
+install.cran("hms", version="1.1.4")
+install.cran("progress", version="1.2.3")
+install.cran("tzdb", version="0.5.0")
+install.cran("vroom", version="1.6.7")
+install.cran("readr", version="2.1.6")
+install.cran("hexbin", version="1.28.5")
 
 #Bioconductor packages
 install.bioconductor("limma", version="3.62.2", "3.20")
