@@ -570,6 +570,7 @@ class RdsHandler:
     @staticmethod
     def preparse(args, file_path):
         result = {
+            "warnings": [],
             "detected_format": FileType.RDS,
             "file_path": file_path, # Does not change for RDS files
             "list_groups": []
@@ -592,28 +593,36 @@ class RdsHandler:
         if obj_class == "Seurat":
             Seurat = importr('Seurat')
             
-            # 10x10 matrix            
-            matrix_r = r('function(obj) as(GetAssayData(obj, slot="count")[1:10, 1:10], "matrix")')(obj) # This throws a warning
-            matrix = np.array(matrix_r).tolist()
+            # Check available assays
+            seurat_assays = np.array(r('names(obj)')).tolist()
             
-            # Global dims
-            nCells = int(list(r['ncol'](obj))[0])
-            nGenes = int(list(r['nrow'](obj))[0])
-            
-            # Gene and cell names
-            genes = list(r['rownames'](obj)[1:10])
-            cells = list(r['colnames'](obj)[1:10])
-                        
-            entry = {
-                "group": "seurat_object",
-                "nber_cols": nCells,
-                "nber_rows": nGenes,
-                "is_count": int((np.array(matrix) % 1 == 0).all()),
-                "genes": genes,
-                "cells": cells,
-                "matrix": matrix
-            }
-            result["list_groups"].append(entry)
+            # Iterate through each assay
+            for assay in seurat_assays:
+                try:
+                    # 10x10 matrix        
+                    matrix_r = r(f'function(obj) as(GetAssayData(obj, layer="counts", assay="{assay}")[1:10, 1:10], "matrix")')(obj) # This throws a warning
+                    matrix = np.array(matrix_r).tolist()
+                    
+                    # Global dims
+                    nCells = int(list(r['ncol'](obj))[0])
+                    nGenes = int(list(r['nrow'](obj))[0])
+                    
+                    # Gene and cell names
+                    genes = list(r['rownames'](obj)[1:10])
+                    cells = list(r['colnames'](obj)[1:10])
+                                
+                    entry = {
+                        "group": assay,
+                        "nber_cols": nCells,
+                        "nber_rows": nGenes,
+                        "is_count": int((np.array(matrix) % 1 == 0).all()),
+                        "genes": genes,
+                        "cells": cells,
+                        "matrix": matrix
+                    }
+                    result["list_groups"].append(entry)
+                except Exception as e:
+                    result["warnings"].append(f"WARNING: Skipping assay {assay} due to error: {e}")
         elif obj_class == "data.frame":
             print("Data Frame")
             from rpy2.robjects import pandas2ri
@@ -630,6 +639,8 @@ class RdsHandler:
                 "matrix": matrix
             }
             result["list_groups"].append(entry)
+        else:
+            result["warnings"].append(f"WARNING: RDS object type not handled. Only handled types are [Seurat, data.frame]")
         
         json_str = json.dumps(result, ensure_ascii=False)
 
