@@ -594,35 +594,45 @@ class RdsHandler:
             Seurat = importr('Seurat')
             
             # Check available assays
-            seurat_assays = np.array(r('names(obj)')).tolist()
+            seurat_assays = [str(a) for a in r["Assays"](obj)]
             
             # Iterate through each assay
             for assay in seurat_assays:
                 try:
-                    # 10x10 matrix        
-                    matrix_r = r(f'function(obj) as(GetAssayData(obj, layer="counts", assay="{assay}")[1:10, 1:10], "matrix")')(obj) # This throws a warning
-                    matrix = np.array(matrix_r).tolist()
-                    
-                    # Global dims
-                    nCells = int(list(r['ncol'](obj))[0])
-                    nGenes = int(list(r['nrow'](obj))[0])
-                    
-                    # Gene and cell names
-                    genes = list(r['rownames'](obj)[1:10])
-                    cells = list(r['colnames'](obj)[1:10])
-                                
-                    entry = {
-                        "group": assay,
-                        "nber_cols": nCells,
-                        "nber_rows": nGenes,
-                        "is_count": int((np.array(matrix) % 1 == 0).all()),
-                        "genes": genes,
-                        "cells": cells,
-                        "matrix": matrix
-                    }
-                    result["list_groups"].append(entry)
+                    layers_r = r(f'''
+                    function(obj) {{
+                      assay <- "{assay}"
+                      Layers(obj[[assay]])
+                    }}
+                    ''')(obj)
+                    layers = [str(x) for x in layers_r]
+                    if "counts" in layers:
+                        # 10x10 matrix        
+                        matrix_r = r(f'function(obj) as(GetAssayData(obj, layer="counts", assay="{assay}")[1:10, 1:10], "matrix")')(obj) # This can throw a warning (I modified src or BPCells to avoid this)
+                        matrix = np.array(matrix_r).tolist()
+                        
+                        # Global dims
+                        nCells = int(list(r['ncol'](obj))[0])
+                        nGenes = int(list(r['nrow'](obj))[0])
+                        
+                        # Gene and cell names
+                        genes = list(r['rownames'](obj)[1:10])
+                        cells = list(r['colnames'](obj)[1:10])
+                                    
+                        entry = {
+                            "group": assay,
+                            "nber_cols": nCells,
+                            "nber_rows": nGenes,
+                            "is_count": int((np.array(matrix) % 1 == 0).all()),
+                            "genes": genes,
+                            "cells": cells,
+                            "matrix": matrix
+                        }
+                        result["list_groups"].append(entry)
+                    else:
+                        result["warnings"].append(f"WARNING: Skipping assay '{assay}', because it's missing the layer 'counts'. Available layers for assay '{assay}': {str(layers)}")
                 except Exception as e:
-                    result["warnings"].append(f"WARNING: Skipping assay {assay} due to error: {e}")
+                    result["warnings"].append(f"WARNING: Skipping assay '{assay}' due to error: {e}")
         elif obj_class == "data.frame":
             print("Data Frame")
             from rpy2.robjects import pandas2ri
@@ -640,7 +650,7 @@ class RdsHandler:
             }
             result["list_groups"].append(entry)
         else:
-            result["warnings"].append(f"WARNING: RDS object type not handled. Only handled types are [Seurat, data.frame]")
+            result["warnings"].append(f"WARNING: RDS object type not handled [{obj_class}]. Only handled types are [Seurat, data.frame]")
         
         json_str = json.dumps(result, ensure_ascii=False)
 
@@ -674,10 +684,11 @@ class MtxHandler:
             "list_groups": []
         }
         
+        print(str(file_paths))
+        
         # Cell names
         cells = [f"Cell_{i+1}" for i in range(10)]
         barcode_path = next((p for p in file_paths if Path(p).name == "barcodes.tsv"), None)
-        print(file_paths)
         if barcode_path:
             with open(barcode_path, "r") as f:
                 cells = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
