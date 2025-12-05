@@ -140,17 +140,27 @@ def decompress_if_needed(file_path, sel):
                     else:
                         ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
                 else:
-                    # MTX format in a zip archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
-                    if len(file_paths) == 3 and {{Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "features.tsv"} or {Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "genes.tsv"}}:
+                    # MTX format in a tar archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
+                    # Determine base names before eventual comp. extension
+                    def base_name(path):
+                        p = Path(path).name
+                        suffix = Path(p).suffix
+                        if suffix in {".gz", ".bz2", ".xz"}:
+                            p = p[: -len(suffix)]
+                        return p
+                    base_names = {base_name(p) for p in file_paths}
+                    allowed_sets = [ {"matrix.mtx", "barcodes.tsv", "features.tsv"}, {"matrix.mtx", "barcodes.tsv", "genes.tsv"} ]
+                    canonical = { "matrix.mtx": "matrix.mtx", "matrix": "matrix.mtx", "barcodes.tsv": "barcodes.tsv", "barcodes": "barcodes.tsv", "features.tsv": "features.tsv", "features": "features.tsv", "genes.tsv": "genes.tsv", "genes": "genes.tsv" }
+                    if len(file_paths) == 3 and base_names in allowed_sets:
                         final_file_paths = []
-                        # Extract all three files
                         for fname in file_paths:
-                            # Extract the single file
-                            extracted_path = z.extract(fname, path='.')
-                            final_path = Path('.').resolve() / Path(fname).name
-                            shutil.move(extracted_path, final_path)
-                            final_file_paths.append(str(final_path))
-                        # Return None for archive path (use this to check later that it is a MTX format)
+                            t.extract(fname, path='.', filter='data')
+                            extracted_path = Path('.') / fname
+                            decompressed_path, sel = decompress_if_needed(extracted_path, None) # Decompress if needed
+                            target_base = canonical[base_name(fname)] # Fix filename
+                            target_path = Path('.').resolve() / target_base
+                            shutil.move(decompressed_path[0], target_path)
+                            final_file_paths.append(str(target_path))
                         return final_file_paths, None
                     else:
                         # If not, then return the list of files in the archive + the archive path
@@ -186,16 +196,26 @@ def decompress_if_needed(file_path, sel):
                         ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
                 else:
                     # MTX format in a tar archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
-                    if len(file_paths) == 3 and {{Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "features.tsv"} or {Path(p).name for p in file_paths} == {"matrix.mtx", "barcodes.tsv", "genes.tsv"}}:
+                    # Determine base names before eventual comp. extension
+                    def base_name(path):
+                        p = Path(path).name
+                        suffix = Path(p).suffix
+                        if suffix in {".gz", ".bz2", ".xz"}:
+                            p = p[: -len(suffix)]
+                        return p
+                    base_names = {base_name(p) for p in file_paths}
+                    allowed_sets = [ {"matrix.mtx", "barcodes.tsv", "features.tsv"}, {"matrix.mtx", "barcodes.tsv", "genes.tsv"} ]
+                    canonical = { "matrix.mtx": "matrix.mtx", "matrix": "matrix.mtx", "barcodes.tsv": "barcodes.tsv", "barcodes": "barcodes.tsv", "features.tsv": "features.tsv", "features": "features.tsv", "genes.tsv": "genes.tsv", "genes": "genes.tsv" }
+                    if len(file_paths) == 3 and base_names in allowed_sets:
                         final_file_paths = []
-                        # Extract all three files
                         for fname in file_paths:
                             t.extract(fname, path='.', filter='data')
                             extracted_path = Path('.') / fname
-                            final_path = Path('.').resolve() / Path(fname).name
-                            shutil.move(extracted_path, final_path)
-                            final_file_paths.append(str(final_path))
-                        # Return None for archive path (use this to check later that it is a MTX format)
+                            decompressed_path, sel = decompress_if_needed(extracted_path, None) # Decompress if needed
+                            target_base = canonical[base_name(fname)] # Fix filename
+                            target_path = Path('.').resolve() / target_base
+                            shutil.move(decompressed_path[0], target_path)
+                            final_file_paths.append(str(target_path))
                         return final_file_paths, None
                     else:
                         # If not, then return the list of files in the archive + the archive path
@@ -634,7 +654,6 @@ class RdsHandler:
                 except Exception as e:
                     result["warnings"].append(f"WARNING: Skipping assay '{assay}' due to error: {e}")
         elif obj_class == "data.frame":
-            print("Data Frame")
             from rpy2.robjects import pandas2ri
             pandas2ri.activate()
             df = pandas2ri.rpy2py(obj)
@@ -684,15 +703,13 @@ class MtxHandler:
             "list_groups": []
         }
         
-        print(str(file_paths))
-        
         # Cell names
         cells = [f"Cell_{i+1}" for i in range(10)]
         barcode_path = next((p for p in file_paths if Path(p).name == "barcodes.tsv"), None)
         if barcode_path:
             with open(barcode_path, "r") as f:
                 cells = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
-                
+
         # Gene names
         genes = [f"Gene_{i+1}" for i in range(10)]
         feature_path = next((p for p in file_paths if Path(p).name == "features.tsv"), None)
@@ -864,7 +881,6 @@ class TextHandler:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
         else:
-            #print("toto")
             print(json_str)
 
 class ErrorJSON(Exception):
