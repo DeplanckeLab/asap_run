@@ -17,14 +17,10 @@ Options:
   --col %s          Name Column [none, first, last] (default: first).
   --sel %s          Name of entry to load from archive or HDF5 (if multiple groups).
   --delim %s        Delimiter (default: tab).
-  --metadata        Export metadata fields (absent: false). Only working with certain formats.
   --help            Show this help message and exit.
 """
 
-#   --organism %i     ID of the organism.
-#   --row-names %s    Metadata column for row names of the main matrix.
-#   --col-names %s    Metadata column for column names of the main matrix.
-#   --host %s         Host override (default: postgres:5434).
+#  --metadata        Export metadata fields (absent: false). Only working with certain formats.
 
 class FileType:
     H5_10X = 'H5_10X'
@@ -912,7 +908,7 @@ def main():
     parser.add_argument('--col', choices=['none', 'first', 'last'], default='first', required=False)
     parser.add_argument('--sel', default=None)
     parser.add_argument('--delim', default='\t')
-    parser.add_argument('--metadata', action='store_true')
+    #parser.add_argument('--metadata', action='store_true')
 
     args = parser.parse_args()
 
