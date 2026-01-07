@@ -17,6 +17,7 @@ import re # Regex for gene to db comparison
 from pathlib import Path # Needed for file extension manipulation
 from collections import Counter # To count categories occurrences
 from scipy.sparse import isspmatrix_csr, isspmatrix_csc # For handling sparse matrices
+import scipy.sparse as sp
 
 custom_help = """
 Parsing Mode
@@ -64,66 +65,74 @@ class H5ADHandler:
 
     @staticmethod
     def transfer_metadata(f, group_path, loom, result, orientation, existing_paths):
-        """
-        f: H5AD file handle
-        group_path: e.g., 'obs' or 'var'
-        orientation: 'CELL' (col_attrs) or 'GENE' (row_attrs)
-        existing_paths: set of paths already written (to avoid duplicates)
-        """
         if group_path not in f: return
         group = f[group_path]
-        columns = group.attrs.get('_column_names', group.keys())
-    
+        
+        # AnnData stores column order in _column_names attribute
+        columns = group.attrs.get('_column_names', list(group.keys()))
+        if isinstance(columns, np.ndarray):
+            columns = columns.tolist()
+
         for col in columns:
-            if col in ['_index', 'categories', 'codes']: continue # Skip internal AnnData keys
+            if col in ['_index', 'categories', 'codes']: continue 
+            
             loom_path = f"/{'col' if orientation == 'CELL' else 'row'}_attrs/{col}"
             if loom_path in existing_paths:
-                result.setdefault("warning", []).append(f"Skipping {col}: already exists.")
                 continue
     
-            data = group[col]
+            item = group[col]
+            values = None
+
+            # --- CASE 1: Categorical Data (Stored as a Group) ---
+            if isinstance(item, h5py.Group):
+                if 'categories' in item and 'codes' in item:
+                    cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item['categories'][:]]
+                    codes = item['codes'][:]
+                    # Map codes to categories, handle -1 as NaN/missing
+                    values = np.array([cats[c] if c != -1 else "nan" for c in codes])
+                else:
+                    # It's a group but not categorical (e.g. nested metadata)
+                    # We skip these as Loom only supports 1D/2D datasets in col_attrs
+                    continue
+
+            # --- CASE 2: Standard Dataset ---
+            else:
+                raw_values = item[:]
+                # Handle byte-string decoding for the whole array
+                if raw_values.dtype.kind in ('S', 'U', 'O'):
+                    values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values])
+                else:
+                    values = raw_values
+
+            if values is None: continue
 
             # Dimension check
             expected_len = result["nber_cols"] if orientation == "CELL" else result["nber_rows"]
-            if len(data) != expected_len:
-                result.setdefault("warning", []).append(f"Skipping {group_path}/{col}: length mismatch. Expected {expected_len}, found {len(data)}.")
+            if len(values) != expected_len:
+                result.setdefault("warning", []).append(f"Skipping {col}: length mismatch.")
                 continue
             
-            # Handle Categorical
-            if isinstance(data, h5py.Group) and 'categories' in data:
-                categories = [v.decode() if isinstance(v, bytes) else str(v) for v in data['categories'][:]]
-                codes = data['codes'][:]
-                values = [categories[c] if c != -1 else "nan" for c in codes]
-            else:
-                raw_values = data[:]
-                values = [v.decode() if isinstance(v, bytes) else str(v) for v in raw_values]
-    
+            # Create Metadata entry
             meta = Metadata(
                 name=loom_path,
                 on=orientation,
                 nber_rows=len(values) if orientation == "GENE" else 1,
                 nber_cols=len(values) if orientation == "CELL" else 1,
-                missing_values = count_missing(values),
-                distinct_values = len(set(values)),
+                missing_values=count_missing(values),
                 imported=1
             )
             
-            counts = Counter(values)
+            # 3. Use Metadata class logic for type determination
+            counts = Counter(values.flatten() if hasattr(values, 'flatten') else values)   
+            meta.distinct_values = len(counts)           
             meta.categories = dict(counts)
+            is_numeric = np.issubdtype(values.dtype, np.number)
+            meta.finalize_type(is_numeric) # If is_categorical() is False, it sets type to STRING/NUMERIC and resets self.categories = {}
             
-            # Numeric Check
-            is_numeric = True
-            for v in values[:1000]: # Sample for speed, or check all if strict
-                if v in [None, "", "nan", "NaN"]: continue
-                try: float(v.replace(',', '.'))
-                except: 
-                    is_numeric = False
-                    break
-            
-            meta.finalize_type(is_numeric)
-            
+            # Write to Loom
             loom.write(values, loom_path)
             meta.dataset_size = loom.get_dataset_size(loom_path)
+            
             result["metadata"].append(meta)
             existing_paths.add(loom_path)
 
@@ -159,9 +168,6 @@ class H5ADHandler:
                 loom.write(data, loom_path)
                 
                 # Determine dimensions
-                # data.shape is (N, M). 
-                # If orientation is CELL: N = cells, M = components (cols)
-                # If orientation is GENE: N = genes, M = components (rows)
                 n_items, n_components = data.shape[0], (data.shape[1] if len(data.shape) > 1 else 1)
     
                 # 3. Create Metadata entry
@@ -169,8 +175,8 @@ class H5ADHandler:
                     name=loom_path,
                     on=orientation,
                     type="NUMERIC",
-                    nber_rows=n_items if orientation == "GENE" else 1,
-                    nber_cols=n_components if orientation == "CELL" else 1,
+                    nber_rows=n_items if orientation == "GENE" else n_components,
+                    nber_cols=n_items if orientation == "CELL" else n_components,
                     dataset_size=loom.get_dataset_size(loom_path),
                     imported=1
                 )
@@ -273,22 +279,21 @@ class H5ADHandler:
                         continue
                     
                     try:
-                        # 1. Size constraint: uns is for small metadata. 
-                        # Large arrays should be in obsm/varm/layers.
-                        if item.size > 1000:
-                            continue
-                        
-                        val = item[()]
-                        
+                        # 1. Get exact shape from H5AD
+                        raw_shape = item.shape
+                        if len(raw_shape) >= 2:
+                            r, c = raw_shape[0], raw_shape[1]
+                        elif len(raw_shape) == 1:
+                            r, c = raw_shape[0], 1 
+                        else: # Scalar
+                            r, c = 1, 1
+
                         # 2. Advanced String/Byte Decoding
+                        val = item[()]
                         if isinstance(val, (bytes, np.bytes_)):
                             val = val.decode('utf-8')
-                        elif isinstance(val, np.ndarray):
-                            if val.dtype.kind in ['S', 'U']: # Bytes or Unicode
-                                val = [v.decode('utf-8') if isinstance(v, bytes) else str(v) for v in val]
-                            elif val.ndim == 0: # Handle scalar arrays
-                                val = val.item()
-                                if isinstance(val, bytes): val = val.decode('utf-8')
+                        elif isinstance(val, np.ndarray) and val.dtype.kind in ('S', 'U'):
+                            val = np.array([v.decode('utf-8') if isinstance(v, bytes) else str(v) for v in val.flatten()]).reshape(val.shape)
                         
                         # 3. Write as a dataset in attrs
                         loom.write(val, loom_path)
@@ -300,13 +305,13 @@ class H5ADHandler:
                         except:
                             pass
                         
-                        # Add to result["metadata"]
+                        # 5. Add to result["metadata"]
                         meta = Metadata(
                             name=loom_path, # Global attrs in Loom are at root level
                             on="GLOBAL",
                             type="NUMERIC" if is_num else "STRING",
-                            nber_cols=len(val) if isinstance(val, (list, np.ndarray)) else 1, # If it's a list/array, we can specify the length in nber_cols
-                            nber_rows=1,
+                            nber_rows=int(r),
+                            nber_cols=int(c),
                             dataset_size=loom.get_dataset_size(loom_path),
                             imported=1
                         )
@@ -478,6 +483,40 @@ class H5ADHandler:
             ### 6.f: uns (Unstructured metadata like colors or global parameters)
             H5ADHandler.transfer_unstructured_metadata(f, loom, result, existing_paths)
 
+            ### 6.g. Transfer alternative main matrices to layers
+            # We check the candidates and see if they were the one picked as 'input_group'
+            for candidate in ['/X', '/raw/X', '/raw.X']:
+                if candidate in f and candidate != result["input_group"]:
+                    try:
+                        # 1. Check dimensions in H5AD (Cells, Genes)
+                        c_count, r_count = H5ADHandler.get_size(f, candidate)
+                        if c_count == result["nber_cols"] and r_count == result["nber_rows"]:
+                            layer_name = candidate.strip("/").replace("/", "_")
+                            loom_layer_path = f"/layers/{layer_name}"
+                            if loom_layer_path not in existing_paths:
+                                # 2. Write matrix and get stats (passing None for gene_metadata to skip heavy stats)
+                                layer_stats = loom.write_matrix(f, candidate, loom_layer_path, result["nber_cols"], result["nber_rows"], None)
+                                # 3. Register in Metadata with layer-specific stats
+                                meta = Metadata(
+                                    name=loom_layer_path,
+                                    on="EXPRESSION_MATRIX",
+                                    type="NUMERIC",
+                                    nber_rows=result["nber_rows"],
+                                    nber_cols=result["nber_cols"],
+                                    dataset_size=loom.get_dataset_size(loom_layer_path),
+                                    imported=1
+                                )
+                                # Manually attach layer-specific stats since Metadata constructor might not handle them as positional arguments
+                                meta.nber_zeros = layer_stats["total_zeros"]
+                                meta.is_count_table = layer_stats["is_count_table"]
+                                result["metadata"].append(meta)
+                                existing_paths.add(loom_layer_path)
+                        else:
+                            # Log dimension mismatch as a warning
+                            result.setdefault("warning", []).append( f"Skipping {candidate}: Dimensions ({r_count}x{c_count}) don't match primary matrix ({result['nber_rows']}x{result['nber_cols']})")
+                    except Exception as e:
+                        result.setdefault("warning", []).append(f"Could not transfer alternative matrix {candidate}: {e}")
+            
             ### 7. end
             loom.close()
 
@@ -688,73 +727,64 @@ class LoomFile:
         # 2. Identify Matrix Type
         group = f[src_path]
         is_sparse = 'data' in group and 'indices' in group and 'indptr' in group
-        
-        # Initialize stats vectors
-        cell_depth = np.zeros(n_cells)
-        cell_detected = np.zeros(n_cells)
-        cell_mt = np.zeros(n_cells)
-        cell_rrna = np.zeros(n_cells)
-        cell_prot = np.zeros(n_cells)
-        
-        gene_sum = np.zeros(n_genes)
+
+        # Initialize stats
         total_zeros = 0
         is_integer = True
-
+        
+        # Initialize stats vectors ONLY if gene_metadata is provided
+        cell_depth = np.zeros(n_cells) if gene_metadata else None
+        cell_detected = np.zeros(n_cells) if gene_metadata else None
+        cell_mt = np.zeros(n_cells) if gene_metadata else None
+        cell_rrna = np.zeros(n_cells) if gene_metadata else None
+        cell_prot = np.zeros(n_cells) if gene_metadata else None
+        gene_sum = np.zeros(n_genes) if gene_metadata else None
+        
+        # Pre-calculate indices to avoid doing it inside the loop
+        mt_idx = rrna_idx = prot_idx = []
+        if gene_metadata is not None:
+            mt_idx = [i for i, g in enumerate(gene_metadata) if g.chr == "MT"]
+            rrna_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "rRNA"]
+            prot_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "protein_coding"]
+        
         # 3. Chunked Processing (Process by Cell blocks) 
         for start in range(0, n_cells, 1024):
             end = min(start + 1024, n_cells)
             
             # Extract chunk
             if is_sparse:
-                # Load sparse chunk and convert to dense for calculation
-                import scipy.sparse as sp
-                data = group['data']
-                indices = group['indices']
-                indptr = group['indptr']
-                
-                # Create a CSR slice
-                ptr_slice = indptr[start:end+1]
-                data_slice = data[ptr_slice[0]:ptr_slice[-1]]
-                indices_slice = indices[ptr_slice[0]:ptr_slice[-1]]
-                
-                # Adjust indptr to start at 0
-                ptr_slice = ptr_slice - ptr_slice[0]
-                
-                chunk = sp.csr_matrix((data_slice, indices_slice, ptr_slice), 
-                                     shape=(end-start, n_genes)).toarray()
+                ptr = group['indptr'][start:end+1]
+                chunk = sp.csr_matrix((group['data'][ptr[0]:ptr[-1]], group['indices'][ptr[0]:ptr[-1]], ptr - ptr[0]), shape=(end-start, n_genes)).toarray()
             else:
-                chunk = group[start:end, :] # Dense slice
+                chunk = group[start:end, :]
 
             # --- Compute Stats ---
             # Check if all values are integers
-            if is_integer and not np.all(np.equal(np.mod(chunk, 1), 0)):
-                is_integer = False
-            
-            # Cell stats
-            cell_depth[start:end] = chunk.sum(axis=1)
-            cell_detected[start:end] = (chunk > 0).sum(axis=1)
-            
-            # Content based on gene biotypes/chrom
-            # (Assuming gene_metadata is a list of Gene objects indexed 0..n_genes)
-            mt_idx = [i for i, g in enumerate(gene_metadata) if g.chr == "MT"]
-            rrna_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "rRNA"]
-            prot_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "protein_coding"]
-            
-            if mt_idx: cell_mt[start:end] = chunk[:, mt_idx].sum(axis=1)
-            if rrna_idx: cell_rrna[start:end] = chunk[:, rrna_idx].sum(axis=1)
-            if prot_idx: cell_prot[start:end] = chunk[:, prot_idx].sum(axis=1)
-
-            # Gene stats (Accumulate)
-            gene_sum += chunk.sum(axis=0)
             total_zeros += (chunk == 0).sum()
+            if is_integer:
+                if not np.all(np.equal(np.mod(chunk, 1), 0)):
+                    is_integer = False
 
-            # --- Write to Loom (Transposed) ---
+            if gene_metadata is not None: # We only compute it in this case
+                # Cell stats
+                cell_depth[start:end] = chunk.sum(axis=1)
+                cell_detected[start:end] = (chunk > 0).sum(axis=1)
+                
+                # Gene stats (Accumulate)
+                gene_sum += chunk.sum(axis=0)
+                
+                # Content based on gene biotypes/chrom          
+                if mt_idx: cell_mt[start:end] = chunk[:, mt_idx].sum(axis=1)
+                if rrna_idx: cell_rrna[start:end] = chunk[:, rrna_idx].sum(axis=1)
+                if prot_idx: cell_prot[start:end] = chunk[:, prot_idx].sum(axis=1)
+
+            # --- Write to Loom (Transposed chunk) ---
             dset[:, start:end] = chunk.T
 
-        # 5. Final Aggregates
         # Function to calculate Percentages (0 to 100)
         # We use np.divide with 'where' to avoid division by zero errors for empty cells
         def to_percentage(subset_sum, total_sum):
+            if subset_sum is None or total_sum is None: return None
             return np.divide(subset_sum, total_sum, out=np.zeros_like(subset_sum), where=total_sum != 0) * 100
         
         stats = {
@@ -764,11 +794,12 @@ class LoomFile:
             "cell_rrna": to_percentage(cell_rrna, cell_depth),
             "cell_prot": to_percentage(cell_prot, cell_depth),
             "gene_sum": gene_sum,
-            "total_zeros": total_zeros,
-            "is_count_table": is_integer,
-            "empty_cells": np.sum(cell_depth == 0),
-            "empty_genes": np.sum(gene_sum == 0)
+            "total_zeros": int(total_zeros),
+            "is_count_table": int(is_integer),
+            "empty_cells": np.sum(cell_depth == 0) if cell_depth is not None else None,
+            "empty_genes": np.sum(gene_sum == 0) if gene_sum is not None else None,
         }
+
         return stats
     
     def close(self) -> None:
@@ -785,13 +816,24 @@ def dataclass_to_json(obj):
     if dataclasses.is_dataclass(obj):
         d = dataclasses.asdict(obj)
         return {
-            k: v for k, v in d.items() 
+            k: dataclass_to_json(v) for k, v in d.items() 
             if v is not None and not (isinstance(v, (set, list, dict)) and len(v) == 0)
         }
-    if isinstance(obj, set):
-        return sorted(list(obj))
-    # Dictionaries are natively supported by JSON, so no extra logic needed here
-    return str(obj)
+    if isinstance(obj, dict):
+        # Clean keys: Convert numpy/bool keys to strings
+        return {str(k): dataclass_to_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        # Recursively clean lists/sets
+        return [dataclass_to_json(x) for x in obj]
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, (np.str_, np.bytes_)):
+        return str(obj)
+    return obj
 
 @dataclass
 class Metadata:
@@ -803,6 +845,8 @@ class Metadata:
     dataset_size: int = 0
     distinct_values: int = None
     missing_values: int = None
+    nber_zeros: int = None
+    is_count_table: int = None
     imported: int = 0
     categories: Dict[str, int] = field(default_factory=dict) # Changed from Set to Dict
     values: Set[str] = field(default_factory=set)
@@ -812,8 +856,21 @@ class Metadata:
         if n_unique == 0: return False
         if n_unique > 500: return False
         if n_unique < 10: return True
-        # Threshold: unique values < 10% of total rows
-        return n_unique <= (self.nber_rows * 0.10)
+            
+        # Determine the denominator based on the orientation
+        if self.on == "CELL":
+            denominator = self.nber_cols
+        elif self.on == "GENE":
+            denominator = self.nber_rows
+        else: 
+            # For GLOBAL, we don't really have a denominator to compare density, 
+            # so we rely on the n_unique < 10 or n_unique > 500 rules.
+            return n_unique < 10
+
+        if denominator == 0: return False
+        
+        # Threshold: unique values < 10% of the relevant dimension
+        return n_unique <= (denominator * 0.10)
 
     def finalize_type(self, is_numeric: bool):
         """Sets the final type and clears categories if not categorical."""
