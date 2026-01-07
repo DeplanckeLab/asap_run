@@ -254,58 +254,68 @@ class H5ADHandler:
                 result.setdefault("warning", []).append(f"Failed to transfer layer {layer_name}: {str(e)}")
 
     @staticmethod
-    def transfer_unstructured_metadata(f, loom, result):
+    def transfer_unstructured_metadata(f, loom, result, existing_paths):
         if "uns" not in f: return
-        uns_group = f["uns"]
-        
+
+        # Function for recursive check of uns/ arborescence
         def walk(group, prefix=""):
             for key in group.keys():
                 item = group[key]
                 attr_name = f"{prefix}{key}"
+                loom_path = f"/attrs/{attr_name}"
                 
-                if isinstance(item, h5py.Group): 
+                if isinstance(item, h5py.Group):
+                    # Recursively walk groups
                     walk(item, prefix=f"{attr_name}_")
-                
                 elif isinstance(item, h5py.Dataset):
+                    # 0. Protection Check
+                    if loom_path in existing_paths:
+                        continue
+                    
                     try:
+                        # 1. Size constraint: uns is for small metadata. 
+                        # Large arrays should be in obsm/varm/layers.
                         if item.size > 1000:
                             continue
                         
                         val = item[()]
                         
-                        # Handle string decoding
-                        if isinstance(val, bytes): 
+                        # 2. Advanced String/Byte Decoding
+                        if isinstance(val, (bytes, np.bytes_)):
                             val = val.decode('utf-8')
-                        elif isinstance(val, np.ndarray) and val.dtype.kind == 'S':
-                            val = [v.decode('utf-8') for v in val]
+                        elif isinstance(val, np.ndarray):
+                            if val.dtype.kind in ['S', 'U']: # Bytes or Unicode
+                                val = [v.decode('utf-8') if isinstance(v, bytes) else str(v) for v in val]
+                            elif val.ndim == 0: # Handle scalar arrays
+                                val = val.item()
+                                if isinstance(val, bytes): val = val.decode('utf-8')
                         
-                        # Write to Loom attributes
-                        loom.handle.attrs[attr_name] = val
+                        # 3. Write as a dataset in attrs
+                        loom.write(val, loom_path)
                         
-                        # Determine the "type" for metadata
-                        # We use NUMERIC if it's a number/array of numbers, else STRING
-                        is_num = np.issubdtype(np.array(val).dtype, np.number)
+                        # 4. Determine Numeric Type (We use NUMERIC if it's a number/array of numbers, else STRING)
+                        is_num = False
+                        try:
+                            is_num = np.issubdtype(np.array(val).dtype, np.number)
+                        except:
+                            pass
                         
                         # Add to result["metadata"]
                         meta = Metadata(
-                            name=f"attrs/{attr_name}", # Global attrs in Loom are at root level
+                            name=loom_path, # Global attrs in Loom are at root level
                             on="GLOBAL",
                             type="NUMERIC" if is_num else "STRING",
-                            nber_cols=1,
+                            nber_cols=len(val) if isinstance(val, (list, np.ndarray)) else 1, # If it's a list/array, we can specify the length in nber_cols
                             nber_rows=1,
+                            dataset_size=loom.get_dataset_size(loom_path),
                             imported=1
                         )
-                        
-                        # If it's a list/array, we can specify the length in nber_cols
-                        if isinstance(val, (list, np.ndarray)):
-                            meta.nber_cols = len(val)
-
                         result["metadata"].append(meta)
                         
                     except Exception as e:
                         result.setdefault("warning", []).append(f"Skipping uns item {attr_name}: {str(e)}")
         
-        walk(uns_group)
+        walk(f["uns"])
     
     @staticmethod
     def parse(args, file_path, gene_db):
@@ -448,6 +458,7 @@ class H5ADHandler:
             ## 6. Transfer the existing metadata from h5ad to Loom
             # To avoid overwriting fields I've already generated
             existing_paths = {m.name for m in result["metadata"]}
+            existing_paths.add("/attrs/LOOM_SPEC_VERSION")
 
             ### 6.a. Transfer obs (Cell unidimensional metadata)
             H5ADHandler.transfer_metadata(f, "obs", loom, result, "CELL", existing_paths)
@@ -465,7 +476,7 @@ class H5ADHandler:
             H5ADHandler.transfer_layers(f, loom, result, result["nber_cols"], result["nber_rows"], existing_paths)
 
             ### 6.f: uns (Unstructured metadata like colors or global parameters)
-            H5ADHandler.transfer_unstructured_metadata(f, loom, result)
+            H5ADHandler.transfer_unstructured_metadata(f, loom, result, existing_paths)
 
             ### 7. end
             loom.close()
@@ -629,17 +640,32 @@ class LoomFile:
     
     def write(self, data, path: str) -> None:
         try:
+            # 1. Convert to numpy and handle strings
             if not isinstance(data, np.ndarray):
                 data = np.array(data)
+            
             if data.dtype.kind in ('U', 'S', 'O'):
                 data = data.astype('O') 
                 dtype = h5py.string_dtype(encoding='utf-8')
             else:
                 dtype = None 
+
+            # 2. Delete existing path to allow overwriting
             if path in self.handle:
                 del self.handle[path]
             
-            self.handle.create_dataset(path, data=data, dtype=dtype, compression="gzip")
+            # 3. Handle Scalar vs Dataset
+            # If data.ndim is 0, it's a scalar (e.g., a single float or string)
+            if data.ndim == 0:
+                self.handle.create_dataset(path, data=data, dtype=dtype)
+            else:
+                # Only use compression for arrays with 1 or more dimensions
+                self.handle.create_dataset(
+                    path, 
+                    data=data, 
+                    dtype=dtype, 
+                    compression="gzip"
+                )
         except Exception as e:
             ErrorJSON(f"Error writing to {path} with dtype {data.dtype}: {e}")
 
