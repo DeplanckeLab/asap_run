@@ -16,7 +16,6 @@ import numpy as np # For diverse array calculations
 import re # Regex for gene to db comparison
 from pathlib import Path # Needed for file extension manipulation
 from collections import Counter # To count categories occurrences
-from scipy.sparse import isspmatrix_csr, isspmatrix_csc # For handling sparse matrices
 import scipy.sparse as sp
 
 custom_help = """
@@ -37,105 +36,242 @@ Options:
        
 class H5ADHandler:
     @staticmethod
+    def _is_compound_table(node) -> bool:
+        return isinstance(node, h5py.Dataset) and node.dtype.fields is not None
+
+    @staticmethod
+    def _table_columns(f, table_path: str):
+        node = f[table_path]
+        if isinstance(node, h5py.Group):
+            cols = node.attrs.get('_column_names', list(node.keys()))
+            if isinstance(cols, np.ndarray):
+                cols = cols.tolist()
+            return cols
+        elif H5ADHandler._is_compound_table(node):
+            return list(node.dtype.names or [])
+        else:
+            return []
+
+    @staticmethod
+    def _table_get_column(f, table_path: str, col: str):
+        node = f[table_path]
+        if isinstance(node, h5py.Group):
+            if col not in node:
+                raise KeyError(col)
+            return node[col]  # may be Dataset or Group (categorical)
+        elif H5ADHandler._is_compound_table(node):
+            # returns a numpy array for that field
+            return node[col]
+        else:
+            raise TypeError(f"Unsupported table node at {table_path}")
+    
+    @staticmethod
     def get_size(f, path):
-        # Get matrix dimensions
-        shape = f[path].attrs.get('shape', None)
+        node = f[path]
+    
+        # 1) Standard attrs (anndata / h5sparse)
+        shape = node.attrs.get("shape", None)
         if shape is None:
-            shape = f[path].attrs.get('h5sparse_shape', None)
-        if shape is None: # Dense matrix?
-            shape = f[path].shape  # fallback: dense matrix or explicitly stored shape
-        return tuple(int(x) for x in shape)
+            shape = node.attrs.get("h5sparse_shape", None)
+        if shape is not None:
+            return tuple(int(x) for x in shape)
+    
+        # 2) Dense dataset fallback
+        if isinstance(node, h5py.Dataset):
+            return tuple(int(x) for x in node.shape)
+    
+        # 3) Sparse group inference fallback (best-effort)
+        if isinstance(node, h5py.Group) and all(k in node for k in ("data", "indices", "indptr")):
+            # infer rows/cols depending on encoding
+            enc = node.attrs.get("encoding-type", "csr_matrix")
+            if isinstance(enc, bytes):
+                enc = enc.decode()
+            enc = str(enc)
+    
+            # One dimension is length(indptr)-1
+            major = int(node["indptr"].shape[0] - 1)
+    
+            # Other dimension: max(indices)+1 (expensive but usually ok, still best-effort)
+            # Use chunks if huge? For now keep simple.
+            idx = node["indices"][:]
+            minor = int(idx.max() + 1) if idx.size else 0
+    
+            if enc == "csr_matrix":
+                return (major, minor)   # (cells, genes)
+            elif enc == "csc_matrix":
+                return (minor, major)   # (cells, genes)
+            else:
+                raise ErrorJSON(f"Unsupported encoding-type={enc!r} at {path}")
+    
+        raise ErrorJSON(f"Could not determine shape for {path}")
     
     @staticmethod
     def extract_index(f, path):
         try:
-            # AnnData stores the name of the index column in the '_index' attribute
-            raw = f[path].attrs.get('_index', 'index') 
-            index_col_name = raw.decode() if isinstance(raw, bytes) else raw
-            full_path = f"{path.rstrip('/')}/{index_col_name.lstrip('/')}"
-            
-            if full_path not in f:
-                # Fallback if the attribute pointed to a non-existent path
-                full_path = f"{path.rstrip('/')}/_index"
-                
-            return [v.decode() if isinstance(v, bytes) else str(v)
-                    for v in f[full_path][:]]    
+            node = f[path]
+    
+            # CASE A: Group-based obs/var (current behavior)
+            if isinstance(node, h5py.Group):
+                raw = node.attrs.get('_index', 'index')
+                index_col_name = raw.decode() if isinstance(raw, bytes) else raw
+                full_path = f"{path.rstrip('/')}/{index_col_name.lstrip('/')}"
+                if full_path not in f:
+                    full_path = f"{path.rstrip('/')}/_index"
+                return [v.decode() if isinstance(v, bytes) else str(v) for v in f[full_path][:]]
+    
+            # CASE B: Compound dataset obs/var
+            if H5ADHandler._is_compound_table(node):
+                raw = node.attrs.get('_index', None)
+                index_field = raw.decode() if isinstance(raw, bytes) else raw
+    
+                # try attr-provided field first, otherwise common fallbacks
+                candidates = []
+                if index_field:
+                    candidates.append(index_field)
+                candidates += ["_index", "index", "obs_names", "var_names"]
+    
+                for c in candidates:
+                    if c in (node.dtype.names or ()):
+                        vals = node[c]
+                        # decode bytes if needed
+                        if getattr(vals, "dtype", None) is not None and vals.dtype.kind in ("S", "O", "U"):
+                            return [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in vals]
+                        return [str(v) for v in vals]
+    
+                ErrorJSON(f"Could not find index field in compound table {path}. Fields: {node.dtype.names}")
+    
+            ErrorJSON(f"Unsupported obs/var node at {path}")
+    
         except Exception:
             ErrorJSON(f"Could not find index for {path}. Ensure the H5AD is valid.")
 
     @staticmethod
+    def _find_categories_for_column(f, table_path: str, col: str):
+        """
+        Returns list[str] categories if found, else None.
+        Looks in old-style __categories, cat, and raw/cat locations.
+        """
+        candidates = []
+    
+        # categories attached to table
+        candidates.append(f"{table_path.rstrip('/')}/__categories/{col}")
+        candidates.append(f"{table_path.rstrip('/')}/cat/{col}")
+    
+        # raw-specific category store you mentioned
+        # if table_path is raw/obs or raw/var, raw/cat is a likely store
+        if table_path.startswith("raw/") or table_path.startswith("/raw/"):
+            candidates.append("raw/cat/" + col)
+            candidates.append("/raw/cat/" + col)
+    
+        # also sometimes categories live at top-level /cat
+        candidates.append("cat/" + col)
+        candidates.append("/cat/" + col)
+    
+        for p in candidates:
+            if p in f and isinstance(f[p], h5py.Dataset):
+                cats = f[p][:]
+                cats = [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in cats]
+                return cats
+
+        # Fallback: categories stored in uns as "<col>_categories"
+        for p in (f"uns/{col}_categories", f"/uns/{col}_categories"):
+            if p in f and isinstance(f[p], h5py.Dataset):
+                cats = f[p][:]
+                return [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in cats]
+    
+        return None
+
+    @staticmethod
     def transfer_metadata(f, group_path, loom, result, orientation, existing_paths):
-        if group_path not in f: return
-        group = f[group_path]
-        
-        # 1. Identify the index column to avoid importing it as metadata
-        # AnnData stores the index name in the '_index' attribute
-        index_col = group.attrs.get('_index', '_index')
-        if isinstance(index_col, bytes): index_col = index_col.decode()
-
-        # 2. Get column order
-        columns = group.attrs.get('_column_names', list(group.keys()))
-        if isinstance(columns, np.ndarray): columns = columns.tolist()
-
-        # Handle old-style categories group
-        has_old_categories = "__categories" in group and isinstance(group["__categories"], h5py.Group)
-        old_cat_group = group["__categories"] if has_old_categories else None
-        
-        for col in columns:
-            # Skip index and internal categorical components
-            if col in [index_col, '_index', 'categories', 'codes', '__categories']: continue
-
-            # Construct the destination path in the Loom file
+        if group_path not in f:
+            return
+    
+        cols = H5ADHandler._table_columns(f, group_path)
+        if not cols:
+            return
+    
+        # what to skip
+        skip_cols = {"_index", "categories", "codes", "__categories", "cat"}
+    
+        # Identify index column name if available (group attr)
+        node = f[group_path]
+        index_col = None
+        if isinstance(node, h5py.Group):
+            index_col = node.attrs.get('_index', '_index')
+            if isinstance(index_col, bytes):
+                index_col = index_col.decode()
+    
+        for col in cols:
+            if col in skip_cols or (index_col and col == index_col):
+                continue
+    
             loom_path = f"/{'col' if orientation == 'CELL' else 'row'}_attrs/{col}"
-            if loom_path in existing_paths: continue
-
-            if col not in group: continue
-            
-            item = group[col]
+            if loom_path in existing_paths:
+                continue
+    
             values = None
-
-            # --- CASE 1: Categorical Data (Stored as a Group) ---
-            if isinstance(item, h5py.Group):
-                if 'categories' in item and 'codes' in item:
+    
+            # ---- CASE 1: group-based column (could be categorical group or dataset) ----
+            if isinstance(node, h5py.Group):
+                item = node[col]
+    
+                # new-style categorical group: {categories, codes}
+                if isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
                     cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item['categories'][:]]
                     codes = item['codes'][:]
-                    # Map codes to categories, handle -1 as NaN/missing
-                    values = np.array([cats[c] if c != -1 else "nan" for c in codes])
+                    values = np.array([cats[c] if c != -1 else "nan" for c in codes], dtype=object)
+    
+                # old-style categorical: codes in obs/<col>, categories in obs/__categories/<col>
+                elif isinstance(item, h5py.Dataset) and np.issubdtype(item.dtype, np.integer):
+                    cats = H5ADHandler._find_categories_for_column(f, group_path, col)
+                    if cats is not None:
+                        codes = item[:]
+                        def map_code(c):
+                            if c == -1: return "nan"
+                            c = int(c)
+                            return cats[c] if 0 <= c < len(cats) else "nan"
+                        values = np.array([map_code(c) for c in codes], dtype=object)
+                    else:
+                        values = item[:]
+    
                 else:
-                    # It's a group but not categorical (e.g. nested metadata)
-                    # We skip these as Loom only supports 1D/2D datasets in col_attrs
-                    continue
-                    
-            # --- CASE 2: Old categorical encoding: codes in obs/<col>, categories in obs/__categories/<col> ---
-            elif ( has_old_categories and col in old_cat_group and isinstance(old_cat_group[col], h5py.Dataset) and isinstance(item, h5py.Dataset) and np.issubdtype(item.dtype, np.integer) ):
-                cats = old_cat_group[col][:]
-                cats = [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in cats]
-                codes = item[:]
-                # guard against out-of-range codes
-                def map_code(c):
-                    if c == -1: return "nan"
-                    if 0 <= int(c) < len(cats): return cats[int(c)]
-                    return "nan"
-                values = np.array([map_code(c) for c in codes], dtype=object)
-
-            # --- CASE 3: Standard Dataset ---
+                    raw_values = item[:]
+                    if raw_values.dtype.kind in ('S', 'U', 'O'):
+                        values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values], dtype=object)
+                    else:
+                        values = raw_values
+    
+            # ---- CASE 2: compound table (values are already arrays) ----
             else:
-                raw_values = item[:]
-                # Handle byte-string decoding for the whole array
-                if hasattr(raw_values, "dtype") and raw_values.dtype.kind in ('S', 'U', 'O'):
-                    values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values])
+                raw_values = node[col]
+    
+                # If integer codes and categories exist (raw.cat etc.), decode them
+                if np.issubdtype(np.array(raw_values).dtype, np.integer):
+                    cats = H5ADHandler._find_categories_for_column(f, group_path, col)
+                    if cats is not None:
+                        def map_code(c):
+                            if c == -1: return "nan"
+                            c = int(c)
+                            return cats[c] if 0 <= c < len(cats) else "nan"
+                        values = np.array([map_code(c) for c in raw_values], dtype=object)
+                    else:
+                        values = raw_values
                 else:
-                    values = raw_values
-
-            if values is None: continue
-
-            # Dimension check
+                    if np.array(raw_values).dtype.kind in ('S', 'U', 'O'):
+                        values = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in raw_values], dtype=object)
+                    else:
+                        values = raw_values
+    
+            if values is None:
+                continue
+    
             expected_len = result["nber_cols"] if orientation == "CELL" else result["nber_rows"]
             if len(values) != expected_len:
-                result.setdefault("warning", []).append(f"Skipping {col}: length mismatch.")
+                entity = "cells" if orientation == "CELL" else "genes"
+                result.setdefault("warning", []).append(f"Skipping {col} from {group_path}: length mismatch. Expected {expected_len} {entity}, but found {len(values)}.")
                 continue
             
-            # Create Metadata entry
+            # --- your existing Metadata build/write logic ---
             meta = Metadata(
                 name=loom_path,
                 on=orientation,
@@ -144,20 +280,20 @@ class H5ADHandler:
                 missing_values=count_missing(values),
                 imported=1
             )
-            
-            # 3. Use Metadata class logic for type determination
-            counts = Counter(values.flatten() if hasattr(values, 'flatten') else values)   
-            meta.distinct_values = len(counts)           
+    
+            counts = Counter(values.flatten() if hasattr(values, 'flatten') else values)
+            meta.distinct_values = len(counts)
             meta.categories = dict(counts)
-            is_numeric = np.issubdtype(values.dtype, np.number)
-            meta.finalize_type(is_numeric) # If is_categorical() is False, it sets type to STRING/NUMERIC and resets self.categories = {}
-            
-            # Write to Loom
+    
+            is_numeric = np.issubdtype(np.array(values).dtype, np.number)
+            meta.finalize_type(is_numeric)
+    
             loom.write(values, loom_path)
             meta.dataset_size = loom.get_dataset_size(loom_path)
-            
+    
             result["metadata"].append(meta)
             existing_paths.add(loom_path)
+
 
     @staticmethod
     def transfer_multidimensional_metadata(f, group_path, loom, result, orientation, existing_paths):
@@ -215,66 +351,106 @@ class H5ADHandler:
     def transfer_layers(f, loom, result, n_cells, n_genes, existing_paths):
         """
         Transfers additional matrices from H5AD /layers to Loom /layers.
+        Supports dense, CSR, and CSC encoded sparse layers.
         Uses chunked processing to remain RAM-efficient.
         """
-        if "layers" not in f:  return
+        if "layers" not in f:
+            return
+    
+        def _encoding_type(h5_group) -> str:
+            et = h5_group.attrs.get("encoding-type", "csr_matrix")
+            if isinstance(et, bytes):
+                et = et.decode()
+            return str(et)
+    
         for layer_name in f["layers"].keys():
             loom_path = f"/layers/{layer_name}"
-            
-            # 1. Duplicate Check
+    
+            # 1) Duplicate check
             if loom_path in existing_paths:
                 result.setdefault("warning", []).append(f"Skipping layer {layer_name}: already exists.")
                 continue
     
             try:
-                # Check dimension
+                # 2) Dimension check (Cells, Genes in H5AD)
                 l_shape = H5ADHandler.get_size(f, f"layers/{layer_name}")
                 if l_shape[0] != n_cells or l_shape[1] != n_genes:
-                    result.setdefault("warning", []).append(f"Skipping layer {layer_name}: dimension mismatch. Expected ({n_cells}, {n_genes}), found {l_shape}.")
+                    result.setdefault("warning", []).append(
+                        f"Skipping layer {layer_name}: dimension mismatch. "
+                        f"Expected ({n_cells}, {n_genes}), found {l_shape}."
+                    )
                     continue
-                
-                # 2. Prepare Loom Dataset (Genes x Cells)
-                # Loom expects layers to be transposed relative to H5AD, just like the main matrix
+    
+                # 3) Prepare Loom dataset (Genes x Cells)
                 dset = loom.handle.create_dataset(
-                    loom_path, 
-                    shape=(n_genes, n_cells), 
-                    dtype='float32', 
+                    loom_path,
+                    shape=(n_genes, n_cells),
+                    dtype="float32",
                     chunks=(min(n_genes, 1024), min(n_cells, 1024)),
-                    compression="gzip"
+                    compression="gzip",
                 )
     
-                # 3. Detect Sparse vs Dense
-                layer_data = f["layers"][layer_name]
-                is_sparse = 'data' in layer_data and 'indices' in layer_data and 'indptr' in layer_data
+                layer_node = f["layers"][layer_name]
     
-                # 4. Chunked Write
+                is_sparse = (
+                    isinstance(layer_node, h5py.Group)
+                    and all(k in layer_node for k in ("data", "indices", "indptr"))
+                )
+                is_dense = isinstance(layer_node, h5py.Dataset)
+    
+                if not (is_sparse or is_dense):
+                    result.setdefault("warning", []).append(
+                        f"Skipping layer {layer_name}: unsupported layout (not dense dataset or sparse group)."
+                    )
+                    continue
+    
+                # 4) If CSC, build CSR view once
+                enc = None
+                csr_view = None
+                if is_sparse:
+                    enc = _encoding_type(layer_node)
+                    if enc == "csc_matrix":
+                        X_csc = sp.csc_matrix(
+                            (layer_node["data"][:], layer_node["indices"][:], layer_node["indptr"][:]),
+                            shape=(n_cells, n_genes),
+                        )
+                        csr_view = X_csc.tocsr()
+                    elif enc != "csr_matrix":
+                        result.setdefault("warning", []).append(
+                            f"Skipping layer {layer_name}: unsupported encoding-type={enc!r}."
+                        )
+                        continue
+    
+                # 5) Chunked write (cells x genes -> genes x cells)
                 for start in range(0, n_cells, 1024):
                     end = min(start + 1024, n_cells)
-                    
-                    if is_sparse:
-                        import scipy.sparse as sp
-                        ptr = layer_data['indptr'][start:end+1]
-                        chunk = sp.csr_matrix(
-                            (layer_data['data'][ptr[0]:ptr[-1]], 
-                             layer_data['indices'][ptr[0]:ptr[-1]], 
-                             ptr - ptr[0]), 
-                            shape=(end-start, n_genes)
-                        ).toarray()
-                    else:
-                        chunk = layer_data[start:end, :]
     
-                    # Write Transposed
+                    if is_sparse:
+                        if enc == "csr_matrix":
+                            ptr = layer_node["indptr"][start:end + 1]
+                            chunk = sp.csr_matrix(
+                                (layer_node["data"][ptr[0]:ptr[-1]],
+                                 layer_node["indices"][ptr[0]:ptr[-1]],
+                                 ptr - ptr[0]),
+                                shape=(end - start, n_genes),
+                            ).toarray()
+                        else:
+                            # enc == "csc_matrix"
+                            chunk = csr_view[start:end, :].toarray()
+                    else:
+                        chunk = layer_node[start:end, :]
+    
                     dset[:, start:end] = chunk.T
     
-                # 5. Metadata Entry
+                # 6) Metadata entry
                 meta = Metadata(
                     name=loom_path,
-                    on="EXPRESSION_MATRIX", # Layers are global to the file
+                    on="EXPRESSION_MATRIX",
                     type="NUMERIC",
                     nber_rows=n_genes,
                     nber_cols=n_cells,
                     dataset_size=loom.get_dataset_size(loom_path),
-                    imported=1
+                    imported=1,
                 )
                 result["metadata"].append(meta)
                 existing_paths.add(loom_path)
@@ -284,67 +460,82 @@ class H5ADHandler:
 
     @staticmethod
     def transfer_unstructured_metadata(f, loom, result, existing_paths):
-        if "uns" not in f: return
-
-        # Function for recursive check of uns/ arborescence
+        if "uns" not in f:
+            return
+    
+        # Keys in uns that are really categorical dictionaries / lookup tables
+        def should_skip_uns_key(key: str) -> bool:
+            k = key.lower()
+            # the one you hit
+            if k.endswith("_categories"):
+                return True
+            # optional: also skip other common ones if you don't want them
+            # if k.endswith("_levels") or k.endswith("_codes"):
+            #     return True
+            return False
+    
         def walk(group, prefix=""):
             for key in group.keys():
                 item = group[key]
                 attr_name = f"{prefix}{key}"
-                loom_path = f"/attrs/{attr_name}"
-                
-                if isinstance(item, h5py.Group):
-                    # Recursively walk groups
-                    walk(item, prefix=f"{attr_name}_")
-                elif isinstance(item, h5py.Dataset):
-                    # 0. Protection Check
-                    if loom_path in existing_paths:
-                        continue
-                    
-                    try:
-                        # 1. Get exact shape from H5AD
-                        raw_shape = item.shape
-                        if len(raw_shape) >= 2:
-                            r, c = raw_shape[0], raw_shape[1]
-                        elif len(raw_shape) == 1:
-                            r, c = raw_shape[0], 1 
-                        else: # Scalar
-                            r, c = 1, 1
-
-                        # 2. Advanced String/Byte Decoding
-                        val = item[()]
-                        if isinstance(val, (bytes, np.bytes_)):
-                            val = val.decode('utf-8')
-                        elif isinstance(val, np.ndarray) and val.dtype.kind in ('S', 'U'):
-                            val = np.array([v.decode('utf-8') if isinstance(v, bytes) else str(v) for v in val.flatten()]).reshape(val.shape)
-                        
-                        # 3. Write as a dataset in attrs
-                        loom.write(val, loom_path)
-                        
-                        # 4. Determine Numeric Type (We use NUMERIC if it's a number/array of numbers, else STRING)
-                        is_num = False
-                        try:
-                            is_num = np.issubdtype(np.array(val).dtype, np.number)
-                        except:
-                            pass
-                        
-                        # 5. Add to result["metadata"]
-                        meta = Metadata(
-                            name=loom_path, # Global attrs in Loom are at root level
-                            on="GLOBAL",
-                            type="NUMERIC" if is_num else "STRING",
-                            nber_rows=int(r),
-                            nber_cols=int(c),
-                            dataset_size=loom.get_dataset_size(loom_path),
-                            imported=1
-                        )
-                        result["metadata"].append(meta)
-                        
-                    except Exception as e:
-                        result.setdefault("warning", []).append(f"Skipping uns item {attr_name}: {str(e)}")
-        
-        walk(f["uns"])
     
+                # --- NEW: skip *_categories (and friends, if you enable them) anywhere in uns ---
+                if should_skip_uns_key(attr_name):
+                    continue
+    
+                loom_path = f"/attrs/{attr_name}"
+    
+                if isinstance(item, h5py.Group):
+                    walk(item, prefix=f"{attr_name}_")
+                    continue
+    
+                if not isinstance(item, h5py.Dataset):
+                    continue
+    
+                if loom_path in existing_paths:
+                    continue
+    
+                try:
+                    raw_shape = item.shape
+                    if len(raw_shape) >= 2:
+                        r, c = raw_shape[0], raw_shape[1]
+                    elif len(raw_shape) == 1:
+                        r, c = raw_shape[0], 1
+                    else:
+                        r, c = 1, 1
+    
+                    val = item[()]
+                    if isinstance(val, (bytes, np.bytes_)):
+                        val = val.decode("utf-8")
+                    elif isinstance(val, np.ndarray) and val.dtype.kind in ("S", "U"):
+                        val = np.array(
+                            [v.decode("utf-8") if isinstance(v, bytes) else str(v) for v in val.flatten()]
+                        ).reshape(val.shape)
+    
+                    loom.write(val, loom_path)
+    
+                    is_num = False
+                    try:
+                        is_num = np.issubdtype(np.array(val).dtype, np.number)
+                    except:
+                        pass
+    
+                    meta = Metadata(
+                        name=loom_path,
+                        on="GLOBAL",
+                        type="NUMERIC" if is_num else "STRING",
+                        nber_rows=int(r),
+                        nber_cols=int(c),
+                        dataset_size=loom.get_dataset_size(loom_path),
+                        imported=1
+                    )
+                    result["metadata"].append(meta)
+    
+                except Exception as e:
+                    result.setdefault("warning", []).append(f"Skipping uns item {attr_name}: {str(e)}")
+    
+        walk(f["uns"])
+
     @staticmethod
     def parse(args, file_path, gene_db):
         result = {
@@ -696,6 +887,31 @@ class LoomFile:
         if path in self.handle:
             return self.handle[path].id.get_storage_size()
         return 0
+
+    @staticmethod
+    def _detect_encoding(node, n_cells, n_genes) -> str:
+        # 1) Try attr
+        enc = node.attrs.get("encoding-type", None)
+        if isinstance(enc, bytes):
+            enc = enc.decode()
+        enc = str(enc) if enc is not None else None
+    
+        # 2) Validate / infer from indptr length
+        indptr_len = int(node["indptr"].shape[0])
+        if indptr_len == n_cells + 1:
+            inferred = "csr_matrix"
+        elif indptr_len == n_genes + 1:
+            inferred = "csc_matrix"
+        else:
+            raise ErrorJSON( f"Cannot infer sparse encoding: len(indptr)={indptr_len}, expected {n_cells+1} (CSR) or {n_genes+1} (CSC)" )
+    
+        # If attr exists but disagrees, prefer inferred (and warn)
+        if enc and enc != inferred:
+            # optional: log warning instead of error
+            # print(f"WARNING: encoding-type attr={enc} but inferred={inferred}; using inferred")
+            return inferred
+    
+        return inferred
     
     def write(self, data, path: str) -> None:
         try:
@@ -746,11 +962,26 @@ class LoomFile:
 
         # 2. Identify Matrix Type
         node = f[src_path]
-        is_sparse = ( isinstance(node, h5py.Group) and all(k in node for k in ("data", "indices", "indptr")) )
-        is_dense = isinstance(node, h5py.Dataset)
+        is_sparse = isinstance(node, h5py.Group) and all(k in node for k in ("data", "indices", "indptr"))
+        is_dense  = isinstance(node, h5py.Dataset)
         if not (is_sparse or is_dense):
             ErrorJSON(f"Unsupported matrix layout at {src_path}: expected CSR group or dense dataset")
 
+        ## Prepare a CSR view once if CSC
+        csr_view = None
+        enc = None
+        if is_sparse:
+            enc = self._detect_encoding(node, n_cells, n_genes)
+            if enc == "csc_matrix":
+                # build once, convert once
+                X_csc = sp.csc_matrix(
+                    (node["data"][:], node["indices"][:], node["indptr"][:]),
+                    shape=(n_cells, n_genes),
+                )
+                csr_view = X_csc.tocsr()
+            elif enc != "csr_matrix":
+                ErrorJSON(f"Unsupported sparse encoding-type={enc!r} at {src_path}")
+        
         # Initialize stats
         total_zeros = 0
         is_integer = True
@@ -770,19 +1001,18 @@ class LoomFile:
             rrna_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "rRNA"]
             prot_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "protein_coding"]
         
-        # 3. Chunked Processing (Process by Cell blocks) 
+        # 3. Chunked Processing (Process by Cell blocks)
         for start in range(0, n_cells, 1024):
             end = min(start + 1024, n_cells)
             
             # Extract chunk
             if is_sparse:
-                ptr = node["indptr"][start:end + 1]
-                chunk = sp.csr_matrix(
-                    (node["data"][ptr[0]:ptr[-1]],
-                     node["indices"][ptr[0]:ptr[-1]],
-                     ptr - ptr[0]),
-                    shape=(end - start, n_genes)
-                ).toarray()
+                if enc == "csr_matrix":
+                    ptr = node["indptr"][start:end + 1]
+                    chunk = sp.csr_matrix( (node["data"][ptr[0]:ptr[-1]], node["indices"][ptr[0]:ptr[-1]], ptr - ptr[0]), shape=(end - start, n_genes) ).toarray()
+                else:
+                    # enc == "csc_matrix": use csr_view slicing
+                    chunk = csr_view[start:end, :].toarray()
             else:
                 # dense dataset
                 chunk = node[start:end, :]
@@ -838,7 +1068,22 @@ class LoomFile:
 ### DB Stuff ###
 
 def count_missing(obj):
-    return sum(1 for o in obj if o in [None, "", "nan", "NaN", "null"])
+    if isinstance(obj, np.ndarray):
+        flat = obj.ravel()
+    else:
+        flat = obj
+
+    missing = 0
+    for o in flat:
+        if o is None:
+            missing += 1
+            continue
+        if isinstance(o, (bytes, np.bytes_)):
+            o = o.decode(errors="ignore")
+        s = str(o)
+        if s == "" or s.lower() in ("nan", "null"):
+            missing += 1
+    return missing
 
 def dataclass_to_json(obj):
     if dataclasses.is_dataclass(obj):
