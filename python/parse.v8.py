@@ -68,18 +68,29 @@ class H5ADHandler:
         if group_path not in f: return
         group = f[group_path]
         
-        # AnnData stores column order in _column_names attribute
-        columns = group.attrs.get('_column_names', list(group.keys()))
-        if isinstance(columns, np.ndarray):
-            columns = columns.tolist()
+        # 1. Identify the index column to avoid importing it as metadata
+        # AnnData stores the index name in the '_index' attribute
+        index_col = group.attrs.get('_index', '_index')
+        if isinstance(index_col, bytes): index_col = index_col.decode()
 
+        # 2. Get column order
+        columns = group.attrs.get('_column_names', list(group.keys()))
+        if isinstance(columns, np.ndarray): columns = columns.tolist()
+
+        # Handle old-style categories group
+        has_old_categories = "__categories" in group and isinstance(group["__categories"], h5py.Group)
+        old_cat_group = group["__categories"] if has_old_categories else None
+        
         for col in columns:
-            if col in ['_index', 'categories', 'codes']: continue 
-            
+            # Skip index and internal categorical components
+            if col in [index_col, '_index', 'categories', 'codes', '__categories']: continue
+
+            # Construct the destination path in the Loom file
             loom_path = f"/{'col' if orientation == 'CELL' else 'row'}_attrs/{col}"
-            if loom_path in existing_paths:
-                continue
-    
+            if loom_path in existing_paths: continue
+
+            if col not in group: continue
+            
             item = group[col]
             values = None
 
@@ -94,12 +105,24 @@ class H5ADHandler:
                     # It's a group but not categorical (e.g. nested metadata)
                     # We skip these as Loom only supports 1D/2D datasets in col_attrs
                     continue
+                    
+            # --- CASE 2: Old categorical encoding: codes in obs/<col>, categories in obs/__categories/<col> ---
+            elif ( has_old_categories and col in old_cat_group and isinstance(old_cat_group[col], h5py.Dataset) and isinstance(item, h5py.Dataset) and np.issubdtype(item.dtype, np.integer) ):
+                cats = old_cat_group[col][:]
+                cats = [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in cats]
+                codes = item[:]
+                # guard against out-of-range codes
+                def map_code(c):
+                    if c == -1: return "nan"
+                    if 0 <= int(c) < len(cats): return cats[int(c)]
+                    return "nan"
+                values = np.array([map_code(c) for c in codes], dtype=object)
 
-            # --- CASE 2: Standard Dataset ---
+            # --- CASE 3: Standard Dataset ---
             else:
                 raw_values = item[:]
                 # Handle byte-string decoding for the whole array
-                if raw_values.dtype.kind in ('S', 'U', 'O'):
+                if hasattr(raw_values, "dtype") and raw_values.dtype.kind in ('S', 'U', 'O'):
                     values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values])
                 else:
                     values = raw_values
@@ -367,28 +390,17 @@ class H5ADHandler:
             
             ## 4. Handle the gene annotation
             ### 4.a. Load gene/cell names
+            var_path = "/var" # default
+            obs_path = "/obs" # default
             if result["input_group"] == '/raw.X':
-                if '/raw.var' in f:   
-                    var_genes = H5ADHandler.extract_index(f, "/raw.var")
-                else:
-                    var_genes = H5ADHandler.extract_index(f, "/var")
-                if '/raw.obs' in f:   
-                    obs_cells = H5ADHandler.extract_index(f, "/raw.obs")
-                else:
-                    obs_cells = H5ADHandler.extract_index(f, "/obs")
+                if '/raw.var' in f: var_path = "/raw.var"
+                if '/raw.obs' in f: obs_path = "/raw.obs"
             elif result["input_group"] == '/raw/X':
-                if '/raw/var' in f:   
-                    var_genes = H5ADHandler.extract_index(f, "/raw/var")
-                else:
-                    var_genes = H5ADHandler.extract_index(f, "/var")
-                if '/raw/obs' in f:   
-                    obs_cells = H5ADHandler.extract_index(f, "/raw/obs")
-                else:
-                    obs_cells = H5ADHandler.extract_index(f, "/obs")
-            else:
-                var_genes = H5ADHandler.extract_index(f, "/var")
-                obs_cells = H5ADHandler.extract_index(f, "/obs")
-
+                if '/raw/var' in f: var_path = "/raw/var"
+                if '/raw/obs' in f: obs_path = "/raw/obs"
+            var_genes = H5ADHandler.extract_index(f, var_path)
+            obs_cells = H5ADHandler.extract_index(f, obs_path)
+            
             ### 4.b. Write Cell names and Original gene names + fill associated metadata for output JSON
             loom.write(obs_cells, "/col_attrs/CellID") # Add cells to Loom           
             result["metadata"].append(Metadata(name="/col_attrs/CellID", on="CELL", type="STRING", nber_cols=len(obs_cells), nber_rows=1, distinct_values=len(set(obs_cells)), missing_values=count_missing(obs_cells), dataset_size=loom.get_dataset_size("/col_attrs/CellID"), imported=0))
@@ -460,30 +472,38 @@ class H5ADHandler:
             loom.write(stable_ids_cols, "/col_attrs/_StableID")
             result["metadata"].append(Metadata(name="/col_attrs/_StableID", on="CELL", type="NUMERIC", nber_cols=len(stable_ids_cols), nber_rows=1, distinct_values=len(set(stable_ids_cols)), missing_values=count_missing(stable_ids_cols), dataset_size=loom.get_dataset_size("/col_attrs/_StableID"), imported=0))
 
-            ## 6. Transfer the existing metadata from h5ad to Loom
+            ## 7. Transfer the existing metadata from h5ad to Loom
             # To avoid overwriting fields I've already generated
             existing_paths = {m.name for m in result["metadata"]}
             existing_paths.add("/attrs/LOOM_SPEC_VERSION")
 
-            ### 6.a. Transfer obs (Cell unidimensional metadata)
+            ### 7.a. Transfer obs (Cell unidimensional metadata)
+            if result["input_group"] == '/raw.X' and '/raw.obs' in f: H5ADHandler.transfer_metadata(f, "raw.obs", loom, result, "CELL", existing_paths)
+            if result["input_group"] == '/raw/X' and '/raw/obs' in f: H5ADHandler.transfer_metadata(f, "raw/obs", loom, result, "CELL", existing_paths)
             H5ADHandler.transfer_metadata(f, "obs", loom, result, "CELL", existing_paths)
-
-            ### 6.b. Transfer var (Gene unidimensional metadata)
+            
+            ### 7.b. Transfer var (Gene unidimensional metadata)
+            if result["input_group"] == '/raw.X' and '/raw.var' in f: H5ADHandler.transfer_metadata(f, "raw.var", loom, result, "GENE", existing_paths)
+            if result["input_group"] == '/raw/X' and '/raw/var' in f: H5ADHandler.transfer_metadata(f, "raw/var", loom, result, "GENE", existing_paths)
             H5ADHandler.transfer_metadata(f, "var", loom, result, "GENE", existing_paths)
-
-            ### 6.c. Transfer obsm (Cell multidimensional metadata)
+            
+            ### 7.c. Transfer obsm (Cell multidimensional metadata)
+            if result["input_group"] == '/raw.X' and '/raw.obsm' in f: H5ADHandler.transfer_multidimensional_metadata(f, "raw.obsm", loom, result, "CELL", existing_paths)
+            if result["input_group"] == '/raw/X' and '/raw/obsm' in f: H5ADHandler.transfer_multidimensional_metadata(f, "raw/obsm", loom, result, "CELL", existing_paths)
             H5ADHandler.transfer_multidimensional_metadata(f, "obsm", loom, result, "CELL", existing_paths)
             
-            ### 6.d. Transfer varm (Gene multidimensional metadata)
+            ### 7.d. Transfer varm (Gene multidimensional metadata)
+            if result["input_group"] == '/raw.X' and '/raw.varm' in f: H5ADHandler.transfer_multidimensional_metadata(f, "raw.varm", loom, result, "GENE", existing_paths)
+            if result["input_group"] == '/raw/X' and '/raw.varm' in f: H5ADHandler.transfer_multidimensional_metadata(f, "raw/varm", loom, result, "GENE", existing_paths)
             H5ADHandler.transfer_multidimensional_metadata(f, "varm", loom, result, "GENE", existing_paths)
 
-            ### 6.e. Layers (Alternative matrices like 'spliced'/'unspliced' or 'transformed')
+            ### 7.e. Layers (Alternative matrices like 'spliced'/'unspliced' or 'transformed')
             H5ADHandler.transfer_layers(f, loom, result, result["nber_cols"], result["nber_rows"], existing_paths)
 
-            ### 6.f: uns (Unstructured metadata like colors or global parameters)
+            ### 7.f: uns (Unstructured metadata like colors or global parameters)
             H5ADHandler.transfer_unstructured_metadata(f, loom, result, existing_paths)
 
-            ### 6.g. Transfer alternative main matrices to layers
+            ### 7.g. Transfer alternative main matrices to layers
             # We check the candidates and see if they were the one picked as 'input_group'
             for candidate in ['/X', '/raw/X', '/raw.X']:
                 if candidate in f and candidate != result["input_group"]:
@@ -517,7 +537,7 @@ class H5ADHandler:
                     except Exception as e:
                         result.setdefault("warning", []).append(f"Could not transfer alternative matrix {candidate}: {e}")
             
-            ### 7. end
+            ### 8. end
             loom.close()
 
         # II. Write final JSON
@@ -725,8 +745,11 @@ class LoomFile:
         )
 
         # 2. Identify Matrix Type
-        group = f[src_path]
-        is_sparse = 'data' in group and 'indices' in group and 'indptr' in group
+        node = f[src_path]
+        is_sparse = ( isinstance(node, h5py.Group) and all(k in node for k in ("data", "indices", "indptr")) )
+        is_dense = isinstance(node, h5py.Dataset)
+        if not (is_sparse or is_dense):
+            ErrorJSON(f"Unsupported matrix layout at {src_path}: expected CSR group or dense dataset")
 
         # Initialize stats
         total_zeros = 0
@@ -753,17 +776,22 @@ class LoomFile:
             
             # Extract chunk
             if is_sparse:
-                ptr = group['indptr'][start:end+1]
-                chunk = sp.csr_matrix((group['data'][ptr[0]:ptr[-1]], group['indices'][ptr[0]:ptr[-1]], ptr - ptr[0]), shape=(end-start, n_genes)).toarray()
+                ptr = node["indptr"][start:end + 1]
+                chunk = sp.csr_matrix(
+                    (node["data"][ptr[0]:ptr[-1]],
+                     node["indices"][ptr[0]:ptr[-1]],
+                     ptr - ptr[0]),
+                    shape=(end - start, n_genes)
+                ).toarray()
             else:
-                chunk = group[start:end, :]
+                # dense dataset
+                chunk = node[start:end, :]
 
             # --- Compute Stats ---
             # Check if all values are integers
             total_zeros += (chunk == 0).sum()
-            if is_integer:
-                if not np.all(np.equal(np.mod(chunk, 1), 0)):
-                    is_integer = False
+            if is_integer and not np.all(np.equal(np.mod(chunk, 1), 0)):
+                is_integer = False
 
             if gene_metadata is not None: # We only compute it in this case
                 # Cell stats
