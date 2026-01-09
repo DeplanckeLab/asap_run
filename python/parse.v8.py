@@ -36,9 +36,181 @@ Options:
        
 class H5ADHandler:
     @staticmethod
-    def _is_compound_table(node) -> bool:
+    def _infer_meta_dims(arr: np.ndarray, orientation: str) -> tuple[int, int]:
+        if arr.ndim == 0:
+            return (1, 1)
+        if arr.ndim == 1:
+            n = int(arr.shape[0])
+            if orientation == "CELL":
+                return (1, n)
+            if orientation == "GENE":
+                return (n, 1)
+            return (n, 1)  # GLOBAL: vector as column
+        # arr.ndim >= 2
+        n_items = int(arr.shape[0])
+        n_components = int(arr.shape[1])
+        if orientation == "CELL":
+            return (n_components, n_items)
+        if orientation == "GENE":
+            return (n_items, n_components)
+        return (n_items, n_components)  # GLOBAL: keep shape
+    
+    @staticmethod
+    def _is_compound_dataset(node) -> bool:
         return isinstance(node, h5py.Dataset) and node.dtype.fields is not None
 
+    @staticmethod
+    def _write_no_compound_and_register(*, src_obj: h5py.Dataset, loom, result: dict, existing_paths: set, loom_path: str, orientation: str, expected_len: int | None = None) -> None:
+        """
+        Writes src_obj to loom_path, guaranteeing NO compound dtype in output.
+        Reuses your existing Metadata patterns:
+
+        - If compound with 1 numeric field -> write 1D vector to loom_path and create
+          metadata like transfer_metadata (distinct_values, missing_values, categories, finalize_type).
+        - Otherwise -> write one dataset per field at loom_path__<field> (best-effort),
+          and register each (1D fields get categorical stats; multidim fields get numeric-only meta).
+        """
+        if loom_path in existing_paths:
+            return
+
+        # Load structured array
+        data = src_obj[()]
+        arr = np.asarray(data)
+
+        # Not compound => just write directly (caller should have handled, but safe)
+        if arr.dtype.fields is None:
+            # length check if requested
+            if expected_len is not None and arr.ndim >= 1 and int(arr.shape[0]) != int(expected_len):
+                result.setdefault("warning", []).append(
+                    f"Skipping {loom_path}: length mismatch. Expected {expected_len}, found {arr.shape[0]}."
+                )
+                return
+
+            loom.write(arr, loom_path)
+
+            # register minimal meta (caller usually does its own, but safe)
+            meta = Metadata(
+                name=loom_path,
+                on=orientation,
+                imported=1,
+                dataset_size=loom.get_dataset_size(loom_path),
+            )
+
+            # Compute dims according to our rules
+            nber_rows, nber_cols = H5ADHandler._infer_meta_dims(np.asarray(arr), orientation)
+            meta.nber_rows = int(nber_rows)
+            meta.nber_cols = int(nber_cols)
+            
+            # if 1D, do full categorical logic like transfer_metadata
+            if arr.ndim <= 1:
+                vals = arr
+                if vals.dtype.kind in ('S', 'U', 'O'):
+                    vals = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in vals], dtype=object)
+                counts = Counter(vals.flatten() if hasattr(vals, 'flatten') else vals)
+                meta.distinct_values = len(counts)
+                meta.categories = dict(counts)
+                meta.missing_values = count_missing(vals)
+                is_numeric = np.issubdtype(np.array(vals).dtype, np.number)
+                meta.finalize_type(is_numeric)
+            else:
+                meta.type = "NUMERIC" if np.issubdtype(np.array(arr).dtype, np.number) else "STRING"
+
+            result["metadata"].append(meta)
+            existing_paths.add(loom_path)
+            return
+
+        # Compound case
+        fields = list(arr.dtype.names or [])
+        if not fields:
+            result.setdefault("warning", []).append(f"Skipping {loom_path}: compound dataset has no fields.")
+            return
+
+        arr_flat = arr.reshape(-1) if arr.ndim > 1 else arr
+        n_rows = int(arr_flat.shape[0])
+
+        if expected_len is not None and n_rows != int(expected_len):
+            result.setdefault("warning", []).append(
+                f"Skipping {loom_path}: length mismatch. Expected {expected_len}, found {n_rows}."
+            )
+            return
+
+        def field_is_numeric(fname: str) -> bool:
+            dt = arr.dtype.fields[fname][0]
+            return np.issubdtype(dt, np.number) or np.issubdtype(dt, np.bool_)
+
+        all_numeric = all(field_is_numeric(f) for f in fields)
+
+        # ---- 1 field => keep as 1D dataset ----
+        if len(fields) == 1:
+            col = np.asarray(arr_flat[fields[0]]).reshape(-1)
+            # decode to string if needed
+            if col.dtype.kind in ("S", "O", "U"):
+                col = np.array(
+                    [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col],
+                    dtype=object,
+                )
+
+            loom.write(col, loom_path)
+
+            meta = Metadata(
+                name=loom_path,
+                on=orientation,
+                imported=1,
+                dataset_size=loom.get_dataset_size(loom_path),
+            )
+
+            # 1D: keep your categorical logic
+            vals = col
+            counts = Counter(vals)
+            meta.distinct_values = len(counts)
+            meta.categories = dict(counts)
+            meta.missing_values = count_missing(vals)
+            is_numeric = np.issubdtype(np.array(vals).dtype, np.number)
+            meta.finalize_type(is_numeric)
+            meta.nber_rows = len(vals) if orientation == "GENE" else 1
+            meta.nber_cols = len(vals) if orientation == "CELL" else 1
+
+            result["metadata"].append(meta)
+            existing_paths.add(loom_path)
+            return
+
+        # ---- >1 field => keep as single 2D dataset at SAME path ----
+        if all_numeric:
+            mat = np.empty((n_rows, len(fields)), dtype=np.float32)
+            for j, f_ in enumerate(fields):
+                mat[:, j] = np.asarray(arr_flat[f_], dtype=np.float32)
+        else:
+            # store as strings to avoid splitting
+            mat = np.empty((n_rows, len(fields)), dtype=object)
+            for j, f_ in enumerate(fields):
+                col = np.asarray(arr_flat[f_]).reshape(-1)
+                if col.dtype.kind in ("S", "O", "U"):
+                    col = np.array(
+                        [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col],
+                        dtype=object,
+                    )
+                else:
+                    col = np.array([str(v) for v in col], dtype=object)
+                mat[:, j] = col
+
+        loom.write(mat, loom_path)
+
+        # Compute dims according to our rules
+        nber_rows, nber_cols = H5ADHandler._infer_meta_dims(np.asarray(mat), orientation)
+        
+        meta = Metadata(
+            name=loom_path,
+            on=orientation,
+            type="NUMERIC" if all_numeric else "STRING",
+            nber_rows=int(nber_rows),
+            nber_cols=int(nber_cols),
+            dataset_size=loom.get_dataset_size(loom_path),
+            imported=1,
+        )
+        result["metadata"].append(meta)
+        existing_paths.add(loom_path)
+        return
+    
     @staticmethod
     def _table_columns(f, table_path: str):
         node = f[table_path]
@@ -47,7 +219,7 @@ class H5ADHandler:
             if isinstance(cols, np.ndarray):
                 cols = cols.tolist()
             return cols
-        elif H5ADHandler._is_compound_table(node):
+        elif H5ADHandler._is_compound_dataset(node):
             return list(node.dtype.names or [])
         else:
             return []
@@ -59,7 +231,7 @@ class H5ADHandler:
             if col not in node:
                 raise KeyError(col)
             return node[col]  # may be Dataset or Group (categorical)
-        elif H5ADHandler._is_compound_table(node):
+        elif H5ADHandler._is_compound_dataset(node):
             # returns a numpy array for that field
             return node[col]
         else:
@@ -101,9 +273,9 @@ class H5ADHandler:
             elif enc == "csc_matrix":
                 return (minor, major)   # (cells, genes)
             else:
-                raise ErrorJSON(f"Unsupported encoding-type={enc!r} at {path}")
+                ErrorJSON(f"Unsupported encoding-type={enc!r} at {path}")
     
-        raise ErrorJSON(f"Could not determine shape for {path}")
+        ErrorJSON(f"Could not determine shape for {path}")
     
     @staticmethod
     def extract_index(f, path):
@@ -120,7 +292,7 @@ class H5ADHandler:
                 return [v.decode() if isinstance(v, bytes) else str(v) for v in f[full_path][:]]
     
             # CASE B: Compound dataset obs/var
-            if H5ADHandler._is_compound_table(node):
+            if H5ADHandler._is_compound_dataset(node):
                 raw = node.attrs.get('_index', None)
                 index_field = raw.decode() if isinstance(raw, bytes) else raw
     
@@ -264,19 +436,23 @@ class H5ADHandler:
     
             if values is None:
                 continue
-    
+
+            # Check dimension consistency
             expected_len = result["nber_cols"] if orientation == "CELL" else result["nber_rows"]
             if len(values) != expected_len:
                 entity = "cells" if orientation == "CELL" else "genes"
                 result.setdefault("warning", []).append(f"Skipping {col} from {group_path}: length mismatch. Expected {expected_len} {entity}, but found {len(values)}.")
                 continue
+
+            # Compute dimensions according to our rules
+            arr = np.asarray(values)
+            nber_rows, nber_cols = H5ADHandler._infer_meta_dims(arr, orientation)
             
-            # --- your existing Metadata build/write logic ---
             meta = Metadata(
                 name=loom_path,
                 on=orientation,
-                nber_rows=len(values) if orientation == "GENE" else 1,
-                nber_cols=len(values) if orientation == "CELL" else 1,
+                nber_rows=int(nber_rows),
+                nber_cols=int(nber_cols),
                 missing_values=count_missing(values),
                 imported=1
             )
@@ -323,24 +499,40 @@ class H5ADHandler:
                     continue
 
                 # Continue if dimension is ok
-                data = group[key][:]
-                loom.write(data, loom_path)
+                item = group[key]
+                if not isinstance(item, h5py.Dataset):
+                    result.setdefault("warning", []).append(f"Skipping {group_path}/{key}: not a dataset.")
+                    continue
+              
+                # Handle compound datasets without writing compound dtypes
+                if H5ADHandler._is_compound_dataset(item):
+                    H5ADHandler._write_no_compound_and_register(
+                        src_obj=item,
+                        loom=loom,
+                        result=result,
+                        existing_paths=existing_paths,
+                        loom_path=loom_path,
+                        orientation=orientation,
+                        expected_len=expected_n
+                    )
+                    continue
                 
-                # Determine dimensions
-                n_items, n_components = data.shape[0], (data.shape[1] if len(data.shape) > 1 else 1)
-    
-                # 3. Create Metadata entry
+                # Normal multidim write path (your existing behavior)
+                data = item[:]
+                loom.write(data, loom_path)
+
+                # Compute dims according to our rules
+                nber_rows, nber_cols = H5ADHandler._infer_meta_dims(np.asarray(data), orientation)
+                
                 meta = Metadata(
                     name=loom_path,
                     on=orientation,
                     type="NUMERIC",
-                    nber_rows=n_items if orientation == "GENE" else n_components,
-                    nber_cols=n_items if orientation == "CELL" else n_components,
+                    nber_rows=int(nber_rows),
+                    nber_cols=int(nber_cols),
                     dataset_size=loom.get_dataset_size(loom_path),
                     imported=1
                 )
-                               
-                # 4. Update result object
                 result["metadata"].append(meta)
                 existing_paths.add(loom_path)
                 
@@ -494,16 +686,21 @@ class H5ADHandler:
     
                 if loom_path in existing_paths:
                     continue
-    
+
+                if H5ADHandler._is_compound_dataset(item):
+                    # We typically do NOT want multidim treatment for uns; decompose to 1D or per-field
+                    H5ADHandler._write_no_compound_and_register(
+                        src_obj=item,
+                        loom=loom,
+                        result=result,
+                        existing_paths=existing_paths,
+                        loom_path=loom_path,
+                        orientation="GLOBAL",
+                        expected_len=None
+                    )
+                    continue
+                
                 try:
-                    raw_shape = item.shape
-                    if len(raw_shape) >= 2:
-                        r, c = raw_shape[0], raw_shape[1]
-                    elif len(raw_shape) == 1:
-                        r, c = raw_shape[0], 1
-                    else:
-                        r, c = 1, 1
-    
                     val = item[()]
                     if isinstance(val, (bytes, np.bytes_)):
                         val = val.decode("utf-8")
@@ -513,7 +710,11 @@ class H5ADHandler:
                         ).reshape(val.shape)
     
                     loom.write(val, loom_path)
-    
+
+                    # Compute dims according to our rules
+                    val_arr = val if isinstance(val, np.ndarray) else np.array(val)
+                    nber_rows, nber_cols = H5ADHandler._infer_meta_dims(val_arr, "GLOBAL")
+                    
                     is_num = False
                     try:
                         is_num = np.issubdtype(np.array(val).dtype, np.number)
@@ -524,12 +725,13 @@ class H5ADHandler:
                         name=loom_path,
                         on="GLOBAL",
                         type="NUMERIC" if is_num else "STRING",
-                        nber_rows=int(r),
-                        nber_cols=int(c),
+                        nber_rows=int(nber_rows),
+                        nber_cols=int(nber_cols),
                         dataset_size=loom.get_dataset_size(loom_path),
                         imported=1
                     )
                     result["metadata"].append(meta)
+                    existing_paths.add(loom_path)
     
                 except Exception as e:
                     result.setdefault("warning", []).append(f"Skipping uns item {attr_name}: {str(e)}")
@@ -553,7 +755,9 @@ class H5ADHandler:
             "dataset_size": -1,
             "metadata": []
         }
-        # Optional: "message":"bla"
+        # Deal with previous warnings
+        if getattr(args, "warnings", None):
+            result["warning"] = list(args.warnings)
 
         # I. Read the h5ad file and find the correct matrix to load
         with h5py.File(file_path, 'r') as f:
@@ -578,6 +782,7 @@ class H5ADHandler:
             
             ## 3. Create Loom file
             loom = LoomFile(args.output_path)
+            loom.ribo_protein_gene_names = getattr(gene_db, "ribo_protein_gene_names", set())
             
             ## 4. Handle the gene annotation
             ### 4.a. Load gene/cell names
@@ -740,32 +945,593 @@ class H5ADHandler:
         else:
             print(json_str)
 
-class H510xHandler:
-    @staticmethod
-    def parse(args, file_path, gene_db):
-        # build the JSON-able structure
-        result = {
-            "detected_format": "H5_10x",
-            "input_path": file_path,
-            "output_path": args.output_path,
-        }
+class LoomHandler:
+    """
+    Parses an input .loom and writes a *new* .loom (Loom v3 layout) to args.output_path,
+    reproducing the H5ADHandler.parse behavior:
+      - detect/select main matrix
+      - compute on-the-fly stats (depth, detected genes, mt/ribo/protein-coding %)
+      - write gene annotations from the DB (Accession/Name/Biotypes/Chromosomes/etc.)
+      - copy all other matrices + metadata from the source loom to the new loom
+      - emit JSON summary with Metadata entries
+    """
 
-        # Serialize to JSON
-        json_str = json.dumps(result, ensure_ascii=False)
+    @staticmethod
+    def _infer_meta_dims(arr: np.ndarray, on: str, *, n_cells: int, n_genes: int) -> tuple[int, int]:
+        """
+        Enforce Loom conventions:
+          - CELL: nber_cols == n_cells
+          - GENE: nber_rows == n_genes
+          - EXPRESSION_MATRIX: (n_genes, n_cells)
+          - GLOBAL: use natural shape rules
+        """
+        if arr.ndim == 0:
+            return (1, 1)
+
+        if on == "CELL":
+            if arr.ndim == 1:
+                return (1, n_cells)
+            r, c = int(arr.shape[0]), int(arr.shape[1])
+            if r == n_cells:
+                return (c, n_cells)
+            if c == n_cells:
+                return (r, n_cells)
+            # fallback: force n_cells
+            return (r, n_cells)
+
+        if on == "GENE":
+            if arr.ndim == 1:
+                return (n_genes, 1)
+            r, c = int(arr.shape[0]), int(arr.shape[1])
+            if r == n_genes:
+                return (n_genes, c)
+            if c == n_genes:
+                return (n_genes, r)
+            # fallback: force n_genes
+            return (n_genes, c)
+
+        if on == "EXPRESSION_MATRIX":
+            return (n_genes, n_cells)
+
+        # GLOBAL (or unknown): natural shape
+        if arr.ndim == 1:
+            return (int(arr.shape[0]), 1)
+        return (int(arr.shape[0]), int(arr.shape[1]))
+    
+    @staticmethod
+    def _is_compound_dataset(obj) -> bool:
+        return isinstance(obj, h5py.Dataset) and obj.dtype.fields is not None
+
+    @staticmethod
+    def _compound_field_names(obj: h5py.Dataset) -> list[str]:
+        return list(obj.dtype.names or [])
+
+    @staticmethod
+    def _compound_all_numeric(obj: h5py.Dataset) -> bool:
+        # All fields numeric? (int/float/bool)
+        for name in LoomHandler._compound_field_names(obj):
+            dt = obj.dtype.fields[name][0]
+            if not np.issubdtype(dt, np.number) and not np.issubdtype(dt, np.bool_):
+                return False
+        return True
+
+    @staticmethod
+    def _write_compound_as_regular( src_obj: h5py.Dataset, loom_out: LoomFile, result: dict, existing_paths: set[str], full_path: str) -> None:
+        """
+        Writes a compound dataset without using compound dtypes in the output.
+        Strategy:
+          - If all fields numeric => write 2D float32 dataset to SAME path (N x K).
+          - Else => write one dataset per field: f"{path}__{field}".
+        """
+        fields = LoomHandler._compound_field_names(src_obj)
+        if not fields:
+            result.setdefault("warning", []).append(f"Skipping compound dataset {full_path}: no fields found.")
+            return
+
+        # Read once
+        data = src_obj[:]  # structured array shape (N,) or (N,...) typically
+
+        # Most loom attrs like Embedding are (N,) structured arrays.
+        # If it's higher-rank structured, we still try to flatten leading dims into rows.
+        # We'll reshape to (N_rows, ) where possible.
+        if isinstance(data, np.ndarray) and data.dtype.fields is not None:
+            # reshape structured array to 1D rows if possible
+            if data.ndim > 1:
+                # flatten all but last? safest: flatten completely
+                data_flat = data.reshape(-1)
+            else:
+                data_flat = data
+        else:
+            # shouldn't happen, but guard
+            result.setdefault("warning", []).append(f"Skipping {full_path}: expected structured ndarray.")
+            return
+
+        n_rows = int(data_flat.shape[0])
+
+        # Case 1: all numeric -> write (n_rows x n_fields) to SAME path
+        if LoomHandler._compound_all_numeric(src_obj):
+            # If only 1 field, write a 1D vector (NOT a (n,1) matrix)
+            if len(fields) == 1:
+                name = fields[0]
+                vec = np.asarray(data_flat[name])  # keep native numeric dtype (int/float)
+                # ensure it is 1D
+                vec = vec.reshape(-1)
         
-        # Either write to file or print
+                loom_out.write(vec, full_path)
+                meta = LoomHandler._make_meta_for_written_dataset(
+                    loom_out, full_path, vec,
+                    n_cells=result["nber_cols"],
+                    n_genes=result["nber_rows"],
+                )
+                result["metadata"].append(meta)
+                existing_paths.add(full_path)
+                return
+        
+            # otherwise: write a true 2D numeric matrix (n_rows x n_fields)
+            mat = np.empty((n_rows, len(fields)), dtype=np.float32)
+            for j, name in enumerate(fields):
+                col = data_flat[name]
+                mat[:, j] = np.asarray(col, dtype=np.float32)
+        
+            loom_out.write(mat, full_path)
+            meta = LoomHandler._make_meta_for_written_dataset(
+                loom_out, full_path, mat,
+                n_cells=result["nber_cols"],
+                n_genes=result["nber_rows"],
+            )
+            result["metadata"].append(meta)
+            existing_paths.add(full_path)
+            return
+
+        # Case 2: mixed types -> write single 2D string matrix to SAME path
+        if len(fields) == 1:
+            col = np.asarray(data_flat[fields[0]]).reshape(-1)
+            if col.dtype.kind in ("S", "O", "U"):
+                col = np.array(
+                    [v.decode(errors="ignore") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col],
+                    dtype=object,
+                )
+            loom_out.write(col, full_path)
+            meta = LoomHandler._make_meta_for_written_dataset(
+                loom_out, full_path, col, n_cells=result["nber_cols"], n_genes=result["nber_rows"]
+            )
+            result["metadata"].append(meta)
+            existing_paths.add(full_path)
+            return
+
+        mat = np.empty((n_rows, len(fields)), dtype=object)
+        for j, name in enumerate(fields):
+            col = np.asarray(data_flat[name]).reshape(-1)
+            mat[:, j] = [
+                v.decode(errors="ignore") if isinstance(v, (bytes, np.bytes_)) else str(v)
+                for v in col
+            ]
+
+        loom_out.write(mat, full_path)
+        meta = LoomHandler._make_meta_for_written_dataset(
+            loom_out, full_path, mat, n_cells=result["nber_cols"], n_genes=result["nber_rows"]
+        )
+        result["metadata"].append(meta)
+        existing_paths.add(full_path)
+        return
+    
+    @staticmethod
+    def _as_str_list(arr) -> list[str]:
+        if isinstance(arr, np.ndarray):
+            flat = arr.ravel()
+        else:
+            flat = arr
+        out = []
+        for v in flat:
+            if isinstance(v, (bytes, np.bytes_)):
+                out.append(v.decode(errors="ignore"))
+            else:
+                out.append(str(v))
+        return out
+
+    @staticmethod
+    def _dataset_shape(node) -> tuple[int, ...]:
+        if isinstance(node, h5py.Dataset):
+            return tuple(int(x) for x in node.shape)
+        return ()
+
+    @staticmethod
+    def _find_first_existing(f: h5py.File, paths: list[str]) -> str | None:
+        for p in paths:
+            if p in f:
+                return p
+        return None
+
+    @staticmethod
+    def _infer_cell_ids(f: h5py.File, n_cells: int) -> tuple[list[str], str]:
+        """
+        Returns (cell_ids, source_path_or_reason).
+        Prefers /col_attrs/CellID, then common alternatives, otherwise creates Cell_1..Cell_n.
+        """
+        candidates = ["/col_attrs/CellID", "/col_attrs/cell_id", "/col_attrs/cell_ids", "/col_attrs/barcode", "/col_attrs/barcodes", "/col_attrs/Barcode", "/col_attrs/obs_names", "/col_attrs/index", "/col_attrs/_index" ]
+        p = LoomHandler._find_first_existing(f, candidates)
+        if p and isinstance(f[p], h5py.Dataset):
+            vals = f[p][:]
+            cell_ids = LoomHandler._as_str_list(vals)
+            if len(cell_ids) == n_cells:
+                return cell_ids, p
+
+        # Fallback
+        return [f"Cell_{i+1}" for i in range(n_cells)], "__generated__"
+
+    @staticmethod
+    def _infer_original_gene_names(f: h5py.File, n_genes: int) -> tuple[list[str], str]:
+        """
+        Returns (gene_names, source_path_or_reason).
+        Prefers /row_attrs/Original_Gene then Name/Gene/Accession etc.
+        """
+        candidates = [ "/row_attrs/Original_Gene", "/row_attrs/Name", "/row_attrs/Gene", "/row_attrs/Accession", "/row_attrs/gene", "/row_attrs/gene_name", "/row_attrs/var_names", "/row_attrs/index", "/row_attrs/_index" ]
+        p = LoomHandler._find_first_existing(f, candidates)
+        if p and isinstance(f[p], h5py.Dataset):
+            vals = f[p][:]
+            genes = LoomHandler._as_str_list(vals)
+            if len(genes) == n_genes:
+                return genes, p
+
+        # Fallback
+        return [f"Gene_{i+1}" for i in range(n_genes)], "__generated__"
+
+    @staticmethod
+    def _path_orientation(path: str) -> str:
+        if path.startswith("/col_attrs/"): return "CELL"
+        if path.startswith("/row_attrs/"): return "GENE"
+        if path == "/matrix" or path.startswith("/layers/"): return "EXPRESSION_MATRIX"
+        if path.startswith("/attrs/"): return "GLOBAL"
+        if path.startswith("/row_graphs/"): return "GENE"
+        if path.startswith("/col_graphs/"): return "CELL"
+        return "GLOBAL"
+
+    @staticmethod
+    def _make_meta_for_written_dataset(loom: LoomFile, path: str, value, *, n_cells: int, n_genes: int) -> "Metadata":
+        """
+        Builds a Metadata object for a just-written dataset at `path`.
+        Uses `loom.get_dataset_size(path)` and tries to infer shape/orientation/type.
+            Conventions enforced:
+              - /col_attrs/* (CELL): nber_cols MUST equal n_cells
+                  * 1D (n_cells,) => nber_rows=1, nber_cols=n_cells
+                  * 2D (n_cells, k) => nber_rows=k, nber_cols=n_cells
+                  * 2D (k, n_cells) => nber_rows=k, nber_cols=n_cells  (also accepted)
+              - /row_attrs/* (GENE) (SYMMETRIC): nber_rows MUST equal n_genes
+                  * 1D (n_genes,)         -> nber_rows=n_genes, nber_cols=1
+                  * 2D (n_genes, k)       -> nber_rows=n_genes, nber_cols=k
+                  * 2D (k, n_genes)       -> nber_rows=n_genes, nber_cols=k
+              - /matrix and /layers (EXPRESSION_MATRIX): nber_rows=n_genes, nber_cols=n_cells
+              - Scalars: 1x1
+        """
+        on = LoomHandler._path_orientation(path)
+
+        # Infer shape
+        arr = np.array(value) if not isinstance(value, np.ndarray) else value
+        missing = None # only compute this for 1-D arrays
+        if arr.ndim <= 1: missing = int(count_missing(arr))
+
+        is_numeric = False
+        try:
+            is_numeric = np.issubdtype(np.array(arr).dtype, np.number)
+        except Exception:
+            is_numeric = False
+    
+        # Compute dims according to our rules
+        nber_rows, nber_cols = LoomHandler._infer_meta_dims(arr, on, n_cells=n_cells, n_genes=n_genes)
+    
+        m = Metadata(
+            name=path,
+            on=on if on in ("CELL", "GENE", "GLOBAL") else "EXPRESSION_MATRIX",
+            type=None,
+            nber_rows=int(nber_rows),
+            nber_cols=int(nber_cols),
+            missing_values=missing,
+            dataset_size=loom.get_dataset_size(path),
+            imported=1,
+        )
+    
+        # Categoricals only for 1D-like attrs
+        if on in ("CELL", "GENE", "GLOBAL") and arr.ndim <= 1:
+            vals = LoomHandler._as_str_list(arr)
+            counts = Counter(vals)
+            m.distinct_values = len(counts)
+            m.categories = dict(counts)
+            m.finalize_type(is_numeric=is_numeric)
+        else:
+            m.type = "NUMERIC" if is_numeric else "STRING"
+    
+        return m
+
+    # -----------------------------------------
+    # Core: copy matrix + compute stats on fly
+    # -----------------------------------------
+    @staticmethod
+    def _copy_matrix_and_compute_stats( src_f: h5py.File, src_path: str, loom_out: LoomFile, dest_path: str, n_cells: int, n_genes: int, gene_metadata: list["Gene"] | None, block_cells: int = 1024 ) -> dict:
+        """
+        Copies a dense Loom matrix (Genes x Cells) from src_path to dest_path.
+        Computes stats like LoomFile.write_matrix() did for H5AD (but input already is Genes x Cells).
+        """
+        if src_path not in src_f: ErrorJSON(f"Matrix path not found in Loom: {src_path}")
+        node = src_f[src_path]
+        if not isinstance(node, h5py.Dataset): ErrorJSON(f"Unsupported Loom matrix layout at {src_path}: expected a dataset")
+        shape = LoomHandler._dataset_shape(node)
+        if len(shape) != 2: ErrorJSON(f"Unsupported Loom matrix rank at {src_path}: expected 2D, got shape={shape}")
+        if shape[0] != n_genes or shape[1] != n_cells:  ErrorJSON( f"Matrix dimension mismatch at {src_path}: expected ({n_genes}, {n_cells}) but found {shape}")
+
+        # Create destination dataset (Genes x Cells)
+        dset = loom_out.handle.create_dataset( dest_path, shape=(n_genes, n_cells), dtype="float32", chunks=(min(n_genes, 1024), min(n_cells, 1024)), compression="gzip")
+
+        total_zeros = 0
+        is_integer = True
+
+        cell_depth = np.zeros(n_cells) if gene_metadata else None
+        cell_detected = np.zeros(n_cells) if gene_metadata else None
+        cell_mt = np.zeros(n_cells) if gene_metadata else None
+        cell_rrna = np.zeros(n_cells) if gene_metadata else None
+        cell_prot = np.zeros(n_cells) if gene_metadata else None
+        gene_sum = np.zeros(n_genes) if gene_metadata else None
+
+        mt_idx = ribo_idx = prot_idx = []
+        if gene_metadata is not None:
+            mt_idx = [i for i, g in enumerate(gene_metadata) if loom_out.is_mito(g.chr)]
+            ribo_idx = [i for i, g in enumerate(gene_metadata) if loom_out.is_ribo(g.name)]
+            prot_idx = [i for i, g in enumerate(gene_metadata) if loom_out.is_protein_coding(g.biotype)]
+
+        # Process by cell blocks (columns)
+        for start in range(0, n_cells, block_cells):
+            end = min(start + block_cells, n_cells)
+
+            # src block is genes x cells; convert to cells x genes for stat computation
+            block_gxc = node[:, start:end]  # (n_genes, block_cells)
+            # Convert to numpy array (h5py returns ndarray already)
+            block_gxc = np.array(block_gxc, copy=False)
+
+            # write as float32
+            dset[:, start:end] = block_gxc.astype("float32", copy=False)
+
+            # stats work on cells x genes
+            chunk = block_gxc.T  # (block_cells, n_genes)
+
+            total_zeros += int((chunk == 0).sum())
+            if is_integer and not np.all(np.floor(chunk) == chunk): is_integer = False
+
+            if gene_metadata is not None:
+                depth = chunk.sum(axis=1)
+                detected = (chunk > 0).sum(axis=1)
+
+                cell_depth[start:end] = depth
+                cell_detected[start:end] = detected
+
+                # gene sums in original gene order (n_genes)
+                gene_sum += chunk.sum(axis=0)
+
+                if mt_idx: cell_mt[start:end] = chunk[:, mt_idx].sum(axis=1)
+                if ribo_idx: cell_rrna[start:end] = chunk[:, ribo_idx].sum(axis=1)
+                if prot_idx: cell_prot[start:end] = chunk[:, prot_idx].sum(axis=1)
+
+        def to_percentage(subset_sum, total_sum):
+            if subset_sum is None or total_sum is None: return None
+            return np.divide(subset_sum, total_sum, out=np.zeros_like(subset_sum), where=total_sum != 0) * 100
+
+        stats = {
+            "cell_depth": cell_depth,
+            "cell_detected": cell_detected,
+            "cell_mt": to_percentage(cell_mt, cell_depth),
+            "cell_rrna": to_percentage(cell_rrna, cell_depth),
+            "cell_prot": to_percentage(cell_prot, cell_depth),
+            "gene_sum": gene_sum,
+            "total_zeros": int(total_zeros),
+            "is_count_table": int(is_integer),
+            "empty_cells": int(np.sum(cell_depth == 0)) if cell_depth is not None else None,
+            "empty_genes": int(np.sum(gene_sum == 0)) if gene_sum is not None else None,
+        }
+        return stats
+
+    # -----------------------------------------
+    # Core: copy everything else (metadata/layers)
+    # -----------------------------------------
+    @staticmethod
+    def _copy_all_other_datasets( src_f: h5py.File, loom_out: LoomFile, result: dict, existing_paths: set[str], skip_prefixes: tuple[str, ...] = ()) -> None:
+        """
+        Copies all datasets from src loom to dest loom, except those in existing_paths
+        and except those under skip_prefixes (e.g. skip_prefixes=("/matrix",) if matrix handled).
+        Adds Metadata entries for copied datasets.
+        """
+        def should_skip(full_path: str) -> bool:
+            if full_path in existing_paths: return True
+            for sp in skip_prefixes:
+                if full_path == sp or full_path.startswith(sp + "/"): return True
+            return False
+
+        def visitor(name: str, obj):
+            # h5py visititems provides names WITHOUT leading slash typically.
+            full_path = "/" + name if not name.startswith("/") else name
+
+            if isinstance(obj, h5py.Dataset):
+                if should_skip(full_path): return
+
+                # Read and write
+                try:
+                    if LoomHandler._is_compound_dataset(obj):
+                        LoomHandler._write_compound_as_regular(src_obj=obj, loom_out=loom_out, result=result, existing_paths=existing_paths, full_path=full_path)
+                        return
+
+                    # Non compound
+                    val = obj[()]
+                    loom_out.write(val, full_path)
+
+                    meta = LoomHandler._make_meta_for_written_dataset(loom_out, full_path, val, n_cells=result["nber_cols"], n_genes=result["nber_rows"])
+                    result["metadata"].append(meta)
+                    existing_paths.add(full_path)
+
+                except Exception as e:
+                    result.setdefault("warning", []).append(f"Could not copy dataset {full_path}: {e}")
+                    
+        src_f.visititems(visitor)
+
+    # -----------------------------
+    # Public entry point
+    # -----------------------------
+    @staticmethod
+    def parse(args, file_path, gene_db: "MapGene"):
+        result = {
+            "detected_format": "LOOM",
+            "input_path": file_path,
+            "input_group": "",
+            "output_path": args.output_path,
+            "nber_rows": -1,             # genes
+            "nber_cols": -1,             # cells
+            "nber_not_found_genes": -1,
+            "nber_zeros": -1,
+            "is_count_table": -1,
+            "empty_cols": -1,            # empty cells
+            "empty_rows": -1,            # empty genes
+            "dataset_size": -1,
+            "metadata": [],
+        }
+        # Deal with previous warnings
+        if getattr(args, "warnings", None):
+            result["warning"] = list(args.warnings)
+
+        with h5py.File(file_path, "r") as f:
+            # 1) Pick main matrix
+            if args.sel is not None:
+                if args.sel not in f: ErrorJSON(f"Path '{args.sel}' (provided with --sel) not found in file")
+                matrix_path = args.sel
+            else:
+                # Loom convention: /matrix
+                candidates = ["/matrix"]
+                matrix_path = LoomHandler._find_first_existing(f, candidates)
+                if matrix_path is None: ErrorJSON(f"None of the candidate path were found: {candidates}. Please provide a path with --sel")
+
+            result["input_group"] = matrix_path
+
+            # 2) Get dimensions (genes x cells)
+            node = f[matrix_path]
+            if not isinstance(node, h5py.Dataset): ErrorJSON(f"Unsupported Loom main matrix at {matrix_path}: expected dataset")
+            shape = LoomHandler._dataset_shape(node)
+            if len(shape) != 2: ErrorJSON(f"Unsupported Loom main matrix rank at {matrix_path}: expected 2D, got shape={shape}")
+
+            n_genes, n_cells = int(shape[0]), int(shape[1])
+            result["nber_rows"] = n_genes
+            result["nber_cols"] = n_cells
+
+            # 3) Create output Loom
+            loom = LoomFile(args.output_path)
+            loom.ribo_protein_gene_names = getattr(gene_db, "ribo_protein_gene_names", set())
+
+            # 4) Read cell + gene names from input loom (best-effort)
+            obs_cells, obs_src = LoomHandler._infer_cell_ids(f, n_cells)
+            var_genes, var_src = LoomHandler._infer_original_gene_names(f, n_genes)
+
+            # 5) Write CellID and Original_Gene to output loom (+ metadata)
+            loom.write(obs_cells, "/col_attrs/CellID")
+            result["metadata"].append(Metadata(name="/col_attrs/CellID", on="CELL", type="STRING", nber_cols=len(obs_cells), nber_rows=1, distinct_values=len(set(obs_cells)), missing_values=count_missing(obs_cells), dataset_size=loom.get_dataset_size("/col_attrs/CellID"), imported=0))
+            loom.write(var_genes, "/row_attrs/Original_Gene")
+            result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(var_genes), distinct_values=len(set(var_genes)), missing_values=count_missing(var_genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
+
+            # 6) Map genes through DB, write gene annotations (same as H5ADHandler.parse)
+            parsed_genes, result["nber_not_found_genes"] = gene_db.parse_genes_list(var_genes)
+
+            ens_ids = [g.ensembl_id for g in parsed_genes]
+            loom.write(ens_ids, "/row_attrs/Accession")
+            result["metadata"].append(Metadata(name="/row_attrs/Accession", on="GENE", type="STRING", nber_cols=1, nber_rows=len(ens_ids), distinct_values=len(set(ens_ids)), missing_values=count_missing(ens_ids), dataset_size=loom.get_dataset_size("/row_attrs/Accession"), imported=0))
+
+            gene_names = [g.name for g in parsed_genes]
+            loom.write(gene_names, "/row_attrs/Gene")
+            result["metadata"].append(Metadata(name="/row_attrs/Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(gene_names), distinct_values=len(set(gene_names)), missing_values=count_missing(gene_names), dataset_size=loom.get_dataset_size("/row_attrs/Gene"), imported=0))
+
+            loom.write(gene_names, "/row_attrs/Name")
+            result["metadata"].append(Metadata(name="/row_attrs/Name", on="GENE", type="STRING", nber_cols=1, nber_rows=len(gene_names), distinct_values=len(set(gene_names)), missing_values=count_missing(gene_names), dataset_size=loom.get_dataset_size("/row_attrs/Name"), imported=0))
+
+            biotypes = [g.biotype for g in parsed_genes]
+            loom.write(biotypes, "/row_attrs/_Biotypes")
+            result["metadata"].append(Metadata(name="/row_attrs/_Biotypes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(biotypes), distinct_values=len(set(biotypes)), missing_values=count_missing(biotypes), dataset_size=loom.get_dataset_size("/row_attrs/_Biotypes"), imported=0, categories=dict(Counter(biotypes))))
+
+            chroms = [g.chr for g in parsed_genes]
+            loom.write(chroms, "/row_attrs/_Chromosomes")
+            result["metadata"].append(Metadata(name="/row_attrs/_Chromosomes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(chroms), distinct_values=len(set(chroms)), missing_values=count_missing(chroms), dataset_size=loom.get_dataset_size("/row_attrs/_Chromosomes"), imported=0, categories=dict(Counter(chroms))))
+
+            sum_exon_length = [g.sum_exon_length for g in parsed_genes]
+            loom.write(sum_exon_length, "/row_attrs/_SumExonLength")
+            result["metadata"].append(Metadata(name="/row_attrs/_SumExonLength", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(sum_exon_length), distinct_values=len(set(sum_exon_length)), missing_values=count_missing(sum_exon_length), dataset_size=loom.get_dataset_size("/row_attrs/_SumExonLength"), imported=0))
+
+            # 7) Copy main matrix + compute stats (on the fly)
+            stats = LoomHandler._copy_matrix_and_compute_stats(
+                src_f=f,
+                src_path=matrix_path,
+                loom_out=loom,
+                dest_path="/matrix",
+                n_cells=n_cells,
+                n_genes=n_genes,
+                gene_metadata=parsed_genes,
+            )
+
+            result["dataset_size"] = loom.get_dataset_size("/matrix")
+            result["nber_zeros"] = int(stats["total_zeros"])
+            result["empty_cols"] = int(stats["empty_cells"])
+            result["empty_rows"] = int(stats["empty_genes"])
+            result["is_count_table"] = int(stats["is_count_table"])
+
+            # 8) Write computed vectors (same paths as H5ADHandler.parse)
+            loom.write(stats["cell_depth"], "/col_attrs/_Depth")
+            result["metadata"].append(Metadata(name="/col_attrs/_Depth", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_depth"]), nber_rows=1, distinct_values=len(set(stats["cell_depth"])), missing_values=count_missing(stats["cell_depth"]), dataset_size=loom.get_dataset_size("/col_attrs/_Depth"), imported=0))
+
+            loom.write(stats["cell_detected"], "/col_attrs/_Detected_Genes")
+            result["metadata"].append(Metadata(name="/col_attrs/_Detected_Genes", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_detected"]), nber_rows=1, distinct_values=len(set(stats["cell_detected"])), missing_values=count_missing(stats["cell_detected"]), dataset_size=loom.get_dataset_size("/col_attrs/_Detected_Genes"), imported=0))
+
+            loom.write(stats["cell_mt"], "/col_attrs/_Mitochondrial_Content")
+            result["metadata"].append(Metadata(name="/col_attrs/_Mitochondrial_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_mt"]), nber_rows=1, distinct_values=len(set(stats["cell_mt"])), missing_values=count_missing(stats["cell_mt"]), dataset_size=loom.get_dataset_size("/col_attrs/_Mitochondrial_Content"), imported=0))
+
+            loom.write(stats["cell_rrna"], "/col_attrs/_Ribosomal_Content")
+            result["metadata"].append(Metadata(name="/col_attrs/_Ribosomal_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_rrna"]), nber_rows=1, distinct_values=len(set(stats["cell_rrna"])), missing_values=count_missing(stats["cell_rrna"]), dataset_size=loom.get_dataset_size("/col_attrs/_Ribosomal_Content"), imported=0))
+
+            loom.write(stats["cell_prot"], "/col_attrs/_Protein_Coding_Content")
+            result["metadata"].append(Metadata(name="/col_attrs/_Protein_Coding_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_prot"]), nber_rows=1, distinct_values=len(set(stats["cell_prot"])), missing_values=count_missing(stats["cell_prot"]), dataset_size=loom.get_dataset_size("/col_attrs/_Protein_Coding_Content"), imported=0))
+
+            loom.write(stats["gene_sum"], "/row_attrs/_Sum")
+            result["metadata"].append(Metadata(name="/row_attrs/_Sum", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(stats["gene_sum"]), distinct_values=len(set(stats["gene_sum"])), missing_values=count_missing(stats["gene_sum"]), dataset_size=loom.get_dataset_size("/row_attrs/_Sum"), imported=0))
+
+            # 9) Stable IDs
+            stable_ids_rows = list(range(n_genes))
+            loom.write(stable_ids_rows, "/row_attrs/_StableID")
+            result["metadata"].append(Metadata(name="/row_attrs/_StableID", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(stable_ids_rows), distinct_values=len(set(stable_ids_rows)), missing_values=count_missing(stable_ids_rows), dataset_size=loom.get_dataset_size("/row_attrs/_StableID"), imported=0))
+
+            stable_ids_cols = list(range(n_cells))
+            loom.write(stable_ids_cols, "/col_attrs/_StableID")
+            result["metadata"].append(Metadata(name="/col_attrs/_StableID", on="CELL", type="NUMERIC", nber_cols=len(stable_ids_cols), nber_rows=1, distinct_values=len(set(stable_ids_cols)), missing_values=count_missing(stable_ids_cols), dataset_size=loom.get_dataset_size("/col_attrs/_StableID"), imported=0))
+
+            # 10) Copy all remaining content from source loom into new loom (matrices + metadata)
+            existing_paths = {m.name for m in result["metadata"]}
+            existing_paths.add("/attrs/LOOM_SPEC_VERSION")  # created by LoomFile
+
+            # We already handled /matrix explicitly.
+            # We also intentionally overwrite (with DB-derived values) several standard row/col attrs,
+            # so keep them in existing_paths.
+            LoomHandler._copy_all_other_datasets(
+                src_f=f,
+                loom_out=loom,
+                result=result,
+                existing_paths=existing_paths,
+                skip_prefixes=("/matrix",),  # do not duplicate
+            )
+
+            loom.close()
+
+        # 11) Emit JSON
+        json_str = json.dumps(result, default=dataclass_to_json, ensure_ascii=False)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
         else:
             print(json_str)
 
-class LoomHandler:
+class H510xHandler:
     @staticmethod
     def parse(args, file_path, gene_db):
         # build the JSON-able structure
         result = {
-            "detected_format": "LOOM",
+            "detected_format": "H5_10x",
             "input_path": file_path,
             "output_path": args.output_path,
         }
@@ -860,7 +1626,6 @@ class ErrorJSON(Exception):
         sys.exit(1)
 
 ### File handling ###
-
 class LoomFile:
     handle = None
     
@@ -870,6 +1635,7 @@ class LoomFile:
             self.loomPath.unlink() # Overwrite
         self.handle = h5py.File(self.loomPath, "w")
         self._ensure_loom_v3_layout()
+        self.ribo_protein_gene_names: set[str] = set()
         
     def _ensure_loom_v3_layout(self) -> None:
         """Create required Loom v3 groups/datasets if missing."""
@@ -903,7 +1669,7 @@ class LoomFile:
         elif indptr_len == n_genes + 1:
             inferred = "csc_matrix"
         else:
-            raise ErrorJSON( f"Cannot infer sparse encoding: len(indptr)={indptr_len}, expected {n_cells+1} (CSR) or {n_genes+1} (CSC)" )
+            ErrorJSON( f"Cannot infer sparse encoding: len(indptr)={indptr_len}, expected {n_cells+1} (CSR) or {n_genes+1} (CSC)" )
     
         # If attr exists but disagrees, prefer inferred (and warn)
         if enc and enc != inferred:
@@ -912,7 +1678,50 @@ class LoomFile:
             return inferred
     
         return inferred
+
+    @staticmethod
+    def is_mito(chr_name: str | None) -> bool:
+        if chr_name is None: return False
+        s = str(chr_name).strip()
+        if not s: return False
     
+        s_up = s.upper()
+        if s_up in {"MT", "M", "MITOCHONDRION_GENOME", "DMEL_MITOCHONDRION_GENOME"}: return True
+        s_up = s_up.replace("CHROMOSOME", "").replace("CHR", "").replace("_", "").replace("-", "").strip()
+        if s_up in {"MT", "M"}: return True
+        if "MITO" in s_up: return True
+    
+        return False
+
+    @staticmethod
+    def _norm_gene_name(x: str | None) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, (bytes, np.bytes_)):
+            x = x.decode(errors="ignore")
+        return str(x).strip().upper()
+    
+    def is_ribo(self, gene_name: str | None) -> bool:
+        """
+        Ribosomal *protein* genes only, defined by GO:0003735-derived set.
+        If the set is empty, returns False (no ribo-content computed).
+        """
+        if not self.ribo_protein_gene_names:
+            return False
+        return self._norm_gene_name(gene_name) in self.ribo_protein_gene_names
+
+    @staticmethod
+    def is_protein_coding(biotype: str | None) -> bool:
+        if biotype is None: return False
+        s = str(biotype).strip()
+        if not s: return False
+    
+        s_up = s.upper()
+        if s_up in {"PROTEIN_CODING"}: return True
+        if s_up.startswith("PROTEIN_CODING"): return True
+        
+        return False
+
     def write(self, data, path: str) -> None:
         try:
             # 1. Convert to numpy and handle strings
@@ -995,11 +1804,11 @@ class LoomFile:
         gene_sum = np.zeros(n_genes) if gene_metadata else None
         
         # Pre-calculate indices to avoid doing it inside the loop
-        mt_idx = rrna_idx = prot_idx = []
+        mt_idx = ribo_idx = prot_idx = []
         if gene_metadata is not None:
-            mt_idx = [i for i, g in enumerate(gene_metadata) if g.chr == "MT"]
-            rrna_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "rRNA"]
-            prot_idx = [i for i, g in enumerate(gene_metadata) if g.biotype == "protein_coding"]
+            mt_idx = [i for i, g in enumerate(gene_metadata) if self.is_mito(g.chr)]
+            ribo_idx = [i for i, g in enumerate(gene_metadata) if self.is_ribo(g.name)]
+            prot_idx = [i for i, g in enumerate(gene_metadata) if self.is_protein_coding(g.biotype)]
         
         # 3. Chunked Processing (Process by Cell blocks)
         for start in range(0, n_cells, 1024):
@@ -1033,7 +1842,7 @@ class LoomFile:
                 
                 # Content based on gene biotypes/chrom          
                 if mt_idx: cell_mt[start:end] = chunk[:, mt_idx].sum(axis=1)
-                if rrna_idx: cell_rrna[start:end] = chunk[:, rrna_idx].sum(axis=1)
+                if ribo_idx: cell_rrna[start:end] = chunk[:, ribo_idx].sum(axis=1)
                 if prot_idx: cell_prot[start:end] = chunk[:, prot_idx].sum(axis=1)
 
             # --- Write to Loom (Transposed chunk) ---
@@ -1271,7 +2080,7 @@ class DBManager:
         try:
             self._conn = psycopg2.connect(**conn_kwargs)
         except Exception as e:
-            raise ErrorJSON(f"Failed to connect to PostgreSQL: {e}") from e
+            ErrorJSON(f"Failed to connect to PostgreSQL: {e}")
 
     def disconnect(self) -> None:
         if self._conn is None:
@@ -1284,7 +2093,7 @@ class DBManager:
     @contextmanager
     def _cursor(self):
         if self._conn is None or self._conn.closed:
-            raise ErrorJSON("Not connected. Call connect() first (or use get_genes_in_db_once).")
+            ErrorJSON("Not connected. Call connect() first (or use get_genes_in_db_once).")
         cur = self._conn.cursor(cursor_factory=RealDictCursor)
         try:
             yield cur
@@ -1348,6 +2157,45 @@ class DBManager:
         finally:
             self.disconnect()
 
+    def get_ribo_protein_gene_names(self, organism_id: int, go_term: str = "GO:0003735") -> set[str]:
+        """
+        Returns a set of gene symbols (genes.name) for the GO term.
+        Uses gene_set_items.identifier (NOT gene_sets.identifier).
+        """
+        sql = """
+        WITH target_set AS (
+          SELECT
+            gs.organism_id,
+            gsi.gene_set_id,
+            gsi.content
+          FROM gene_set_items gsi
+          JOIN gene_sets gs ON gs.id = gsi.gene_set_id
+          WHERE gsi.identifier = %s
+            AND gs.organism_id = %s
+        )
+        SELECT
+          string_agg(DISTINCT g.name, ',' ORDER BY g.name) AS gene_names
+        FROM target_set ts
+        CROSS JOIN LATERAL unnest(string_to_array(ts.content, ',')) AS gene_id_text
+        JOIN genes g ON g.id = (gene_id_text)::integer;
+        """
+    
+        with self._cursor() as cur:
+            cur.execute(sql, (go_term, organism_id))
+            row = cur.fetchone() or {}
+    
+        names_csv = row.get("gene_names") or ""
+        names = {n.strip() for n in names_csv.split(",") if n and n.strip()}
+        
+        return {n.upper() for n in names}
+
+    def get_ribo_protein_gene_names_once(self, organism_id: int, go_term: str = "GO:0003735") -> set[str]:
+        self.connect()
+        try:
+            return self.get_ribo_protein_gene_names(organism_id, go_term=go_term)
+        finally:
+            self.disconnect()
+
 
 ### MAIN functions ###
         
@@ -1356,7 +2204,7 @@ dispatch = {
     'H5_10X': H510xHandler.parse,
     'H5AD': H5ADHandler.parse,
     'LOOM': LoomHandler.parse,
-    'RDS': LoomHandler.parse,
+    'RDS': RdsHandler.parse,
     'MTX': MtxHandler.parse,
     'RAW_TEXT': TextHandler.parse,
 }
@@ -1364,13 +2212,11 @@ dispatch = {
 def get_env(name: str, required: bool = False, default: str | None = None) -> str | None:
     value = os.getenv(name, default)
     if required and not value:
-        raise ErrorJSON(f"Missing required environment variable: {name}")
+        ErrorJSON(f"Missing required environment variable: {name}")
     return value
 
 def parse_host_string(s: str):
-    from urllib.parse import urlparse
-    if "://" not in s:
-        s = "dummy://" + s
+    if "://" not in s: s = "dummy://" + s
     u = urlparse(s)
     # host
     if not u.hostname:
@@ -1386,7 +2232,10 @@ def parse_host_string(s: str):
                 port = int(parts[1])
             else:
                ErrorJSON(f"Invalid port: {parts[1]!r}")
-
+    if port is None:
+        #ErrorJSON("Missing port in --dburl (expected HOST:PORT/DB)")
+        port = 5432 # default
+    
     # dbname
     dbname = u.path.lstrip("/")
     if not dbname:
@@ -1409,7 +2258,15 @@ def parse(args):
     
     # Extract genes from species
     gene_db = db.get_genes_in_db_once(args.organism)
-   
+
+    # Fetch ribosomal protein gene symbols via GO and attach to gene_db object
+    ribo_set = db.get_ribo_protein_gene_names_once(args.organism, go_term="GO:0003735")
+    gene_db.ribo_protein_gene_names = ribo_set
+
+    args.warnings = getattr(args, "warnings", [])
+    if not ribo_set:
+        args.warnings.append(f"No ribosomal protein genes found for GO:0003735 (organism_id={args.organism}). Ribosomal protein content will be reported as 0 for all cells.")
+    
     # Call the appropriate parsing function
     handler = dispatch.get(args.filetype)
     if handler:
