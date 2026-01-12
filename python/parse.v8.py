@@ -1527,19 +1527,414 @@ class LoomHandler:
             print(json_str)
 
 class H510xHandler:
+    """
+    Parses a 10x Genomics HDF5 Feature-Barcode Matrix (.h5) and writes a Loom v3 file to args.output_path.
+
+    Mirrors H5ADHandler.parse + LoomHandler.parse behavior:
+      - select input group (root-level genome group) via --sel or auto if unique
+      - write /col_attrs/CellID and /row_attrs/Original_Gene
+      - map genes via DB and write Accession/Name/Biotypes/Chromosomes/etc.
+      - write /matrix (Genes x Cells) with chunked processing and compute stats on the fly:
+          _Depth, _Detected_Genes, _Mitochondrial_Content, _Ribosomal_Content, _Protein_Coding_Content, _Sum
+      - write _StableID vectors for rows/cols
+      - transfer extra 10x feature annotations (feature_type, genome, etc.) into /row_attrs/*
+      - emit JSON summary with Metadata entries (same structure as other handlers)
+    """
+
     @staticmethod
-    def parse(args, file_path, gene_db):
-        # build the JSON-able structure
+    def _decode_list(arr) -> list[str]:
+        out = []
+        for v in arr:
+            if isinstance(v, (bytes, np.bytes_, np.void)):
+                try:
+                    out.append(v.decode(errors="ignore"))
+                except Exception:
+                    out.append(str(v))
+            else:
+                out.append(str(v))
+        return out
+
+    @staticmethod
+    def _find_10x_groups(f: h5py.File) -> list[str]:
+        """
+        Returns list of root-level group names that look like 10x matrices.
+        Your preparse detection: {'barcodes','data','indices','indptr','shape'} subset.
+        """
+        out = []
+        for key in f.keys():
+            if isinstance(f[key], h5py.Group):
+                grp = f[key]
+                if {'barcodes', 'data', 'indices', 'indptr', 'shape'}.issubset(grp.keys()):
+                    out.append(key)
+        return out
+
+    @staticmethod
+    def _pick_group(f: h5py.File, sel: str | None) -> str:
+        candidates = H510xHandler._find_10x_groups(f)
+        if sel is not None:
+            if sel in f and isinstance(f[sel], h5py.Group):
+                # accept exact match even if not in candidates (but validate)
+                grp = f[sel]
+                if {'barcodes', 'data', 'indices', 'indptr', 'shape'}.issubset(grp.keys()):
+                    return sel
+                ErrorJSON(f"Path '{sel}' (provided with --sel) is not a valid 10x matrix group (missing required datasets).")
+            ErrorJSON(f"Path '{sel}' (provided with --sel) not found in file")
+        # auto-pick
+        if len(candidates) == 0:
+            ErrorJSON("No valid 10x matrix group found at root level. Please provide --sel with the correct group name.")
+        if len(candidates) > 1:
+            ErrorJSON(f"Multiple 10x matrix groups found: {candidates}. Please provide a group with --sel")
+        return candidates[0]
+
+    @staticmethod
+    def _read_barcodes(grp: h5py.Group) -> list[str]:
+        if "barcodes" not in grp:
+            ErrorJSON("10x group missing 'barcodes'")
+        return H510xHandler._decode_list(grp["barcodes"][:])
+
+    @staticmethod
+    def _read_feature_ids_and_names(grp: h5py.Group, n_genes: int) -> tuple[list[str], dict[str, np.ndarray]]:
+        """
+        Returns:
+          - var_genes: preferred original gene names (for /row_attrs/Original_Gene)
+          - extra_fields: dict of other feature-level vectors to optionally transfer to /row_attrs/*
+        Handles both older (gene_names / genes) and v3 (features/*) layouts.
+        """
+        extra_fields: dict[str, np.ndarray] = {}
+
+        # ---- Older 10x layouts ----
+        if "gene_names" in grp:
+            names = grp["gene_names"][:]
+            var_genes = H510xHandler._decode_list(names)
+            if len(var_genes) != n_genes:
+                # best-effort truncate/pad
+                var_genes = (var_genes + [f"Gene_{i+1}" for i in range(len(var_genes), n_genes)])[:n_genes]
+            return var_genes, extra_fields
+
+        if "genes" in grp:
+            # sometimes it's Ensembl IDs or symbols depending on producer
+            ids = grp["genes"][:]
+            var_genes = H510xHandler._decode_list(ids)
+            if len(var_genes) != n_genes:
+                var_genes = (var_genes + [f"Gene_{i+1}" for i in range(len(var_genes), n_genes)])[:n_genes]
+            return var_genes, extra_fields
+
+        # ---- 10x v3+ 'features' group ----
+        if "features" in grp and isinstance(grp["features"], h5py.Group):
+            fg = grp["features"]
+
+            # Candidate datasets for "original gene label"
+            # Prefer features/name if available; fall back to features/id.
+            if "name" in fg:
+                var_genes = H510xHandler._decode_list(fg["name"][:])
+            elif "id" in fg:
+                var_genes = H510xHandler._decode_list(fg["id"][:])
+            else:
+                var_genes = [f"Gene_{i+1}" for i in range(n_genes)]
+
+            # Collect extra feature annotations for transfer (length == n_genes)
+            for k in fg.keys():
+                if k in {"name", "id"}:
+                    continue
+                node = fg[k]
+                if isinstance(node, h5py.Dataset):
+                    try:
+                        arr = node[:]
+                        if isinstance(arr, np.ndarray) and arr.shape[0] == n_genes:
+                            # decode bytes arrays to str arrays if needed
+                            if arr.dtype.kind in ("S", "O", "U"):
+                                arr = np.array(
+                                    [v.decode(errors="ignore") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in arr],
+                                    dtype=object,
+                                )
+                            extra_fields[k] = arr
+                    except Exception:
+                        pass
+
+            # Ensure length
+            if len(var_genes) != n_genes:
+                var_genes = (var_genes + [f"Gene_{i+1}" for i in range(len(var_genes), n_genes)])[:n_genes]
+
+            return var_genes, extra_fields
+
+        # ---- Fallback ----
+        return [f"Gene_{i+1}" for i in range(n_genes)], extra_fields
+
+    @staticmethod
+    def _write_10x_matrix_and_compute_stats(grp: h5py.Group, loom: LoomFile, dest_path: str, n_cells: int, n_genes: int, gene_metadata: list["Gene"] | None) -> dict:
+        """
+        10x H5 stores a CSC matrix with:
+          - shape = (n_genes, n_cells)
+          - indptr length = n_cells + 1  (columns = cells)
+          - indices are row indices (genes)
+        We write /matrix as Genes x Cells and compute stats using chunk over cells.
+        """
+        # Validate
+        for k in ("data", "indices", "indptr", "shape"):
+            if k not in grp:
+                ErrorJSON(f"10x group missing '{k}'")
+
+        shape = tuple(int(x) for x in grp["shape"][:])
+        if len(shape) != 2:
+            ErrorJSON(f"10x 'shape' is not 2D: {shape}")
+        # shape is (genes, cells)
+        if shape[0] != n_genes or shape[1] != n_cells:
+            ErrorJSON(f"10x matrix dimension mismatch: expected ({n_genes},{n_cells}) found {shape}")
+
+        indptr = grp["indptr"]
+        indices = grp["indices"]
+        data = grp["data"]
+
+        if int(indptr.shape[0]) != n_cells + 1:
+            # Some exotic producers might transpose; we keep strict to avoid silent corruption
+            ErrorJSON(f"Unexpected 10x indptr length={int(indptr.shape[0])}. Expected n_cells+1={n_cells+1} (CSC with columns=cells).")
+
+        # Prepare Loom dataset (Genes x Cells)
+        dset = loom.handle.create_dataset(
+            dest_path,
+            shape=(n_genes, n_cells),
+            dtype="float32",
+            chunks=(min(n_genes, 1024), min(n_cells, 1024)),
+            compression="gzip",
+        )
+
+        total_zeros = 0
+        is_integer = True
+
+        cell_depth = np.zeros(n_cells) if gene_metadata else None
+        cell_detected = np.zeros(n_cells) if gene_metadata else None
+        cell_mt = np.zeros(n_cells) if gene_metadata else None
+        cell_rrna = np.zeros(n_cells) if gene_metadata else None
+        cell_prot = np.zeros(n_cells) if gene_metadata else None
+        gene_sum = np.zeros(n_genes) if gene_metadata else None
+
+        mt_idx = ribo_idx = prot_idx = []
+        if gene_metadata is not None:
+            mt_idx = [i for i, g in enumerate(gene_metadata) if loom.is_mito(g.chr)]
+            ribo_idx = [i for i, g in enumerate(gene_metadata) if loom.is_ribo(g.name)]
+            prot_idx = [i for i, g in enumerate(gene_metadata) if loom.is_protein_coding(g.biotype)]
+
+        # chunk over cells
+        block_cells = 1024
+        for start in range(0, n_cells, block_cells):
+            end = min(start + block_cells, n_cells)
+
+            ptr = indptr[start:end + 1]
+            # ptr is a numpy array (or array-like)
+            ptr0 = int(ptr[0])
+            ptrN = int(ptr[-1])
+
+            # Slice CSC pieces
+            data_slice = data[ptr0:ptrN]
+            idx_slice = indices[ptr0:ptrN]
+            # Local indptr for this block
+            local_indptr = (ptr - ptr0).astype(np.int64, copy=False)
+
+            # Build CSC (genes x block_cells)
+            block = sp.csc_matrix(
+                (data_slice, idx_slice, local_indptr),
+                shape=(n_genes, end - start),
+            )
+
+            # Convert to dense for writing/stats
+            block_gxc = block.toarray().astype(np.float32, copy=False)  # (genes, block_cells)
+            dset[:, start:end] = block_gxc
+
+            # stats need cells x genes
+            chunk = block_gxc.T  # (block_cells, genes)
+
+            # zeros: count over dense chunk
+            total_zeros += int((chunk == 0).sum())
+
+            if is_integer and not np.all(np.floor(chunk) == chunk):
+                is_integer = False
+
+            if gene_metadata is not None:
+                depth = chunk.sum(axis=1)
+                detected = (chunk > 0).sum(axis=1)
+
+                cell_depth[start:end] = depth
+                cell_detected[start:end] = detected
+
+                gene_sum += chunk.sum(axis=0)
+
+                if mt_idx:
+                    cell_mt[start:end] = chunk[:, mt_idx].sum(axis=1)
+                if ribo_idx:
+                    cell_rrna[start:end] = chunk[:, ribo_idx].sum(axis=1)
+                if prot_idx:
+                    cell_prot[start:end] = chunk[:, prot_idx].sum(axis=1)
+
+        def to_percentage(subset_sum, total_sum):
+            if subset_sum is None or total_sum is None:
+                return None
+            return np.divide(subset_sum, total_sum, out=np.zeros_like(subset_sum), where=total_sum != 0) * 100
+
+        stats = {
+            "cell_depth": cell_depth,
+            "cell_detected": cell_detected,
+            "cell_mt": to_percentage(cell_mt, cell_depth),
+            "cell_rrna": to_percentage(cell_rrna, cell_depth),
+            "cell_prot": to_percentage(cell_prot, cell_depth),
+            "gene_sum": gene_sum,
+            "total_zeros": int(total_zeros),
+            "is_count_table": int(is_integer),
+            "empty_cells": int(np.sum(cell_depth == 0)) if cell_depth is not None else None,
+            "empty_genes": int(np.sum(gene_sum == 0)) if gene_sum is not None else None,
+        }
+        return stats
+
+    @staticmethod
+    def parse(args, file_path, gene_db: "MapGene"):
         result = {
             "detected_format": "H5_10x",
             "input_path": file_path,
+            "input_group": "",
             "output_path": args.output_path,
+            "nber_rows": -1,             # genes
+            "nber_cols": -1,             # cells
+            "nber_not_found_genes": -1,
+            "nber_zeros": -1,
+            "is_count_table": -1,
+            "empty_cols": -1,            # empty cells
+            "empty_rows": -1,            # empty genes
+            "dataset_size": -1,
+            "metadata": [],
         }
+        # Deal with previous warnings
+        if getattr(args, "warnings", None):
+            result["warning"] = list(args.warnings)
 
-        # Serialize to JSON
-        json_str = json.dumps(result, ensure_ascii=False)
-        
-        # Either write to file or print
+        with h5py.File(file_path, "r") as f:
+            # 1) Select group
+            group_name = H510xHandler._pick_group(f, args.sel)
+            result["input_group"] = group_name
+            grp = f[group_name]
+
+            # 2) Dimensions
+            n_genes = int(grp["shape"][0])
+            n_cells = int(grp["shape"][1])
+            result["nber_rows"] = n_genes
+            result["nber_cols"] = n_cells
+
+            # 3) Create output Loom
+            loom = LoomFile(args.output_path)
+            loom.ribo_protein_gene_names = getattr(gene_db, "ribo_protein_gene_names", set())
+
+            # 4) Read barcodes + feature names
+            obs_cells = H510xHandler._read_barcodes(grp)
+            if len(obs_cells) != n_cells:
+                obs_cells = (obs_cells + [f"Cell_{i+1}" for i in range(len(obs_cells), n_cells)])[:n_cells]
+
+            var_genes, feature_extra = H510xHandler._read_feature_ids_and_names(grp, n_genes)
+
+            # 5) Write CellID and Original_Gene
+            loom.write(obs_cells, "/col_attrs/CellID")
+            result["metadata"].append(Metadata(name="/col_attrs/CellID", on="CELL", type="STRING", nber_cols=len(obs_cells), nber_rows=1, distinct_values=len(set(obs_cells)), missing_values=count_missing(obs_cells), dataset_size=loom.get_dataset_size("/col_attrs/CellID"), imported=0))
+
+            loom.write(var_genes, "/row_attrs/Original_Gene")
+            result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(var_genes), distinct_values=len(set(var_genes)), missing_values=count_missing(var_genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
+
+            # 6) Map genes through DB, write gene annotations (same as H5AD + Loom handlers)
+            parsed_genes, result["nber_not_found_genes"] = gene_db.parse_genes_list(var_genes)
+
+            ens_ids = [g.ensembl_id for g in parsed_genes]
+            loom.write(ens_ids, "/row_attrs/Accession")
+            result["metadata"].append(Metadata(name="/row_attrs/Accession", on="GENE", type="STRING", nber_cols=1, nber_rows=len(ens_ids), distinct_values=len(set(ens_ids)), missing_values=count_missing(ens_ids), dataset_size=loom.get_dataset_size("/row_attrs/Accession"), imported=0))
+
+            gene_names = [g.name for g in parsed_genes]
+            loom.write(gene_names, "/row_attrs/Gene")  # backward compatibility
+            result["metadata"].append(Metadata(name="/row_attrs/Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(gene_names), distinct_values=len(set(gene_names)), missing_values=count_missing(gene_names), dataset_size=loom.get_dataset_size("/row_attrs/Gene"), imported=0))
+
+            loom.write(gene_names, "/row_attrs/Name")
+            result["metadata"].append(Metadata(name="/row_attrs/Name", on="GENE", type="STRING", nber_cols=1, nber_rows=len(gene_names), distinct_values=len(set(gene_names)), missing_values=count_missing(gene_names), dataset_size=loom.get_dataset_size("/row_attrs/Name"), imported=0))
+
+            biotypes = [g.biotype for g in parsed_genes]
+            loom.write(biotypes, "/row_attrs/_Biotypes")
+            result["metadata"].append(Metadata(name="/row_attrs/_Biotypes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(biotypes), distinct_values=len(set(biotypes)), missing_values=count_missing(biotypes), dataset_size=loom.get_dataset_size("/row_attrs/_Biotypes"), imported=0, categories=dict(Counter(biotypes)), )
+            )
+
+            chroms = [g.chr for g in parsed_genes]
+            loom.write(chroms, "/row_attrs/_Chromosomes")
+            result["metadata"].append(Metadata(name="/row_attrs/_Chromosomes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(chroms), distinct_values=len(set(chroms)), missing_values=count_missing(chroms), dataset_size=loom.get_dataset_size("/row_attrs/_Chromosomes"), imported=0, categories=dict(Counter(chroms)), )
+            )
+
+            sum_exon_length = [g.sum_exon_length for g in parsed_genes]
+            loom.write(sum_exon_length, "/row_attrs/_SumExonLength")
+            result["metadata"].append(Metadata(name="/row_attrs/_SumExonLength", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(sum_exon_length), distinct_values=len(set(sum_exon_length)), missing_values=count_missing(sum_exon_length), dataset_size=loom.get_dataset_size("/row_attrs/_SumExonLength"), imported=0))
+
+            # 7) Write main matrix + compute stats
+            stats = H510xHandler._write_10x_matrix_and_compute_stats(grp=grp, loom=loom, dest_path="/matrix", n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes)
+
+            result["dataset_size"] = loom.get_dataset_size("/matrix")
+            result["nber_zeros"] = int(stats["total_zeros"])
+            result["empty_cols"] = int(stats["empty_cells"])
+            result["empty_rows"] = int(stats["empty_genes"])
+            result["is_count_table"] = int(stats["is_count_table"])
+
+            # 8) Write computed vectors
+            loom.write(stats["cell_depth"], "/col_attrs/_Depth")
+            result["metadata"].append(Metadata(name="/col_attrs/_Depth", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_depth"]), nber_rows=1, distinct_values=len(set(stats["cell_depth"])), missing_values=count_missing(stats["cell_depth"]), dataset_size=loom.get_dataset_size("/col_attrs/_Depth"), imported=0))
+
+            loom.write(stats["cell_detected"], "/col_attrs/_Detected_Genes")
+            result["metadata"].append(Metadata(name="/col_attrs/_Detected_Genes", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_detected"]), nber_rows=1, distinct_values=len(set(stats["cell_detected"])), missing_values=count_missing(stats["cell_detected"]), dataset_size=loom.get_dataset_size("/col_attrs/_Detected_Genes"), imported=0))
+
+            loom.write(stats["cell_mt"], "/col_attrs/_Mitochondrial_Content")
+            result["metadata"].append(Metadata(name="/col_attrs/_Mitochondrial_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_mt"]), nber_rows=1, distinct_values=len(set(stats["cell_mt"])), missing_values=count_missing(stats["cell_mt"]), dataset_size=loom.get_dataset_size("/col_attrs/_Mitochondrial_Content"), imported=0))
+
+            loom.write(stats["cell_rrna"], "/col_attrs/_Ribosomal_Content")
+            result["metadata"].append(Metadata(name="/col_attrs/_Ribosomal_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_rrna"]), nber_rows=1, distinct_values=len(set(stats["cell_rrna"])), missing_values=count_missing(stats["cell_rrna"]), dataset_size=loom.get_dataset_size("/col_attrs/_Ribosomal_Content"), imported=0))
+
+            loom.write(stats["cell_prot"], "/col_attrs/_Protein_Coding_Content")
+            result["metadata"].append(Metadata(name="/col_attrs/_Protein_Coding_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_prot"]), nber_rows=1, distinct_values=len(set(stats["cell_prot"])), missing_values=count_missing(stats["cell_prot"]), dataset_size=loom.get_dataset_size("/col_attrs/_Protein_Coding_Content"), imported=0))
+
+            loom.write(stats["gene_sum"], "/row_attrs/_Sum")
+            result["metadata"].append(Metadata(name="/row_attrs/_Sum", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(stats["gene_sum"]), distinct_values=len(set(stats["gene_sum"])), missing_values=count_missing(stats["gene_sum"]), dataset_size=loom.get_dataset_size("/row_attrs/_Sum"), imported=0))
+
+            # 9) Stable IDs
+            stable_ids_rows = list(range(n_genes))
+            loom.write(stable_ids_rows, "/row_attrs/_StableID")
+            result["metadata"].append(Metadata(name="/row_attrs/_StableID", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(stable_ids_rows), distinct_values=len(set(stable_ids_rows)), missing_values=count_missing(stable_ids_rows), dataset_size=loom.get_dataset_size("/row_attrs/_StableID"), imported=0))
+
+            stable_ids_cols = list(range(n_cells))
+            loom.write(stable_ids_cols, "/col_attrs/_StableID")
+            result["metadata"].append(Metadata(name="/col_attrs/_StableID", on="CELL", type="NUMERIC", nber_cols=len(stable_ids_cols), nber_rows=1, distinct_values=len(set(stable_ids_cols)), missing_values=count_missing(stable_ids_cols), dataset_size=loom.get_dataset_size("/col_attrs/_StableID"), imported=0))
+
+            # 10) Transfer extra feature-level annotations (10x v3 features/*) as imported metadata
+            existing_paths = {m.name for m in result["metadata"]}
+            for k, arr in feature_extra.items():
+                loom_path = f"/row_attrs/{k}"
+                if loom_path in existing_paths:
+                    continue
+                try:
+                    loom.write(arr, loom_path)
+
+                    # Build metadata similarly to transfer_metadata logic
+                    meta = Metadata(name=loom_path, on="GENE", nber_rows=n_genes, nber_cols=1, missing_values=count_missing(arr), imported=1, dataset_size=loom.get_dataset_size(loom_path))
+
+                    # categorical counts only for 1D
+                    if np.asarray(arr).ndim <= 1:
+                        # Convert to strings for counting
+                        vals = arr
+                        if np.asarray(vals).dtype.kind in ("S", "U", "O"):
+                            vals = np.array([v.decode(errors="ignore") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in vals], dtype=object)
+                        counts = Counter(list(vals))
+                        meta.distinct_values = len(counts)
+                        meta.categories = dict(counts)
+                        is_numeric = np.issubdtype(np.array(vals).dtype, np.number)
+                        meta.finalize_type(is_numeric)
+                    else:
+                        meta.type = "NUMERIC" if np.issubdtype(np.array(arr).dtype, np.number) else "STRING"
+
+                    result["metadata"].append(meta)
+                    existing_paths.add(loom_path)
+                except Exception as e:
+                    result.setdefault("warning", []).append(f"Could not transfer 10x feature field '{k}': {e}")
+
+            loom.close()
+
+        # 11) Emit JSON
+        json_str = json.dumps(result, default=dataclass_to_json, ensure_ascii=False)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
