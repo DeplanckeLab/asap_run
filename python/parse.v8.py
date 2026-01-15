@@ -1170,7 +1170,7 @@ class LoomHandler:
         Returns (gene_names, source_path_or_reason).
         Prefers /row_attrs/Original_Gene then Name/Gene/Accession etc.
         """
-        candidates = [ "/row_attrs/Original_Gene", "/row_attrs/Name", "/row_attrs/Gene", "/row_attrs/Accession", "/row_attrs/gene", "/row_attrs/gene_name", "/row_attrs/var_names", "/row_attrs/index", "/row_attrs/_index" ]
+        candidates = [ "/row_attrs/Accession", "/row_attrs/Name", "/row_attrs/Gene", "/row_attrs/Original_Gene", "/row_attrs/gene", "/row_attrs/gene_name", "/row_attrs/var_names", "/row_attrs/index", "/row_attrs/_index" ]
         p = LoomHandler._find_first_existing(f, candidates)
         if p and isinstance(f[p], h5py.Dataset):
             vals = f[p][:]
