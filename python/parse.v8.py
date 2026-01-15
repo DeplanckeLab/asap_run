@@ -1168,18 +1168,70 @@ class LoomHandler:
     def _infer_original_gene_names(f: h5py.File, n_genes: int) -> tuple[list[str], str]:
         """
         Returns (gene_names, source_path_or_reason).
-        Prefers /row_attrs/Original_Gene then Name/Gene/Accession etc.
-        """
-        candidates = [ "/row_attrs/Accession", "/row_attrs/Name", "/row_attrs/Gene", "/row_attrs/Original_Gene", "/row_attrs/gene", "/row_attrs/gene_name", "/row_attrs/var_names", "/row_attrs/index", "/row_attrs/_index" ]
-        p = LoomHandler._find_first_existing(f, candidates)
-        if p and isinstance(f[p], h5py.Dataset):
-            vals = f[p][:]
-            genes = LoomHandler._as_str_list(vals)
-            if len(genes) == n_genes:
-                return genes, p
 
-        # Fallback
-        return [f"Gene_{i+1}" for i in range(n_genes)], "__generated__"
+        Per-gene fallback across multiple candidate row_attrs vectors:
+        for each gene i, take the first non-empty value from the ordered candidates.
+        If all candidates are empty/missing for a gene, fall back to "Gene_{i+1}".
+        """
+        candidates = [
+            "/row_attrs/Accession",
+            "/row_attrs/Name",
+            "/row_attrs/Gene",
+            "/row_attrs/Original_Gene",
+            "/row_attrs/gene",
+            "/row_attrs/gene_name",
+            "/row_attrs/var_names",
+            "/row_attrs/index",
+            "/row_attrs/_index",
+        ]
+
+        # Load all usable candidate vectors (must exist, be dataset, and have correct length)
+        loaded: list[tuple[str, list[str]]] = []
+        for p in candidates:
+            if p in f and isinstance(f[p], h5py.Dataset):
+                try:
+                    vals = f[p][:]
+                    vec = LoomHandler._as_str_list(vals)
+                except Exception:
+                    continue
+                if len(vec) == n_genes:
+                    loaded.append((p, vec))
+
+        if not loaded:
+            return [f"Gene_{i+1}" for i in range(n_genes)], "__generated__"
+
+        def is_empty(s: str) -> bool:
+            if s is None:
+                return True
+            ss = str(s).strip()
+            return (ss == "" or ss.lower() in {"nan", "null", "0"})
+
+        # Per-gene fallback: first non-empty across loaded candidates
+        out: list[str] = []
+        used_paths: set[str] = set()
+
+        for i in range(n_genes):
+            chosen = None
+            chosen_path = None
+            for p, vec in loaded:
+                v = vec[i]
+                if not is_empty(v):
+                    chosen = str(v).strip()
+                    chosen_path = p
+                    break
+
+            if chosen is None:
+                out.append(f"Gene_{i+1}")
+            else:
+                out.append(chosen)
+                used_paths.add(chosen_path)
+
+        # Describe provenance: single source if only one used; otherwise mark as mixed
+        if not used_paths:
+            return out, "__generated__"
+        if len(used_paths) == 1:
+            return out, next(iter(used_paths))
+        return out, "__mixed__:" + ",".join(sorted(used_paths))
 
     @staticmethod
     def _path_orientation(path: str) -> str:
