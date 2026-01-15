@@ -803,7 +803,12 @@ class H5ADHandler:
             loom.write(var_genes, "/row_attrs/Original_Gene") # Add original gene names to Loom
             result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(var_genes), distinct_values=len(set(var_genes)), missing_values=count_missing(var_genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
             ### 4.c. Add informations from Gene database
-            parsed_genes, result["nber_not_found_genes"] = gene_db.parse_genes_list(var_genes) # Compare genes to database
+            parsed_genes, not_found_genes = gene_db.parse_genes_list(var_genes) # Compare genes to database
+            result["nber_not_found_genes"] = len(not_found_genes)
+            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f:
+                for gene in not_found_genes:
+                    f.write(f"{gene}\n")
+            
             # Extract the vectors for Loom writing and write to loom
             #### 4.c.1. Ensembl IDS
             ens_ids = [g.ensembl_id for g in parsed_genes]
@@ -1431,7 +1436,11 @@ class LoomHandler:
             result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(var_genes), distinct_values=len(set(var_genes)), missing_values=count_missing(var_genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
 
             # 6) Map genes through DB, write gene annotations (same as H5ADHandler.parse)
-            parsed_genes, result["nber_not_found_genes"] = gene_db.parse_genes_list(var_genes)
+            parsed_genes, not_found_genes = gene_db.parse_genes_list(var_genes) # Compare genes to database
+            result["nber_not_found_genes"] = len(not_found_genes)
+            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f:
+                for gene in not_found_genes:
+                    f.write(f"{gene}\n")
 
             ens_ids = [g.ensembl_id for g in parsed_genes]
             loom.write(ens_ids, "/row_attrs/Accession")
@@ -1836,7 +1845,11 @@ class H510xHandler:
             result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(var_genes), distinct_values=len(set(var_genes)), missing_values=count_missing(var_genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
 
             # 6) Map genes through DB, write gene annotations (same as H5AD + Loom handlers)
-            parsed_genes, result["nber_not_found_genes"] = gene_db.parse_genes_list(var_genes)
+            parsed_genes, not_found_genes = gene_db.parse_genes_list(var_genes) # Compare genes to database
+            result["nber_not_found_genes"] = len(not_found_genes)
+            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f:
+                for gene in not_found_genes:
+                    f.write(f"{gene}\n")
 
             ens_ids = [g.ensembl_id for g in parsed_genes]
             loom.write(ens_ids, "/row_attrs/Accession")
@@ -2445,13 +2458,15 @@ class MapGene:
     def parse_genes_list(self, queries: List[str]):
         """ Process a list of gene identifiers (e.g. var_genes)  and returns a list of Gene objects. """
         results = []
-        not_found_count = 0
+        not_found_genes = []
+        #not_found_count = 0
         for i, q in enumerate(queries):
             gene_obj = self.parse_gene(q, i)
             if gene_obj.biotype == "__unknown":
-                not_found_count += 1
+                #not_found_count += 1
+                not_found_genes.append(q)
             results.append(gene_obj)
-        return results, not_found_count
+        return results, not_found_genes
 
 class DBManager:
     def __init__(self, *, dbname: str, user: str, password: str, host: str, port:int, connect_timeout: int = 10, sslmode: Optional[str] = None) -> None:
