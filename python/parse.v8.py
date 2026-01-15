@@ -805,9 +805,9 @@ class H5ADHandler:
             ### 4.c. Add informations from Gene database
             parsed_genes, not_found_genes = gene_db.parse_genes_list(var_genes) # Compare genes to database
             result["nber_not_found_genes"] = len(not_found_genes)
-            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f:
+            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f_nfg:
                 for gene in not_found_genes:
-                    f.write(f"{gene}\n")
+                    f_nfg.write(f"{gene}\n")
             
             # Extract the vectors for Loom writing and write to loom
             #### 4.c.1. Ensembl IDS
@@ -1438,9 +1438,9 @@ class LoomHandler:
             # 6) Map genes through DB, write gene annotations (same as H5ADHandler.parse)
             parsed_genes, not_found_genes = gene_db.parse_genes_list(var_genes) # Compare genes to database
             result["nber_not_found_genes"] = len(not_found_genes)
-            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f:
+            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f_nfg:
                 for gene in not_found_genes:
-                    f.write(f"{gene}\n")
+                    f_nfg.write(f"{gene}\n")
 
             ens_ids = [g.ensembl_id for g in parsed_genes]
             loom.write(ens_ids, "/row_attrs/Accession")
@@ -1847,9 +1847,9 @@ class H510xHandler:
             # 6) Map genes through DB, write gene annotations (same as H5AD + Loom handlers)
             parsed_genes, not_found_genes = gene_db.parse_genes_list(var_genes) # Compare genes to database
             result["nber_not_found_genes"] = len(not_found_genes)
-            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f:
+            with open(Path(args.output_path).parent / "not_found_genes.txt", "w") as f_nfg:
                 for gene in not_found_genes:
-                    f.write(f"{gene}\n")
+                    f_nfg.write(f"{gene}\n")
 
             ens_ids = [g.ensembl_id for g in parsed_genes]
             loom.write(ens_ids, "/row_attrs/Accession")
