@@ -57,6 +57,36 @@ class H5ADHandler:
         return (n_items, n_components)  # GLOBAL: keep shape
     
     @staticmethod
+    def _h5_dataset_max_1d(dset: h5py.Dataset, *, block: int | None = None) -> int:
+        """
+        Compute max(dset) without reading the whole dataset into memory.
+        Assumes dset is 1D (like sparse 'indices').
+        """
+        n = int(dset.shape[0])
+        if n == 0:
+            return -1
+
+        # Choose a block size:
+        # - Prefer HDF5 chunk size if present (usually good)
+        # - Otherwise fall back to something reasonable
+        if block is None:
+            if getattr(dset, "chunks", None) and dset.chunks and dset.chunks[0]:
+                block = int(dset.chunks[0])
+            else:
+                block = 1_000_000  # ~1e6 integers per read
+
+        max_val = -1
+        for start in range(0, n, block):
+            stop = min(start + block, n)
+            arr = dset[start:stop]  # small slice
+            if arr.size:
+                # ensure Python int
+                m = int(arr.max())
+                if m > max_val:
+                    max_val = m
+        return max_val
+    
+    @staticmethod
     def _is_compound_dataset(node) -> bool:
         return isinstance(node, h5py.Dataset) and node.dtype.fields is not None
 
@@ -64,12 +94,6 @@ class H5ADHandler:
     def _write_no_compound_and_register(*, src_obj: h5py.Dataset, loom, result: dict, existing_paths: set, loom_path: str, orientation: str, expected_len: int | None = None) -> None:
         """
         Writes src_obj to loom_path, guaranteeing NO compound dtype in output.
-        Reuses your existing Metadata patterns:
-
-        - If compound with 1 numeric field -> write 1D vector to loom_path and create
-          metadata like transfer_metadata (distinct_values, missing_values, categories, finalize_type).
-        - Otherwise -> write one dataset per field at loom_path__<field> (best-effort),
-          and register each (1D fields get categorical stats; multidim fields get numeric-only meta).
         """
         if loom_path in existing_paths:
             return
@@ -235,10 +259,10 @@ class H5ADHandler:
             # One dimension is length(indptr)-1
             major = int(node["indptr"].shape[0] - 1)
     
-            # Other dimension: max(indices)+1 (expensive but usually ok, still best-effort)
-            # Use chunks if huge? For now keep simple.
-            idx = node["indices"][:]
-            minor = int(idx.max() + 1) if idx.size else 0
+            # Other dimension: max(indices)+1 (use a chunked approach for not exploding RAM)
+            indices = node["indices"]
+            max_idx = H5ADHandler._h5_dataset_max_1d(indices)
+            minor = int(max_idx + 1) if max_idx >= 0 else 0
     
             if enc == "csr_matrix":
                 return (major, minor)   # (cells, genes)
@@ -996,9 +1020,6 @@ class LoomHandler:
     def _write_compound_as_regular( src_obj: h5py.Dataset, loom_out: LoomFile, result: dict, existing_paths: set[str], full_path: str) -> None:
         """
         Writes a compound dataset without using compound dtypes in the output.
-        Strategy:
-          - If all fields numeric => write 2D float32 dataset to SAME path (N x K).
-          - Else => write one dataset per field: f"{path}__{field}".
         """
         fields = LoomHandler._compound_field_names(src_obj)
         if not fields:
@@ -1539,15 +1560,7 @@ class LoomHandler:
             existing_paths.add("/attrs/LOOM_SPEC_VERSION")  # created by LoomFile
 
             # We already handled /matrix explicitly.
-            # We also intentionally overwrite (with DB-derived values) several standard row/col attrs,
-            # so keep them in existing_paths.
-            LoomHandler._copy_all_other_datasets(
-                src_f=f,
-                loom_out=loom,
-                result=result,
-                existing_paths=existing_paths,
-                skip_prefixes=("/matrix",),  # do not duplicate
-            )
+            LoomHandler._copy_all_other_datasets(src_f=f, loom_out=loom, result=result, existing_paths=existing_paths, skip_prefixes=("/matrix"))
 
             loom.close()
 
@@ -2608,7 +2621,7 @@ class LoomFile:
             # --- Compute Stats ---
             # Check if all values are integers
             total_zeros += (chunk == 0).sum()
-            if is_integer and not np.all(np.equal(np.mod(chunk, 1), 0)):
+            if is_integer and not np.all(np.floor(chunk) == chunk):
                 is_integer = False
 
             if gene_metadata is not None: # We only compute it in this case
