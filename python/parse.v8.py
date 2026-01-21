@@ -89,12 +89,7 @@ class H5ADHandler:
             loom.write(arr, loom_path)
 
             # register minimal meta (caller usually does its own, but safe)
-            meta = Metadata(
-                name=loom_path,
-                on=orientation,
-                imported=1,
-                dataset_size=loom.get_dataset_size(loom_path),
-            )
+            meta = Metadata(name=loom_path, on=orientation, imported=1, dataset_size=loom.get_dataset_size(loom_path))
 
             # Compute dims according to our rules
             nber_rows, nber_cols = H5ADHandler._infer_meta_dims(np.asarray(arr), orientation)
@@ -145,19 +140,11 @@ class H5ADHandler:
             col = np.asarray(arr_flat[fields[0]]).reshape(-1)
             # decode to string if needed
             if col.dtype.kind in ("S", "O", "U"):
-                col = np.array(
-                    [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col],
-                    dtype=object,
-                )
+                col = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col], dtype=object)
 
             loom.write(col, loom_path)
 
-            meta = Metadata(
-                name=loom_path,
-                on=orientation,
-                imported=1,
-                dataset_size=loom.get_dataset_size(loom_path),
-            )
+            meta = Metadata(name=loom_path, on=orientation, imported=1, dataset_size=loom.get_dataset_size(loom_path))
 
             # 1D: keep your categorical logic
             vals = col
@@ -185,10 +172,7 @@ class H5ADHandler:
             for j, f_ in enumerate(fields):
                 col = np.asarray(arr_flat[f_]).reshape(-1)
                 if col.dtype.kind in ("S", "O", "U"):
-                    col = np.array(
-                        [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col],
-                        dtype=object,
-                    )
+                    col = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col], dtype=object)
                 else:
                     col = np.array([str(v) for v in col], dtype=object)
                 mat[:, j] = col
@@ -223,19 +207,6 @@ class H5ADHandler:
             return list(node.dtype.names or [])
         else:
             return []
-
-    @staticmethod
-    def _table_get_column(f, table_path: str, col: str):
-        node = f[table_path]
-        if isinstance(node, h5py.Group):
-            if col not in node:
-                raise KeyError(col)
-            return node[col]  # may be Dataset or Group (categorical)
-        elif H5ADHandler._is_compound_dataset(node):
-            # returns a numpy array for that field
-            return node[col]
-        else:
-            raise TypeError(f"Unsupported table node at {table_path}")
     
     @staticmethod
     def get_size(f, path):
@@ -1916,13 +1887,11 @@ class H510xHandler:
 
             biotypes = [g.biotype for g in parsed_genes]
             loom.write(biotypes, "/row_attrs/_Biotypes")
-            result["metadata"].append(Metadata(name="/row_attrs/_Biotypes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(biotypes), distinct_values=len(set(biotypes)), missing_values=count_missing(biotypes), dataset_size=loom.get_dataset_size("/row_attrs/_Biotypes"), imported=0, categories=dict(Counter(biotypes)), )
-            )
+            result["metadata"].append(Metadata(name="/row_attrs/_Biotypes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(biotypes), distinct_values=len(set(biotypes)), missing_values=count_missing(biotypes), dataset_size=loom.get_dataset_size("/row_attrs/_Biotypes"), imported=0, categories=dict(Counter(biotypes))))
 
             chroms = [g.chr for g in parsed_genes]
             loom.write(chroms, "/row_attrs/_Chromosomes")
-            result["metadata"].append(Metadata(name="/row_attrs/_Chromosomes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(chroms), distinct_values=len(set(chroms)), missing_values=count_missing(chroms), dataset_size=loom.get_dataset_size("/row_attrs/_Chromosomes"), imported=0, categories=dict(Counter(chroms)), )
-            )
+            result["metadata"].append(Metadata(name="/row_attrs/_Chromosomes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(chroms), distinct_values=len(set(chroms)), missing_values=count_missing(chroms), dataset_size=loom.get_dataset_size("/row_attrs/_Chromosomes"), imported=0, categories=dict(Counter(chroms))))
 
             sum_exon_length = [g.sum_exon_length for g in parsed_genes]
             loom.write(sum_exon_length, "/row_attrs/_SumExonLength")
@@ -2048,26 +2017,439 @@ class MtxHandler:
 
 class TextHandler:
     @staticmethod
+    def _decode_delim(delim: str) -> str:
+        # Match preparse behavior: allow '\t', '\n', etc.
+        d = bytes(delim, "utf-8").decode("unicode_escape")
+        if len(d) != 1:
+            ErrorJSON(f"Delimiter must be a single character after decoding. Got: {repr(d)}")
+        return d
+
+    @staticmethod
+    def _iter_rows(file_path: str, delim: str):
+        """
+        Stream rows as lists of strings. No pandas dependency; supports big files.
+        """
+        import csv
+        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f, delimiter=delim)
+            for row in reader:
+                # Keep empty columns (csv.reader does). Drop fully empty lines.
+                if not row or (len(row) == 1 and row[0].strip() == ""):
+                    continue
+                yield row
+
+    @staticmethod
+    def _scan_text_matrix(args, file_path: str) -> tuple[list[str], list[str], int, int]:
+        """
+        First pass:
+          - determine n_genes, n_cells
+          - extract/generate gene names and cell names
+          - validate rectangularity
+        Returns: (genes, cells, n_genes, n_cells)
+        """
+        delim = TextHandler._decode_delim(args.delim)
+
+        header = (args.header == "true")
+        col_mode = args.col  # none|first|last
+
+        rows = TextHandler._iter_rows(file_path, delim)
+
+        # Header row -> cells
+        first_row = None
+        try:
+            first_row = next(rows)
+        except StopIteration:
+            ErrorJSON("Input text file appears to be empty (no data rows).")
+
+        # Helper to split row into (gene_name_or_None, values_as_strings)
+        def split_row(row: list[str], row_index_1based: int) -> tuple[str | None, list[str]]:
+            if col_mode == "none":
+                return None, row
+            if len(row) < 2:
+                ErrorJSON(f"Row {row_index_1based} has {len(row)} column(s), but --col={col_mode} requires at least 2 columns.")
+            if col_mode == "first":
+                return row[0], row[1:]
+            if col_mode == "last":
+                return row[-1], row[:-1]
+            ErrorJSON(f"Unknown --col value: {col_mode}")
+
+        # --- determine cells and start reading data rows ---
+        genes: list[str] = []
+        cells: list[str] = []
+
+        n_cells: int | None = None
+
+        # If there is a header: interpret first row as column names
+        if header:
+            # Peek first data row to infer true n_cells
+            try:
+                first_data_row = next(rows)
+            except StopIteration:
+                ErrorJSON("Header is present but file contains no data rows.")
+
+            # Infer n_cells from data row length
+            if col_mode == "none":
+                n_cells = len(first_data_row)
+                if len(first_row) != n_cells:
+                    ErrorJSON(
+                        f"Header should contain {n_cells} columns (cells), but has {len(first_row)}."
+                    )
+                raw_cells = [c.strip() for c in first_row]
+                cells = [(c if c != "" else f"Cell_{i+1}") for i, c in enumerate(raw_cells)]
+
+                # first_data_row is gene1 values (no gene name column)
+                genes.append("Gene_1")
+
+                # Validate rectangularity immediately
+                if len(first_data_row) != n_cells:
+                    ErrorJSON(
+                        f"Non-rectangular matrix: row 2 has {len(first_data_row)} value columns, expected {n_cells}."
+                    )
+                row_counter = 1
+            else:
+                # col_mode is first or last: data rows must include 1 gene-name column
+                if len(first_data_row) < 2:
+                    ErrorJSON("Data rows must have at least 2 columns when --col is first/last.")
+                n_cells = len(first_data_row) - 1
+
+                # Interpret header:
+                # either header has exactly n_cells cell names (NO gene header placeholder),
+                # or it has n_cells+1 including gene header placeholder (then drop it).
+                if len(first_row) == n_cells:
+                    # Your file: header has ONLY cell names
+                    raw_cells = [c.strip() for c in first_row]
+                elif len(first_row) == n_cells + 1:
+                    # Header includes gene column label -> drop it according to col position
+                    if col_mode == "first":
+                        raw_cells = [c.strip() for c in first_row[1:]]
+                    else:  # last
+                        raw_cells = [c.strip() for c in first_row[:-1]]
+                else:
+                    ErrorJSON(
+                        f"Header length mismatch: expected {n_cells} (cells only) or {n_cells+1} (with gene header), "
+                        f"but got {len(first_row)}. Check --delim/--col."
+                    )
+
+                cells = [(c if c != "" else f"Cell_{i+1}") for i, c in enumerate(raw_cells)]
+
+                # Now process the first data row as gene 1
+                gene_name, vals0 = split_row(first_data_row, 2)
+                if len(vals0) != n_cells:
+                    ErrorJSON(
+                        f"Non-rectangular matrix: row 2 has {len(vals0)} value columns, expected {n_cells}."
+                    )
+                g = "" if gene_name is None else str(gene_name).strip()
+                genes.append(g if g != "" else "Gene_1")
+                row_counter = 1
+            
+            # Continue consuming remaining data rows
+            physical_row_index = 2  # we already consumed row 2 as first_data_row
+            for row in rows:
+                physical_row_index += 1
+                gene_name, vals = split_row(row, physical_row_index)
+                if len(vals) != n_cells:
+                    ErrorJSON(
+                        f"Non-rectangular matrix: row {physical_row_index} has {len(vals)} value columns, expected {n_cells}. "
+                        f"Did you set --delim/--header/--col correctly?"
+                    )
+                row_counter += 1
+                if col_mode == "none":
+                    genes.append(f"Gene_{row_counter}")
+                else:
+                    g = "" if gene_name is None else str(gene_name).strip()
+                    genes.append(g if g != "" else f"Gene_{row_counter}")
+        else:
+            # No header -> first_row is data
+            gene0, vals0 = split_row(first_row, 1)
+            n_cells = len(vals0)
+            cells = [f"Cell_{i+1}" for i in range(n_cells)]
+
+            # gene name for first data row
+            if col_mode == "none":
+                genes.append("Gene_1")
+            else:
+                g = "" if gene0 is None else str(gene0).strip()
+                genes.append(g if g != "" else "Gene_1")
+
+            physical_row_index = 1
+            row_counter = 1
+            for row in rows:
+                physical_row_index += 1
+                gene_name, vals = split_row(row, physical_row_index)
+                if len(vals) != n_cells:
+                    ErrorJSON(
+                        f"Non-rectangular matrix: row {physical_row_index} has {len(vals)} value columns, expected {n_cells}. "
+                        f"Did you set --delim/--header/--col correctly?"
+                    )
+                row_counter += 1
+                if col_mode == "none":
+                    genes.append(f"Gene_{row_counter}")
+                else:
+                    g = "" if gene_name is None else str(gene_name).strip()
+                    genes.append(g if g != "" else f"Gene_{row_counter}")
+
+        n_genes = len(genes)
+        if n_genes == 0 or n_cells == 0:
+            ErrorJSON("Parsed matrix has zero genes or zero cells. Check --header/--col/--delim.")
+
+        return genes, cells, n_genes, n_cells
+
+    @staticmethod
+    def _write_dense_text_matrix_and_stats(*, args, file_path: str, loom: "LoomFile", dest_path: str, n_genes: int, n_cells: int, gene_metadata: list | None) -> dict:
+        """
+        Second pass:
+          - stream numeric values
+          - write /matrix row-by-row (genes x cells)
+          - compute stats similarly to LoomFile.write_matrix()
+        """
+        delim = TextHandler._decode_delim(args.delim)
+        header = (args.header == "true")
+        col_mode = args.col
+
+        # Prepare Loom dataset
+        dset = loom.handle.create_dataset(dest_path, shape=(n_genes, n_cells), dtype="float32", chunks=(min(n_genes, 1024), min(n_cells, 1024)), compression="gzip")
+
+        # Stats
+        total_zeros = 0
+        is_integer = True
+
+        cell_depth = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
+        cell_detected = np.zeros(n_cells, dtype=np.int64) if gene_metadata else None
+        cell_mt = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
+        cell_rrna = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
+        cell_prot = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
+        gene_sum = np.zeros(n_genes, dtype=np.float64) if gene_metadata else None
+
+        # precompute gene flags (row-wise) to avoid checking inside every cell
+        mt_flags = ribo_flags = prot_flags = None
+        if gene_metadata is not None:
+            mt_flags = np.array([loom.is_mito(g.chr) for g in gene_metadata], dtype=bool)
+            ribo_flags = np.array([loom.is_ribo(g.name) for g in gene_metadata], dtype=bool)
+            prot_flags = np.array([loom.is_protein_coding(g.biotype) for g in gene_metadata], dtype=bool)
+
+        # Iterate rows
+        it = TextHandler._iter_rows(file_path, delim)
+
+        # Consume header if needed
+        if header:
+            try:
+                next(it)
+            except StopIteration:
+                ErrorJSON("Input text file contains a header but no data rows.")
+
+        def split_values(row: list[str], physical_row_index: int) -> list[str]:
+            if col_mode == "none":
+                vals = row
+            elif col_mode == "first":
+                if len(row) < 2:
+                    ErrorJSON(f"Row {physical_row_index} has {len(row)} column(s), but --col=first requires at least 2.")
+                vals = row[1:]
+            elif col_mode == "last":
+                if len(row) < 2:
+                    ErrorJSON(f"Row {physical_row_index} has {len(row)} column(s), but --col=last requires at least 2.")
+                vals = row[:-1]
+            else:
+                ErrorJSON(f"Unknown --col value: {col_mode}")
+
+            if len(vals) != n_cells:
+                ErrorJSON(f"Non-rectangular matrix: row {physical_row_index} has {len(vals)} value columns, expected {n_cells}. Did you set --delim/--header/--col correctly?")
+            return vals
+
+        physical_row_index = 0 if not header else 1  # header already consumed => file row index starts at 2
+        gene_idx = 0
+
+        for row in it:
+            physical_row_index += 1
+            # If header is present, physical_row_index is off by +1; fix for messages
+            msg_row_index = physical_row_index if not header else physical_row_index + 1
+
+            vals_str = split_values(row, msg_row_index)
+            vals_str = [v.strip() for v in vals_str]
+
+            # Convert to float32
+            try:
+                vals = np.asarray(vals_str, dtype=np.float32)
+            except ValueError:
+                # give a helpful hint
+                ErrorJSON(f"Non-numeric value encountered at data row {msg_row_index}. Did you forget --header=true or choose the wrong --delim?")
+
+            # write
+            dset[gene_idx, :] = vals
+
+            # stats
+            total_zeros += int((vals == 0).sum())
+            if is_integer:
+                # float32 mod 1 check
+                if not np.all(np.equal(np.mod(vals, 1), 0)):
+                    is_integer = False
+
+            if gene_metadata is not None:
+                s = float(vals.sum())
+                gene_sum[gene_idx] = s
+                cell_depth += vals
+                cell_detected += (vals > 0).astype(np.int64)
+
+                if mt_flags[gene_idx]:
+                    cell_mt += vals
+                if ribo_flags[gene_idx]:
+                    cell_rrna += vals
+                if prot_flags[gene_idx]:
+                    cell_prot += vals
+
+            gene_idx += 1
+            if gene_idx >= n_genes:
+                break
+
+        if gene_idx != n_genes:
+            ErrorJSON(f"Expected {n_genes} gene rows, but parsed {gene_idx} rows. File may have been truncated.")
+
+        def to_percentage(subset_sum, total_sum):
+            if subset_sum is None or total_sum is None:
+                return None
+            return np.divide(subset_sum, total_sum, out=np.zeros_like(subset_sum), where=total_sum != 0) * 100.0
+
+        stats = {
+            "cell_depth": cell_depth.astype(np.float32) if cell_depth is not None else None,
+            "cell_detected": cell_detected.astype(np.float32) if cell_detected is not None else None,
+            "cell_mt": to_percentage(cell_mt, cell_depth).astype(np.float32) if cell_mt is not None else None,
+            "cell_rrna": to_percentage(cell_rrna, cell_depth).astype(np.float32) if cell_rrna is not None else None,
+            "cell_prot": to_percentage(cell_prot, cell_depth).astype(np.float32) if cell_prot is not None else None,
+            "gene_sum": gene_sum.astype(np.float32) if gene_sum is not None else None,
+            "total_zeros": int(total_zeros),
+            "is_count_table": int(is_integer),
+            "empty_cells": int(np.sum(cell_depth == 0)) if cell_depth is not None else None,
+            "empty_genes": int(np.sum(gene_sum == 0)) if gene_sum is not None else None,
+        }
+        return stats
+
+    @staticmethod
     def parse(args, file_path, gene_db):
-        # build the JSON-able structure
         result = {
             "detected_format": "RAW_TEXT",
             "input_path": file_path,
+            "input_group": "",
             "output_path": args.output_path,
+            "nber_rows": -1,
+            "nber_cols": -1,
+            "nber_not_found_genes": -1,
+            "nber_zeros": -1,
+            "is_count_table": -1,
+            "empty_cols": -1,
+            "empty_rows": -1,
+            "dataset_size": -1,
+            "metadata": []
         }
+        # Carry over upstream warnings (e.g. ribo set missing)
+        if getattr(args, "warnings", None):
+            result["warning"] = list(args.warnings)
 
-        # Serialize to JSON
-        json_str = json.dumps(result, ensure_ascii=False)
-        
-        # Either write to file or print
+        result["input_group"] = "text_file"
+
+        # 1) Scan structure + names (first pass)
+        genes, cells, n_genes, n_cells = TextHandler._scan_text_matrix(args, file_path)
+        result["nber_rows"] = int(n_genes)
+        result["nber_cols"] = int(n_cells)
+
+        # Warnings about naming
+        if len(set(genes)) != len(genes):
+            result.setdefault("warning", []).append("Gene names are not unique. Did you set --col correctly?")
+        if len(set(cells)) != len(cells):
+            result.setdefault("warning", []).append("Cell names are not unique (from header).")
+
+        # 2) Create Loom
+        loom = LoomFile(args.output_path)
+        loom.ribo_protein_gene_names = getattr(gene_db, "ribo_protein_gene_names", set())
+
+        # 3) Write names
+        loom.write(cells, "/col_attrs/CellID")
+        result["metadata"].append(Metadata(name="/col_attrs/CellID", on="CELL", type="STRING", nber_cols=len(cells), nber_rows=1, distinct_values=len(set(cells)), missing_values=count_missing(cells), dataset_size=loom.get_dataset_size("/col_attrs/CellID"), imported=0))
+
+        loom.write(genes, "/row_attrs/Original_Gene")
+        result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(genes), distinct_values=len(set(genes)), missing_values=count_missing(genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
+
+        # 4) Gene DB annotation (same strategy as other handlers)
+        parsed_genes, not_found_genes = gene_db.parse_genes_list(genes)
+        result["nber_not_found_genes"] = int(len(not_found_genes))
+        with open(Path(args.output_path).parent / "not_found_genes.txt", "w", encoding="utf-8") as f_nfg:
+            for g in not_found_genes:
+                f_nfg.write(f"{g}\n")
+
+        ens_ids = [g.ensembl_id for g in parsed_genes]
+        loom.write(ens_ids, "/row_attrs/Accession")
+        result["metadata"].append(Metadata(name="/row_attrs/Accession", on="GENE", type="STRING", nber_cols=1, nber_rows=len(ens_ids), distinct_values=len(set(ens_ids)), missing_values=count_missing(ens_ids), dataset_size=loom.get_dataset_size("/row_attrs/Accession"), imported=0))
+
+        gene_names = [g.name for g in parsed_genes]
+        loom.write(gene_names, "/row_attrs/Gene")  # backward compat
+        result["metadata"].append(Metadata(name="/row_attrs/Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(gene_names), distinct_values=len(set(gene_names)), missing_values=count_missing(gene_names), dataset_size=loom.get_dataset_size("/row_attrs/Gene"), imported=0))
+        loom.write(gene_names, "/row_attrs/Name")
+        result["metadata"].append(Metadata(name="/row_attrs/Name", on="GENE", type="STRING", nber_cols=1, nber_rows=len(gene_names), distinct_values=len(set(gene_names)), missing_values=count_missing(gene_names), dataset_size=loom.get_dataset_size("/row_attrs/Name"), imported=0))
+
+        biotypes = [g.biotype for g in parsed_genes]
+        loom.write(biotypes, "/row_attrs/_Biotypes")
+        result["metadata"].append(Metadata(name="/row_attrs/_Biotypes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(biotypes), distinct_values=len(set(biotypes)), missing_values=count_missing(biotypes), dataset_size=loom.get_dataset_size("/row_attrs/_Biotypes"), imported=0, categories=dict(Counter(biotypes))))
+
+        chroms = [g.chr for g in parsed_genes]
+        loom.write(chroms, "/row_attrs/_Chromosomes")
+        result["metadata"].append(Metadata(name="/row_attrs/_Chromosomes", on="GENE", type="DISCRETE", nber_cols=1, nber_rows=len(chroms), distinct_values=len(set(chroms)), missing_values=count_missing(chroms), dataset_size=loom.get_dataset_size("/row_attrs/_Chromosomes"), imported=0, categories=dict(Counter(chroms))))
+
+        sum_exon_length = [g.sum_exon_length for g in parsed_genes]
+        loom.write(sum_exon_length, "/row_attrs/_SumExonLength")
+        result["metadata"].append(Metadata(name="/row_attrs/_SumExonLength", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(sum_exon_length), distinct_values=len(set(sum_exon_length)), missing_values=count_missing(sum_exon_length), dataset_size=loom.get_dataset_size("/row_attrs/_SumExonLength"), imported=0))
+
+        # 5) Write matrix + compute stats (second pass, streaming)
+        stats = TextHandler._write_dense_text_matrix_and_stats(args=args, file_path=file_path, loom=loom, dest_path="/matrix", n_genes=n_genes, n_cells=n_cells, gene_metadata=parsed_genes)
+
+        result["dataset_size"] = int(loom.get_dataset_size("/matrix"))
+        result["nber_zeros"] = int(stats["total_zeros"])
+        result["empty_cols"] = int(stats["empty_cells"]) if stats["empty_cells"] is not None else -1
+        result["empty_rows"] = int(stats["empty_genes"]) if stats["empty_genes"] is not None else -1
+        result["is_count_table"] = int(stats["is_count_table"])
+
+        # 6) Write computed QC vectors (same paths as other handlers)
+        loom.write(stats["cell_depth"], "/col_attrs/_Depth")
+        result["metadata"].append(Metadata(name="/col_attrs/_Depth", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_depth"]), nber_rows=1, distinct_values=len(set(stats["cell_depth"])), missing_values=count_missing(stats["cell_depth"]), dataset_size=loom.get_dataset_size("/col_attrs/_Depth"), imported=0))
+
+        loom.write(stats["cell_detected"], "/col_attrs/_Detected_Genes")
+        result["metadata"].append(Metadata(name="/col_attrs/_Detected_Genes", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_detected"]), nber_rows=1, distinct_values=len(set(stats["cell_detected"])), missing_values=count_missing(stats["cell_detected"]), dataset_size=loom.get_dataset_size("/col_attrs/_Detected_Genes"), imported=0))
+
+        loom.write(stats["cell_mt"], "/col_attrs/_Mitochondrial_Content")
+        result["metadata"].append(Metadata(name="/col_attrs/_Mitochondrial_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_mt"]), nber_rows=1, distinct_values=len(set(stats["cell_mt"])), missing_values=count_missing(stats["cell_mt"]), dataset_size=loom.get_dataset_size("/col_attrs/_Mitochondrial_Content"), imported=0))
+
+        loom.write(stats["cell_rrna"], "/col_attrs/_Ribosomal_Content")
+        result["metadata"].append(Metadata(name="/col_attrs/_Ribosomal_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_rrna"]), nber_rows=1, distinct_values=len(set(stats["cell_rrna"])), missing_values=count_missing(stats["cell_rrna"]), dataset_size=loom.get_dataset_size("/col_attrs/_Ribosomal_Content"), imported=0))
+
+        loom.write(stats["cell_prot"], "/col_attrs/_Protein_Coding_Content")
+        result["metadata"].append(Metadata(name="/col_attrs/_Protein_Coding_Content", on="CELL", type="NUMERIC", nber_cols=len(stats["cell_prot"]), nber_rows=1, distinct_values=len(set(stats["cell_prot"])), missing_values=count_missing(stats["cell_prot"]), dataset_size=loom.get_dataset_size("/col_attrs/_Protein_Coding_Content"), imported=0))
+
+        loom.write(stats["gene_sum"], "/row_attrs/_Sum")
+        result["metadata"].append(Metadata(name="/row_attrs/_Sum", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(stats["gene_sum"]), distinct_values=len(set(stats["gene_sum"])), missing_values=count_missing(stats["gene_sum"]), dataset_size=loom.get_dataset_size("/row_attrs/_Sum"), imported=0))
+
+        # 7) Stable IDs
+        stable_ids_rows = list(range(result["nber_rows"]))
+        loom.write(stable_ids_rows, "/row_attrs/_StableID")
+        result["metadata"].append(Metadata(name="/row_attrs/_StableID", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(stable_ids_rows), distinct_values=len(set(stable_ids_rows)), missing_values=count_missing(stable_ids_rows), dataset_size=loom.get_dataset_size("/row_attrs/_StableID"), imported=0))
+
+        stable_ids_cols = list(range(result["nber_cols"]))
+        loom.write(stable_ids_cols, "/col_attrs/_StableID")
+        result["metadata"].append(Metadata(name="/col_attrs/_StableID", on="CELL", type="NUMERIC", nber_cols=len(stable_ids_cols), nber_rows=1, distinct_values=len(set(stable_ids_cols)), missing_values=count_missing(stable_ids_cols), dataset_size=loom.get_dataset_size("/col_attrs/_StableID"), imported=0))
+
+        loom.close()
+
+        # Clean empty warning
+        if "warning" in result and not result["warning"]:
+            del result["warning"]
+
+        # Serialize to JSON (supports Metadata dataclass)
+        json_str = json.dumps(result, default=dataclass_to_json, ensure_ascii=False)
+
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
         else:
             print(json_str)
 
-### Error handling ###
 
+### Error handling ###
 class ErrorJSON(Exception):
     def __init__(self, message: str, output: str = None):
         # still call Exception init so tracebacks, etc. work if you ever raise()
@@ -2422,7 +2804,6 @@ class Metadata:
             self.categories = {} # Clear counts if it's just a long list of unique strings
             self.type = "NUMERIC" if is_numeric else "STRING"
 
-
 @dataclass
 class Gene:
     ensembl_id: Optional[str] = None
@@ -2658,7 +3039,6 @@ class DBManager:
         finally:
             self.disconnect()
 
-
 ### MAIN functions ###
         
 # Dispatch table to run appropriate parsing function depending on filetype
@@ -2741,9 +3121,9 @@ def positive_int(value):
     try:
         ivalue = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+        ErrorJSON(f"--organism must be a positive integer and {value!r} is not an integer")
     if ivalue < 0:
-        raise argparse.ArgumentTypeError("organism must be a positive integer")
+        ErrorJSON("--organism must be a positive integer")
     return ivalue
 
 def main():
