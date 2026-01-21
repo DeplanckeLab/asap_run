@@ -16,7 +16,8 @@ import numpy as np # For diverse array calculations
 import re # Regex for gene to db comparison
 from pathlib import Path # Needed for file extension manipulation
 from collections import Counter # To count categories occurrences
-import scipy.sparse as sp
+import scipy.sparse as sp # For handling sparse matrices
+import polars as pl # For fast-reading text matrices (csv, tsv, ...)
 
 custom_help = """
 Parsing Mode
@@ -2025,300 +2026,234 @@ class TextHandler:
         return d
 
     @staticmethod
-    def _iter_rows(file_path: str, delim: str):
+    def _normalize_gene_name(raw: str | None) -> str:
         """
-        Stream rows as lists of strings. No pandas dependency; supports big files.
+        Normalize gene name coming from text:
+          - strip
+          - if '|' present, keep first token
+          - if empty after normalization, return empty string (caller handles fallback)
         """
-        import csv
-        with open(file_path, "r", encoding="utf-8", errors="replace", newline="") as f:
-            reader = csv.reader(f, delimiter=delim)
-            for row in reader:
-                # Keep empty columns (csv.reader does). Drop fully empty lines.
-                if not row or (len(row) == 1 and row[0].strip() == ""):
-                    continue
-                yield row
+        if raw is None:
+            return ""
+        s = str(raw).strip()
+        if s == "":
+            return ""
+        if "|" in s:
+            s = s.split("|", 1)[0].strip()
+        return s
 
     @staticmethod
-    def _scan_text_matrix(args, file_path: str) -> tuple[list[str], list[str], int, int]:
+    def _drop_fully_empty_rows_polars(df):
         """
-        First pass:
-          - determine n_genes, n_cells
-          - extract/generate gene names and cell names
-          - validate rectangularity
-        Returns: (genes, cells, n_genes, n_cells)
+        Drop rows that are completely empty (all fields are null/empty/whitespace).
+        This makes text parsing robust to blank lines anywhere in the file.
         """
-        delim = TextHandler._decode_delim(args.delim)
+        as_str = [pl.col(c).cast(pl.Utf8, strict=False).fill_null("").str.strip_chars() for c in df.columns]
+        empty_row = pl.all_horizontal([expr == "" for expr in as_str])
+        return df.filter(~empty_row)
 
+    @staticmethod
+    def _scan_text_matrix(args, file_path: str) -> tuple[list[str], list[str], list[str], "np.ndarray"]:
+        """
+        Fast single-read path for RAW_TEXT:
+          - Read whole file into RAM (polars)
+          - Handle subtleties: delimiter, header, gene column position, optional gene header placeholder
+          - Return dense float32 matrix (Genes x Cells) + genes/cells names
+        Falls back to ErrorJSON if format is inconsistent.
+        """
+        
+        delim = TextHandler._decode_delim(args.delim)
         header = (args.header == "true")
         col_mode = args.col  # none|first|last
 
-        rows = TextHandler._iter_rows(file_path, delim)
-
-        # Header row -> cells
-        first_row = None
-        try:
-            first_row = next(rows)
-        except StopIteration:
-            ErrorJSON("Input text file appears to be empty (no data rows).")
-
-        # Helper to split row into (gene_name_or_None, values_as_strings)
-        def split_row(row: list[str], row_index_1based: int) -> tuple[str | None, list[str]]:
-            if col_mode == "none":
-                return None, row
-            if len(row) < 2:
-                ErrorJSON(f"Row {row_index_1based} has {len(row)} column(s), but --col={col_mode} requires at least 2 columns.")
-            if col_mode == "first":
-                return row[0], row[1:]
-            if col_mode == "last":
-                return row[-1], row[:-1]
+        if col_mode not in ("none", "first", "last"):
             ErrorJSON(f"Unknown --col value: {col_mode}")
 
-        # --- determine cells and start reading data rows ---
+        # Read everything as strings first (fast and robust). We cast numeric block in one shot.
+        # IMPORTANT: if header exists and --col is first/last, the header may contain ONLY cell names (N fields). So we read header manually and parse data with has_header=False.
+        header_fields = None
+        if header:
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    first_line = f.readline()
+            except Exception as e:
+                ErrorJSON(f"Failed to read header line. {str(e)}")
+
+            if not first_line:
+                ErrorJSON("Input text file appears to be empty (no data rows).")
+
+            first_line = first_line.rstrip("\r\n")
+            header_fields = first_line.split(delim)
+
+            # Drop trailing empty fields caused by trailing delimiter(s)
+            while header_fields and header_fields[-1].strip() == "":
+                header_fields.pop()
+            
+            # Remove quotes
+            header_fields = [str(c).strip().strip('"') for c in header_fields]
+
+        try:
+            df = pl.read_csv(file_path, separator=delim, has_header=False, skip_rows=1 if header else 0, infer_schema_length=0, ignore_errors=False, try_parse_dates=False, quote_char='"')
+        except Exception as e:
+            ErrorJSON(f"Failed to read text file. {str(e)}")
+        
+        df = TextHandler._drop_fully_empty_rows_polars(df)
+
+        if df.height == 0:
+            ErrorJSON("Input text file contains no data rows (after removing empty lines).")
+        
+        if df.width == 0:
+            ErrorJSON("Input text file contains no data cols (after removing empty lines).")
+
         genes: list[str] = []
         cells: list[str] = []
 
-        n_cells: int | None = None
-
-        # If there is a header: interpret first row as column names
+        # Header row -> cells
         if header:
-            # Peek first data row to infer true n_cells
-            try:
-                first_data_row = next(rows)
-            except StopIteration:
-                ErrorJSON("Header is present but file contains no data rows.")
+            if header_fields is None:
+                ErrorJSON("Internal error: missing header_fields.")
+            header_cols = header_fields
 
-            # Infer n_cells from data row length
             if col_mode == "none":
-                n_cells = len(first_data_row)
-                if len(first_row) != n_cells:
-                    ErrorJSON(
-                        f"Header should contain {n_cells} columns (cells), but has {len(first_row)}."
-                    )
-                raw_cells = [c.strip() for c in first_row]
-                cells = [(c if c != "" else f"Cell_{i+1}") for i, c in enumerate(raw_cells)]
-
-                # first_data_row is gene1 values (no gene name column)
-                genes.append("Gene_1")
-
-                # Validate rectangularity immediately
-                if len(first_data_row) != n_cells:
-                    ErrorJSON(
-                        f"Non-rectangular matrix: row 2 has {len(first_data_row)} value columns, expected {n_cells}."
-                    )
-                row_counter = 1
+                # Header must be exactly cell names
+                cells = [c.strip() if c is not None else "" for c in header_cols]
+                cells = [(c if c != "" else f"Cell_{i+1}") for i, c in enumerate(cells)]
+                num_df = df
+                genes_raw = ["__unknown"] * df.height
+                genes_norm = [f"Gene_{i+1}" for i in range(df.height)]
             else:
-                # col_mode is first or last: data rows must include 1 gene-name column
-                if len(first_data_row) < 2:
+                if df.width < 2:
                     ErrorJSON("Data rows must have at least 2 columns when --col is first/last.")
-                n_cells = len(first_data_row) - 1
+                n_cells = df.width - 1
 
-                # Interpret header:
-                # either header has exactly n_cells cell names (NO gene header placeholder),
-                # or it has n_cells+1 including gene header placeholder (then drop it).
-                if len(first_row) == n_cells:
-                    # Your file: header has ONLY cell names
-                    raw_cells = [c.strip() for c in first_row]
-                elif len(first_row) == n_cells + 1:
-                    # Header includes gene column label -> drop it according to col position
+                # Accept either:
+                #   - header has ONLY cells (len == n_cells), or
+                #   - header includes a gene placeholder (len == n_cells+1)
+                if len(header_cols) == n_cells:
+                    cell_cols = header_cols
+                elif len(header_cols) == n_cells + 1:
                     if col_mode == "first":
-                        raw_cells = [c.strip() for c in first_row[1:]]
-                    else:  # last
-                        raw_cells = [c.strip() for c in first_row[:-1]]
+                        cell_cols = header_cols[1:]
+                    else:
+                        cell_cols = header_cols[:-1]
                 else:
-                    ErrorJSON(
-                        f"Header length mismatch: expected {n_cells} (cells only) or {n_cells+1} (with gene header), "
-                        f"but got {len(first_row)}. Check --delim/--col."
-                    )
+                    ErrorJSON(f"Header length mismatch: expected {n_cells} (cells only) or {n_cells+1} (with gene header), but got {len(header_cols)}. Check --delim/--col.")
 
-                cells = [(c if c != "" else f"Cell_{i+1}") for i, c in enumerate(raw_cells)]
+                cells = [c.strip() if c is not None else "" for c in cell_cols]
+                cells = [(c if c != "" else f"Cell_{i+1}") for i, c in enumerate(cells)]
 
-                # Now process the first data row as gene 1
-                gene_name, vals0 = split_row(first_data_row, 2)
-                if len(vals0) != n_cells:
-                    ErrorJSON(
-                        f"Non-rectangular matrix: row 2 has {len(vals0)} value columns, expected {n_cells}."
-                    )
-                g = "" if gene_name is None else str(gene_name).strip()
-                genes.append(g if g != "" else "Gene_1")
-                row_counter = 1
-            
-            # Continue consuming remaining data rows
-            physical_row_index = 2  # we already consumed row 2 as first_data_row
-            for row in rows:
-                physical_row_index += 1
-                gene_name, vals = split_row(row, physical_row_index)
-                if len(vals) != n_cells:
-                    ErrorJSON(
-                        f"Non-rectangular matrix: row {physical_row_index} has {len(vals)} value columns, expected {n_cells}. "
-                        f"Did you set --delim/--header/--col correctly?"
-                    )
-                row_counter += 1
-                if col_mode == "none":
-                    genes.append(f"Gene_{row_counter}")
+                if col_mode == "first":
+                    gene_series = df.select(df.columns[0]).to_series()
+                    num_df = df.select(df.columns[1:])
                 else:
-                    g = "" if gene_name is None else str(gene_name).strip()
-                    genes.append(g if g != "" else f"Gene_{row_counter}")
+                    gene_series = df.select(df.columns[-1]).to_series()
+                    num_df = df.select(df.columns[:-1])
+
+                g_raw = gene_series.cast(pl.Utf8).fill_null("").str.strip_chars().to_list()
+                genes_raw = [(name if name != "" else f"Gene_{i+1}") for i, name in enumerate(g_raw)]
+                genes_norm = []
+                for i, raw in enumerate(genes_raw):
+                    norm = TextHandler._normalize_gene_name(raw)
+                    genes_norm.append(norm if norm != "" else f"Gene_{i+1}")
         else:
-            # No header -> first_row is data
-            gene0, vals0 = split_row(first_row, 1)
-            n_cells = len(vals0)
-            cells = [f"Cell_{i+1}" for i in range(n_cells)]
-
-            # gene name for first data row
+            # No header -> generate cell names
             if col_mode == "none":
-                genes.append("Gene_1")
+                n_cells = df.width
+                cells = [f"Cell_{i+1}" for i in range(n_cells)]
+                num_df = df
+                genes_raw = ["__unknown"] * df.height
+                genes_norm = [f"Gene_{i+1}" for i in range(df.height)]
             else:
-                g = "" if gene0 is None else str(gene0).strip()
-                genes.append(g if g != "" else "Gene_1")
+                if df.width < 2:
+                    ErrorJSON("Data rows must have at least 2 columns when --col is first/last.")
+                n_cells = df.width - 1
+                cells = [f"Cell_{i+1}" for i in range(n_cells)]
 
-            physical_row_index = 1
-            row_counter = 1
-            for row in rows:
-                physical_row_index += 1
-                gene_name, vals = split_row(row, physical_row_index)
-                if len(vals) != n_cells:
-                    ErrorJSON(
-                        f"Non-rectangular matrix: row {physical_row_index} has {len(vals)} value columns, expected {n_cells}. "
-                        f"Did you set --delim/--header/--col correctly?"
-                    )
-                row_counter += 1
-                if col_mode == "none":
-                    genes.append(f"Gene_{row_counter}")
+                if col_mode == "first":
+                    gene_series = df.select(df.columns[0]).to_series()
+                    num_df = df.select(df.columns[1:])
                 else:
-                    g = "" if gene_name is None else str(gene_name).strip()
-                    genes.append(g if g != "" else f"Gene_{row_counter}")
+                    gene_series = df.select(df.columns[-1]).to_series()
+                    num_df = df.select(df.columns[:-1])
 
-        n_genes = len(genes)
-        if n_genes == 0 or n_cells == 0:
-            ErrorJSON("Parsed matrix has zero genes or zero cells. Check --header/--col/--delim.")
+                g_raw = gene_series.cast(pl.Utf8).fill_null("").str.strip_chars().to_list()
+                genes_raw = [(name if name != "" else f"Gene_{i+1}") for i, name in enumerate(g_raw)]
+                genes_norm = []
+                for i, raw in enumerate(genes_raw):
+                    norm = TextHandler._normalize_gene_name(raw)
+                    genes_norm.append(norm if norm != "" else f"Gene_{i+1}")
 
-        return genes, cells, n_genes, n_cells
+        # Convert numeric block to float32 in one vectorized step
+        try:
+            num_df = num_df.with_columns([pl.all().cast(pl.Float32)])
+        except Exception:
+            ErrorJSON("Non-numeric value encountered in matrix values. Did you set --header/--delim/--col correctly?")
+
+        mat = num_df.to_numpy()
+        if mat.ndim != 2:
+            ErrorJSON(f"Expected a 2D matrix after parsing, but got shape={mat.shape}.")
+
+        # Ensure Genes x Cells orientation (polars returns rows x cols already)
+        if mat.shape[0] != len(genes_raw):
+            ErrorJSON(f"Parsed numeric matrix has {mat.shape[0]} rows but {len(genes_raw)} gene names.")
+        if mat.shape[1] != len(cells):
+            ErrorJSON(f"Parsed numeric matrix has {mat.shape[1]} columns but {len(cells)} cell names.")
+
+        return genes_raw, genes_norm, cells, mat.astype(np.float32, copy=False)
 
     @staticmethod
-    def _write_dense_text_matrix_and_stats(*, args, file_path: str, loom: "LoomFile", dest_path: str, n_genes: int, n_cells: int, gene_metadata: list | None) -> dict:
+    def _stats_from_dense_gxc(mat_gxc, loom: "LoomFile", gene_metadata):
         """
-        Second pass:
-          - stream numeric values
-          - write /matrix row-by-row (genes x cells)
-          - compute stats similarly to LoomFile.write_matrix()
+        Vectorized stats on dense matrix (Genes x Cells), same outputs as the other handlers.
         """
-        delim = TextHandler._decode_delim(args.delim)
-        header = (args.header == "true")
-        col_mode = args.col
 
-        # Prepare Loom dataset
-        dset = loom.handle.create_dataset(dest_path, shape=(n_genes, n_cells), dtype="float32", chunks=(min(n_genes, 1024), min(n_cells, 1024)), compression="gzip")
+        n_genes, n_cells = mat_gxc.shape
 
-        # Stats
-        total_zeros = 0
-        is_integer = True
+        total_zeros = int((mat_gxc == 0).sum())
+        # integer check
+        is_integer = bool(np.all(mat_gxc == np.floor(mat_gxc)))
 
-        cell_depth = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
-        cell_detected = np.zeros(n_cells, dtype=np.int64) if gene_metadata else None
-        cell_mt = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
-        cell_rrna = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
-        cell_prot = np.zeros(n_cells, dtype=np.float64) if gene_metadata else None
-        gene_sum = np.zeros(n_genes, dtype=np.float64) if gene_metadata else None
+        # With a proper gene DB mapping, compute the same QC vectors as the other handlers.
+        # (This matches the intent of your existing code; text input itself has no extra metadata.)
+        mt_flags = np.fromiter((loom.is_mito(g.chr) for g in gene_metadata), dtype=bool, count=n_genes)
+        ribo_flags = np.fromiter((loom.is_ribo(g.name) for g in gene_metadata), dtype=bool, count=n_genes)
+        prot_flags = np.fromiter((loom.is_protein_coding(g.biotype) for g in gene_metadata), dtype=bool, count=n_genes)
 
-        # precompute gene flags (row-wise) to avoid checking inside every cell
-        mt_flags = ribo_flags = prot_flags = None
-        if gene_metadata is not None:
-            mt_flags = np.array([loom.is_mito(g.chr) for g in gene_metadata], dtype=bool)
-            ribo_flags = np.array([loom.is_ribo(g.name) for g in gene_metadata], dtype=bool)
-            prot_flags = np.array([loom.is_protein_coding(g.biotype) for g in gene_metadata], dtype=bool)
+        cell_depth = mat_gxc.sum(axis=0, dtype=np.float64)
+        cell_detected = (mat_gxc > 0).sum(axis=0, dtype=np.int64)
+        gene_sum = mat_gxc.sum(axis=1, dtype=np.float64)
 
-        # Iterate rows
-        it = TextHandler._iter_rows(file_path, delim)
+        if mt_flags.any():
+            cell_mt_sum = mat_gxc[mt_flags, :].sum(axis=0, dtype=np.float64)
+        else:
+            cell_mt_sum = np.zeros(n_cells, dtype=np.float64)
 
-        # Consume header if needed
-        if header:
-            try:
-                next(it)
-            except StopIteration:
-                ErrorJSON("Input text file contains a header but no data rows.")
+        if ribo_flags.any():
+            cell_rrna_sum = mat_gxc[ribo_flags, :].sum(axis=0, dtype=np.float64)
+        else:
+            cell_rrna_sum = np.zeros(n_cells, dtype=np.float64)
 
-        def split_values(row: list[str], physical_row_index: int) -> list[str]:
-            if col_mode == "none":
-                vals = row
-            elif col_mode == "first":
-                if len(row) < 2:
-                    ErrorJSON(f"Row {physical_row_index} has {len(row)} column(s), but --col=first requires at least 2.")
-                vals = row[1:]
-            elif col_mode == "last":
-                if len(row) < 2:
-                    ErrorJSON(f"Row {physical_row_index} has {len(row)} column(s), but --col=last requires at least 2.")
-                vals = row[:-1]
-            else:
-                ErrorJSON(f"Unknown --col value: {col_mode}")
+        if prot_flags.any():
+            cell_prot_sum = mat_gxc[prot_flags, :].sum(axis=0, dtype=np.float64)
+        else:
+            cell_prot_sum = np.zeros(n_cells, dtype=np.float64)
 
-            if len(vals) != n_cells:
-                ErrorJSON(f"Non-rectangular matrix: row {physical_row_index} has {len(vals)} value columns, expected {n_cells}. Did you set --delim/--header/--col correctly?")
-            return vals
-
-        physical_row_index = 0 if not header else 1  # header already consumed => file row index starts at 2
-        gene_idx = 0
-
-        for row in it:
-            physical_row_index += 1
-            # If header is present, physical_row_index is off by +1; fix for messages
-            msg_row_index = physical_row_index if not header else physical_row_index + 1
-
-            vals_str = split_values(row, msg_row_index)
-            vals_str = [v.strip() for v in vals_str]
-
-            # Convert to float32
-            try:
-                vals = np.asarray(vals_str, dtype=np.float32)
-            except ValueError:
-                # give a helpful hint
-                ErrorJSON(f"Non-numeric value encountered at data row {msg_row_index}. Did you forget --header=true or choose the wrong --delim?")
-
-            # write
-            dset[gene_idx, :] = vals
-
-            # stats
-            total_zeros += int((vals == 0).sum())
-            if is_integer:
-                # float32 mod 1 check
-                if not np.all(np.equal(np.mod(vals, 1), 0)):
-                    is_integer = False
-
-            if gene_metadata is not None:
-                s = float(vals.sum())
-                gene_sum[gene_idx] = s
-                cell_depth += vals
-                cell_detected += (vals > 0).astype(np.int64)
-
-                if mt_flags[gene_idx]:
-                    cell_mt += vals
-                if ribo_flags[gene_idx]:
-                    cell_rrna += vals
-                if prot_flags[gene_idx]:
-                    cell_prot += vals
-
-            gene_idx += 1
-            if gene_idx >= n_genes:
-                break
-
-        if gene_idx != n_genes:
-            ErrorJSON(f"Expected {n_genes} gene rows, but parsed {gene_idx} rows. File may have been truncated.")
-
-        def to_percentage(subset_sum, total_sum):
-            if subset_sum is None or total_sum is None:
-                return None
-            return np.divide(subset_sum, total_sum, out=np.zeros_like(subset_sum), where=total_sum != 0) * 100.0
+        def to_pct(subset, total):
+            out = np.zeros_like(total, dtype=np.float64)
+            np.divide(subset, total, out=out, where=(total != 0))
+            return (out * 100.0).astype(np.float32)
 
         stats = {
-            "cell_depth": cell_depth.astype(np.float32) if cell_depth is not None else None,
-            "cell_detected": cell_detected.astype(np.float32) if cell_detected is not None else None,
-            "cell_mt": to_percentage(cell_mt, cell_depth).astype(np.float32) if cell_mt is not None else None,
-            "cell_rrna": to_percentage(cell_rrna, cell_depth).astype(np.float32) if cell_rrna is not None else None,
-            "cell_prot": to_percentage(cell_prot, cell_depth).astype(np.float32) if cell_prot is not None else None,
-            "gene_sum": gene_sum.astype(np.float32) if gene_sum is not None else None,
-            "total_zeros": int(total_zeros),
+            "cell_depth": cell_depth.astype(np.float32),
+            "cell_detected": cell_detected.astype(np.float32),
+            "cell_mt": to_pct(cell_mt_sum, cell_depth),
+            "cell_rrna": to_pct(cell_rrna_sum, cell_depth),
+            "cell_prot": to_pct(cell_prot_sum, cell_depth),
+            "gene_sum": gene_sum.astype(np.float32),
+            "total_zeros": total_zeros,
             "is_count_table": int(is_integer),
-            "empty_cells": int(np.sum(cell_depth == 0)) if cell_depth is not None else None,
-            "empty_genes": int(np.sum(gene_sum == 0)) if gene_sum is not None else None,
+            "empty_cells": int((cell_depth == 0).sum()),
+            "empty_genes": int((gene_sum == 0).sum()),
         }
         return stats
 
@@ -2340,21 +2275,21 @@ class TextHandler:
             "metadata": []
         }
         # Carry over upstream warnings (e.g. ribo set missing)
-        if getattr(args, "warnings", None):
-            result["warning"] = list(args.warnings)
-
+        if getattr(args, "warnings", None): result["warning"] = list(args.warnings)
         result["input_group"] = "text_file"
 
-        # 1) Scan structure + names (first pass)
-        genes, cells, n_genes, n_cells = TextHandler._scan_text_matrix(args, file_path)
+        # 1) Read into RAM as fast as possible (polars)
+        genes_raw, genes_norm, cells, mat_gxc = TextHandler._scan_text_matrix(args, file_path)
+        n_genes = int(mat_gxc.shape[0])
+        n_cells = int(mat_gxc.shape[1])
         result["nber_rows"] = int(n_genes)
         result["nber_cols"] = int(n_cells)
 
         # Warnings about naming
-        if len(set(genes)) != len(genes):
-            result.setdefault("warning", []).append("Gene names are not unique. Did you set --col correctly?")
+        if len(set(genes_norm)) != len(genes_norm):
+            ErrorJSON("Gene names (normalized) are not unique. Did you set --col correctly?")
         if len(set(cells)) != len(cells):
-            result.setdefault("warning", []).append("Cell names are not unique (from header).")
+            ErrorJSON("Cell names are not unique (from header).")
 
         # 2) Create Loom
         loom = LoomFile(args.output_path)
@@ -2364,15 +2299,17 @@ class TextHandler:
         loom.write(cells, "/col_attrs/CellID")
         result["metadata"].append(Metadata(name="/col_attrs/CellID", on="CELL", type="STRING", nber_cols=len(cells), nber_rows=1, distinct_values=len(set(cells)), missing_values=count_missing(cells), dataset_size=loom.get_dataset_size("/col_attrs/CellID"), imported=0))
 
-        loom.write(genes, "/row_attrs/Original_Gene")
-        result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(genes), distinct_values=len(set(genes)), missing_values=count_missing(genes), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
+        loom.write(genes_raw, "/row_attrs/Original_Gene")
+        result["metadata"].append(Metadata(name="/row_attrs/Original_Gene", on="GENE", type="STRING", nber_cols=1, nber_rows=len(genes_raw), distinct_values=len(set(genes_raw)), missing_values=count_missing(genes_raw), dataset_size=loom.get_dataset_size("/row_attrs/Original_Gene"), imported=0))
 
         # 4) Gene DB annotation (same strategy as other handlers)
-        parsed_genes, not_found_genes = gene_db.parse_genes_list(genes)
+        parsed_genes, not_found_genes = gene_db.parse_genes_list(genes_norm)
         result["nber_not_found_genes"] = int(len(not_found_genes))
+        not_found_set = set(not_found_genes)
         with open(Path(args.output_path).parent / "not_found_genes.txt", "w", encoding="utf-8") as f_nfg:
-            for g in not_found_genes:
-                f_nfg.write(f"{g}\n")
+            for raw, norm in zip(genes_raw, genes_norm):
+                if norm in not_found_set:
+                    f_nfg.write(f"{raw}\n")
 
         ens_ids = [g.ensembl_id for g in parsed_genes]
         loom.write(ens_ids, "/row_attrs/Accession")
@@ -2396,8 +2333,9 @@ class TextHandler:
         loom.write(sum_exon_length, "/row_attrs/_SumExonLength")
         result["metadata"].append(Metadata(name="/row_attrs/_SumExonLength", on="GENE", type="NUMERIC", nber_cols=1, nber_rows=len(sum_exon_length), distinct_values=len(set(sum_exon_length)), missing_values=count_missing(sum_exon_length), dataset_size=loom.get_dataset_size("/row_attrs/_SumExonLength"), imported=0))
 
-        # 5) Write matrix + compute stats (second pass, streaming)
-        stats = TextHandler._write_dense_text_matrix_and_stats(args=args, file_path=file_path, loom=loom, dest_path="/matrix", n_genes=n_genes, n_cells=n_cells, gene_metadata=parsed_genes)
+        # 5) Write matrix + compute stats
+        loom.handle.create_dataset("/matrix", data=mat_gxc, dtype="float32", chunks=(min(n_genes, 1024), min(n_cells, 1024)), compression="gzip")
+        stats = TextHandler._stats_from_dense_gxc(mat_gxc, loom, parsed_genes)
 
         result["dataset_size"] = int(loom.get_dataset_size("/matrix"))
         result["nber_zeros"] = int(stats["total_zeros"])
@@ -2447,7 +2385,6 @@ class TextHandler:
                 out.write(json_str)
         else:
             print(json_str)
-
 
 ### Error handling ###
 class ErrorJSON(Exception):
@@ -2717,7 +2654,6 @@ class LoomFile:
             self.handle = None
 
 ### DB Stuff ###
-
 def count_missing(obj):
     if isinstance(obj, np.ndarray):
         flat = obj.ravel()
@@ -2880,7 +2816,7 @@ class MapGene:
         fallback_name = query if query else f"Gene_{index + 1}"
         
         return Gene(
-            ensembl_id=fallback_name,
+            ensembl_id="__unknown",
             name=fallback_name,
             biotype="__unknown",
             chr="__unknown",
@@ -2892,11 +2828,9 @@ class MapGene:
         """ Process a list of gene identifiers (e.g. var_genes)  and returns a list of Gene objects. """
         results = []
         not_found_genes = []
-        #not_found_count = 0
         for i, q in enumerate(queries):
             gene_obj = self.parse_gene(q, i)
             if gene_obj.biotype == "__unknown":
-                #not_found_count += 1
                 not_found_genes.append(q)
             results.append(gene_obj)
         return results, not_found_genes
@@ -3084,7 +3018,6 @@ def parse_host_string(s: str):
         ErrorJSON("Missing dbname")
 
     return host, port, dbname
-
 
 # Main parsing method, called by "Main" and redispatching to correct format parsing method
 def parse(args):
