@@ -67,7 +67,7 @@ class H5ADHandler:
             if enc == "csr_matrix":
                 return (major, minor)  # (cells, genes)
             if enc == "csc_matrix":
-                return (minor, major)
+                return (minor, major)  # (genes, cells) - swapped because H5AD CSC has genes as columns
             ErrorJSON(f"Unsupported encoding-type={enc!r} at {path}")
 
         ErrorJSON(f"Could not determine shape for {path}")
@@ -202,28 +202,13 @@ class H5ADHandler:
                 return sp.csr_matrix((block_data.astype(DEFAULT_NP_DTYPE, copy=False), block_indices.astype(np.int64, copy=False), indptr_local), shape=(end - start, n_genes))
             return get_block
         elif enc == "csc_matrix":
-            # Hybrid loading - pre-load pointers, lazy-load data
-            indptr_full = node["indptr"][:]  # Small array
-            ds_indices = node["indices"]     # Keep as HDF5 reference (lazy)
-            ds_data = node["data"]           # Keep as HDF5 reference (lazy)
+            # CSC: Loading entire matrix and converting to CSR...
+            X_csc = sp.csc_matrix((node["data"][:], node["indices"][:], node["indptr"][:]), shape=(n_cells, n_genes), dtype=DEFAULT_NP_DTYPE)
+            csr_view = X_csc.tocsr()
             
             def get_block(start, end):
-                ptr = indptr_full[start:end + 1].astype(np.int64)
-                p0, p1 = int(ptr[0]), int(ptr[-1])
-                
-                # Empty block optimization
-                if p0 == p1: return sp.csr_matrix((end - start, n_genes), dtype=DEFAULT_NP_DTYPE)
-                
-                # Load only needed data from disk
-                indptr_local = (ptr - p0).astype(np.int64, copy=False)
-                col_indices = ds_indices[p0:p1]
-                col_data = ds_data[p0:p1]
-                
-                # Build CSC block (genes × cells_in_block)
-                block_csc = sp.csc_matrix((col_data.astype(DEFAULT_NP_DTYPE, copy=False), col_indices.astype(np.int64, copy=False), indptr_local), shape=(n_genes, end - start))
-                
-                # Convert to CSR (cells_in_block × genes)
-                return block_csc.T.tocsr()
+                # Extract rows (cells) start:end from the CSR view
+                return csr_view[start:end, :]
     
             return get_block
         else:
@@ -506,6 +491,59 @@ class H5ADHandler:
         walk(f["uns"])
 
     @staticmethod
+    def _write_compound_and_register(src_obj: h5py.Dataset, loom, result: dict, n_cells: int, n_genes: int, orientation: str, loom_path: str, existing_paths: set[str]) -> None:
+        """Write a compound/structured HDF5 dataset into Loom as a regular (non-compound) dataset.
+        - If the compound dtype has 1 field, writes it as a 1D vector.
+        - If it has multiple fields, writes it as a 2D matrix (n_rows × n_fields).
+        """
+        if loom_path in existing_paths: 
+            result.setdefault("warnings", []).append(f"Skipping {src_obj.name} -> {loom_path} transfer: already exists.")
+            return
+
+        try:
+            fields = list(src_obj.dtype.names or [])
+            if not fields:
+                result.setdefault("warnings", []).append(f"Skipping compound dataset {loom_path}: no fields.")
+                return
+
+            data = src_obj[()]  # structured ndarray (possibly >1D)
+            arr = np.asarray(data)
+            data_flat = arr.reshape(-1) if arr.ndim > 1 else arr
+            n_rows = int(data_flat.shape[0])
+
+            def field_is_numeric(fname: str) -> bool:
+                dt = src_obj.dtype.fields[fname][0]
+                return np.issubdtype(dt, np.number) or np.issubdtype(dt, np.bool_)
+
+            all_numeric = all(field_is_numeric(f) for f in fields)
+
+            if len(fields) == 1:
+                col = np.asarray(data_flat[fields[0]]).reshape(-1)
+                if col.dtype.kind in ("S", "O", "U"):
+                    col = np.array([v.decode(errors="ignore") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col], dtype=object)
+                meta = loom.write_metadata(col, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
+                result["metadata"].append(meta)
+                existing_paths.add(loom_path)
+                return
+
+            if all_numeric:
+                mat = np.empty((n_rows, len(fields)), dtype=DEFAULT_NP_DTYPE)
+                for j, f_ in enumerate(fields):
+                    mat[:, j] = np.asarray(data_flat[f_], dtype=DEFAULT_NP_DTYPE)
+            else:
+                mat = np.empty((n_rows, len(fields)), dtype=object)
+                for j, f_ in enumerate(fields):
+                    col = np.asarray(data_flat[f_]).reshape(-1)
+                    mat[:, j] = [v.decode(errors="ignore") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in col]
+
+            meta = loom.write_metadata(mat, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
+            result["metadata"].append(meta)
+            existing_paths.add(loom_path)
+
+        except Exception as e:
+            result.setdefault("warnings", []).append(f"Could not write compound dataset {loom_path}: {e}")
+
+    @staticmethod
     def parse(args, file_path: str, out_dir: Path, gene_db: MapGene, loom, result):
 
         with h5py.File(file_path, "r") as f:
@@ -547,6 +585,7 @@ class H5ADHandler:
 
             parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
 
+            # Write Expression Matrix
             block_reader = H5ADHandler._create_h5ad_block_reader(f=f, src_path=input_group, n_cells=n_cells, n_genes=n_genes)
             stats = loom.write_expression_matrix(get_block=block_reader, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
 
@@ -573,11 +612,11 @@ class H5ADHandler:
             if varm_path != "/varm": 
                 H5ADHandler._transfer_multidimensional_metadata(f, "/varm", loom, result, n_cells, n_genes, "GENE", existing_paths) # Because I still want to copy everything from there if correct size.
 
-            # Transfer Layers + Alternative matrices like 'spliced'/'unspliced' or 'transformed'
-            H5ADHandler._transfer_layers(f, loom, result, n_cells, n_genes, existing_paths, input_group)
-            
             # Transfer uns (unstructured global metadata)
             H5ADHandler._transfer_unstructured_metadata(f, loom, result, n_cells, n_genes, existing_paths)
+
+            # Transfer Layers + Alternative matrices like 'spliced'/'unspliced' or 'transformed'
+            H5ADHandler._transfer_layers(f, loom, result, n_cells, n_genes, existing_paths, input_group)
 
         return stats
 
@@ -1168,8 +1207,8 @@ class TextHandler:
             # Polars slice: select columns (cells) from 'start' to 'end'. Then convert ONLY that chunk to numpy
             block = num_df.select(num_df.columns[start:end]).to_numpy()
             return block.T  # Transpose to (Cells x Genes) for LoomFile
-        stats = loom._write_expression_from_cell_blocks(get_block=get_block, n_cells=n_cells, n_genes=n_genes, dest_path="/matrix", gene_metadata=parsed_genes)
-        
+        stats = loom.write_expression_matrix(get_block=get_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
+
         return stats
 
 ## Error handling
@@ -1387,13 +1426,12 @@ class LoomFile:
         result["metadata"].append(self.write_metadata(stats["cell_rrna"], "/col_attrs/_Ribosomal_Content", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(stats["cell_prot"], "/col_attrs/_Protein_Coding_Content", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(stats["gene_sum"], "/row_attrs/_Sum", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
-     
+    
     def write_expression_matrix(self, *, get_block: callable, n_cells: int, n_genes: int, gene_metadata: list[Gene] | None, dest_path: str = "/matrix") -> dict:
         """
         Optimized writer: Handles both DENSE (numpy) and SPARSE (scipy) blocks.
         Calculates stats on sparse data (CSR) to avoid overhead, densifies only for the final write.
         """
-        
         chunk_shape = (min(n_genes, LOOM_CHUNK_GENES), min(n_cells, LOOM_CHUNK_CELLS))       
         dset = self.handle.create_dataset(dest_path, shape=(n_genes, n_cells), dtype=LOOM_DTYPE, chunks=chunk_shape, compression=LOOM_COMPRESSION, compression_opts=LOOM_COMPRESSION_LEVEL)
 
@@ -1424,27 +1462,25 @@ class LoomFile:
                 # SPARSE PATH (Faster)
                 # Calculate stats on .data only (ignore zeros)
                 total_zeros += (block.shape[0] * block.shape[1]) - block.nnz
-                
                 # Check integers only on non-zero elements
                 if is_integer:
                     # Check if any non-zero element is not an integer. We assume structural zeros are integers (0), so we only check .data
                     if not np.all(np.floor(block.data) == block.data):
                         is_integer = False
-
                 if compute:
                     # Sums on sparse matrices are much faster
                     cell_depth[start:end] = np.ravel(block.sum(axis=1))
-                    #cell_detected[start:end] = block.getnnz(axis=1) # Does not work?
                     cell_detected[start:end] = np.add.reduceat((block.data != 0), block.indptr[:-1]).astype(np.int64)
+
                     gene_sum += np.ravel(block.sum(axis=0))
 
                     if mt_mask.any(): cell_mt[start:end] = np.ravel(block[:, mt_mask].sum(axis=1))
                     if ribo_mask.any(): cell_rrna[start:end] = np.ravel(block[:, ribo_mask].sum(axis=1))
-                    if prot_mask.any(): cell_prot[start:end] = np.ravel(block[:, prot_mask].sum(axis=1))  
-                
+                    if prot_mask.any(): cell_prot[start:end] = np.ravel(block[:, prot_mask].sum(axis=1))
+
                 # 3. Densify ONLY for writing
                 dset[:, start:end] = block.T.toarray().astype(DEFAULT_NP_DTYPE, copy=False)
-                
+
             else:
                 # DENSE PATH
                 chunk_cxg = np.asarray(block, dtype=DEFAULT_NP_DTYPE)
