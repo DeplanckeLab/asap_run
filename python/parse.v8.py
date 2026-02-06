@@ -1014,7 +1014,7 @@ class MtxHandler:
     - A triplet: matrix.mtx + barcodes.tsv + (features.tsv | genes.tsv)
     """
     @staticmethod
-    def _discover_mtx_files(matrix_path: str) -> tuple[str, str, str]:
+    def _discover_mtx_files(matrix_path: str) -> tuple[str, str | None, str | None]:
         """
         Discover the MTX triplet files (matrix, barcodes, features).
         """       

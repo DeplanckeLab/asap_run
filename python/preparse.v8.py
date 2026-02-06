@@ -746,7 +746,6 @@ class H510xHandler:
         else:
             print(json_str)
         
-
 class H5ADHandler:
     @staticmethod
     def get_size(f, path):
@@ -825,7 +824,6 @@ class H5ADHandler:
         else:
             print(json_str)
 
-
 class LoomHandler:
     @staticmethod
     def preparse(args, file_path):
@@ -866,7 +864,6 @@ class LoomHandler:
                 out.write(json_str)
         else:
             print(json_str)
-
 
 class RdsHandler:
     @staticmethod
@@ -1116,7 +1113,6 @@ class MtxHandler:
                 out.write(json_str)
         else:
             print(json_str)
-
 
 class TextHandler:
     @staticmethod
