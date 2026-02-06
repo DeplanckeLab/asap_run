@@ -18,6 +18,10 @@ from pathlib import Path # Needed for file extension manipulation
 from collections import Counter # To count categories occurrences
 import scipy.sparse as sp # For handling sparse matrices
 import polars as pl # For fast-reading text matrices (csv, tsv, ...)
+import rpy2.robjects as ro # For reading RDS files
+from rpy2.robjects.packages import importr # For reading RDS files
+from rpy2.robjects import pandas2ri
+import pandas as pd # For handling dataframes (especially used with RDS files)
 
 ## Constants
 # For defining variable as categorical (arbitrary thresholds)
@@ -1003,8 +1007,277 @@ class H510xHandler:
 
 class RdsHandler:
     @staticmethod
-    def parse(args, file_path: str, out_dir: Path, gene_db: MapGene, loom: LoomFile, result):
-        ErrorJSON("RdsHandler is not implemented yet")
+    def _detect_object_class(obj):
+        """Detect the class of the R object."""
+        try:
+            r = ro.r
+            obj_class = r['class'](obj)[0]
+            return str(obj_class)
+        except Exception as e:
+            ErrorJSON(f"Failed to detect RDS object class: {e}")
+    
+    @staticmethod
+    def _extract_seurat_data(obj, args):
+        """Extract matrix, genes, and cells from Seurat object."""
+        try:
+            r = ro.r
+            Seurat = importr('Seurat')
+            
+            # Get assay list
+            seurat_assays = [str(a) for a in r["Assays"](obj)]
+            
+            # Determine which assay to use
+            if args.sel:
+                if args.sel not in seurat_assays:
+                    ErrorJSON(f"Specified assay '{args.sel}' not found in Seurat object. Available assays: {seurat_assays}")
+                assay_name = args.sel
+            else:
+                if len(seurat_assays) == 0:
+                    ErrorJSON("No assays found in Seurat object")
+                elif len(seurat_assays) > 1:
+                    ErrorJSON(f"Multiple assays found: {seurat_assays}. Use --sel to specify which assay to use.")
+                assay_name = seurat_assays[0]
+            
+            # Check if "counts" layer exists in the assay
+            layers_r = r(f'''function(obj) {{ assay <- "{assay_name}"; Layers(obj[[assay]]) }}''')(obj)
+            layers = [str(x) for x in layers_r]
+            
+            if "counts" not in layers:
+                ErrorJSON(f"Assay '{assay_name}' does not contain a 'counts' layer. Available layers: {layers}")
+            
+            # Get dimensions
+            n_cells = int(list(r['ncol'](obj))[0])
+            n_genes = int(list(r['nrow'](obj))[0])
+            
+            # Get gene and cell names
+            gene_names = list(r['rownames'](obj))
+            cell_ids = list(r['colnames'](obj))
+            
+            # Create block reader function for Seurat counts matrix
+            def get_block(start, end):
+                # Extract block from Seurat (cells x genes)
+                # R uses 1-based indexing
+                r_start = start + 1
+                r_end = end
+                
+                block_r = r(f'''function(obj, start_col, end_col) {{ mat <- GetAssayData(obj, layer="counts", assay="{assay_name}"); block <- mat[, start_col:end_col, drop=FALSE]; as.matrix(t(block)) }}''')(obj, r_start, r_end)
+                
+                return np.array(block_r, dtype=DEFAULT_NP_DTYPE)
+            
+            return gene_names, cell_ids, n_genes, n_cells, get_block, assay_name
+            
+        except Exception as e:
+            ErrorJSON(f"Failed to extract Seurat data: {e}")
+    
+    @staticmethod
+    def _extract_dataframe_data(obj):
+        """Extract matrix, genes, and cells from data.frame object."""
+        try:
+            pandas2ri.activate()
+            
+            # Convert R data.frame to pandas
+            df = pandas2ri.rpy2py(obj)
+            
+            n_genes = len(df)
+            n_cells = len(df.columns)
+            
+            # Get gene and cell names
+            if hasattr(df, 'index') and len(df.index) > 0:
+                gene_names = df.index.tolist()
+            else:
+                gene_names = [f"Gene_{i+1}" for i in range(n_genes)]
+            
+            cell_ids = df.columns.tolist()
+            
+            # Convert to numpy for numerical processing
+            try:
+                matrix_data = df.to_numpy(dtype=np.float64)
+            except Exception as e:
+                ErrorJSON(f"data.frame contains non-numeric values and cannot be converted to expression matrix: {e}")
+            
+            # Create block reader function for data.frame
+            def get_block(start, end):
+                return matrix_data[:, start:end].T.astype(DEFAULT_NP_DTYPE)
+            
+            return gene_names, cell_ids, n_genes, n_cells, get_block, "data_frame"
+            
+        except Exception as e:
+            ErrorJSON(f"Failed to extract data.frame data: {e}")
+    
+    @staticmethod
+    def _transfer_seurat_metadata(obj, assay_name, loom, result, n_cells, n_genes, existing_paths):
+        """Transfer metadata from Seurat object to Loom."""
+        try:           
+            pandas2ri.activate()
+            r = ro.r
+            
+            # Transfer cell metadata (meta.data)
+            try:
+                meta_data_r = r('''function(obj) { obj@meta.data }''')(obj)
+                meta_df = pandas2ri.rpy2py(meta_data_r)
+                
+                for col in meta_df.columns:
+                    loom_path = f"/col_attrs/{col}"
+                    
+                    if loom_path in existing_paths:
+                        result.setdefault("warnings", []).append(f"Skipping Seurat meta.data column '{col}': path already exists.")
+                        continue
+                    
+                    # Handle NA values properly to avoid sentinel values like -2147483648
+                    series = meta_df[col]
+                    
+                    # R's integer NA sentinel value
+                    R_INT_NA = -2147483648
+                    
+                    # Check for R's integer NA sentinel first
+                    if pd.api.types.is_integer_dtype(series):
+                        has_r_na = (series == R_INT_NA).any()
+                        if has_r_na:
+                            # Replace R's NA sentinel with actual NA
+                            series = series.replace(R_INT_NA, pd.NA)
+                    
+                    # Now handle pandas NA values
+                    if series.isna().all():
+                        values = np.array(["nan"] * len(series), dtype=object)
+                    elif series.isna().any():
+                        if pd.api.types.is_numeric_dtype(series):
+                            values = series.astype(object).apply(lambda x: "nan" if pd.isna(x) else x).to_numpy()
+                        else:
+                            values = series.fillna("nan").to_numpy()
+                    else:
+                        values = series.to_numpy()
+                    
+                    # Dimension check
+                    if len(values) != n_cells:
+                        result.setdefault("warnings", []).append(f"Skipping Seurat meta.data column '{col}': length mismatch (expected {n_cells}, found {len(values)}).")
+                        continue
+                    
+                    meta = loom.write_metadata(values, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
+                    result["metadata"].append(meta)
+                    existing_paths.add(loom_path)
+                    
+            except Exception as e:
+                result.setdefault("warnings", []).append(f"Could not transfer Seurat meta.data: {str(e)}")
+            
+            # Transfer dimensional reductions (PCA, UMAP, tSNE, etc.)
+            try:
+                reductions = list(r['Reductions'](obj))
+                
+                for reduction_name in reductions:
+                    try:
+                        # Get embedding coordinates
+                        embedding_r = r(f'''function(obj) {{ Embeddings(obj, reduction="{reduction_name}") }}''')(obj)
+                        embedding = np.array(embedding_r, dtype=DEFAULT_NP_DTYPE)
+                        
+                        # Check dimensions
+                        if embedding.shape[0] != n_cells:
+                            result.setdefault("warnings", []).append(f"Skipping reduction '{reduction_name}': dimension mismatch (expected {n_cells} cells, found {embedding.shape[0]}).")
+                            continue
+                        
+                        loom_path = f"/col_attrs/{reduction_name}"
+                        
+                        if loom_path in existing_paths:
+                            result.setdefault("warnings", []).append(f"Skipping reduction '{reduction_name}': path already exists.")
+                            continue
+                        
+                        meta = loom.write_metadata(embedding, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
+                        result["metadata"].append(meta)
+                        existing_paths.add(loom_path)
+                        
+                    except Exception as e:
+                        result.setdefault("warnings", []).append(f"Could not transfer reduction '{reduction_name}': {str(e)}")
+                        
+            except Exception as e:
+                result.setdefault("warnings", []).append(f"Could not access Seurat reductions: {str(e)}")
+            
+            # Transfer additional layers (if any besides "counts")
+            try:
+                layers_r = r(f'''function(obj) {{ assay <- "{assay_name}"; Layers(obj[[assay]]) }}''')(obj)
+                layers = [str(x) for x in layers_r]
+                
+                for layer_name in layers:
+                    if layer_name == "counts":
+                        continue  # Skip counts as it's already the main matrix
+                    
+                    try:
+                        # Get layer dimensions first
+                        layer_ncol = int(list(r(f'''function(obj) {{ ncol(GetAssayData(obj, layer="{layer_name}", assay="{assay_name}")) }}''')(obj))[0])
+                        layer_nrow = int(list(r(f'''function(obj) {{ nrow(GetAssayData(obj, layer="{layer_name}", assay="{assay_name}")) }}''')(obj))[0])
+                        
+                        if layer_nrow != n_genes or layer_ncol != n_cells:
+                            result.setdefault("warnings", []).append(f"Skipping layer '{layer_name}': dimension mismatch (expected {n_genes}x{n_cells}, found {layer_nrow}x{layer_ncol}).")
+                            continue
+                        
+                        dest_path = f"/layers/{layer_name}"
+                        
+                        if dest_path in existing_paths:
+                            result.setdefault("warnings", []).append(f"Skipping layer '{layer_name}': path already exists.")
+                            continue
+                        
+                        # Create block reader for this layer
+                        def get_layer_block(start, end, ln=layer_name, an=assay_name):
+                            r_start = start + 1
+                            r_end = end
+                            block_r = r(f'''function(obj, start_col, end_col) {{ mat <- GetAssayData(obj, layer="{ln}", assay="{an}"); block <- mat[, start_col:end_col, drop=FALSE]; as.matrix(t(block)) }}''')(obj, r_start, r_end)
+                            return np.array(block_r, dtype=DEFAULT_NP_DTYPE)
+                        
+                        # Write layer
+                        layer_stats = loom.write_expression_matrix(get_block=get_layer_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=None, dest_path=dest_path)
+                        
+                        # Register metadata
+                        meta = Metadata(name=dest_path, on="EXPRESSION_MATRIX", type="NUMERIC", nber_rows=n_genes, nber_cols=n_cells, dataset_size=loom.get_dataset_size(dest_path), nber_zeros=layer_stats["total_zeros"], is_count_table=layer_stats["is_count_table"], imported=1)
+                        result["metadata"].append(meta)
+                        existing_paths.add(dest_path)
+                        
+                    except Exception as e:
+                        result.setdefault("warnings", []).append(f"Could not transfer layer '{layer_name}': {str(e)}")
+                        
+            except Exception as e:
+                result.setdefault("warnings", []).append(f"Could not access Seurat layers: {str(e)}")
+                
+        except Exception as e:
+            result.setdefault("warnings", []).append(f"Error during Seurat metadata transfer: {str(e)}")
+    
+    @staticmethod
+    def parse(args, file_path: str, out_dir: Path, gene_db: MapGene, loom, result):       
+        # Initialize R and load RDS file
+        r = ro.r
+        base = importr('base')
+        obj = base.readRDS(file_path)
+        
+        # Detect object class
+        obj_class = RdsHandler._detect_object_class(obj)
+        result["input_group"] = obj_class
+        
+        # Extract data based on object type
+        if obj_class == "Seurat":
+            gene_names, cell_ids, n_genes, n_cells, get_block, group_name = RdsHandler._extract_seurat_data(obj, args)
+        elif obj_class == "data.frame":
+            gene_names, cell_ids, n_genes, n_cells, get_block, group_name = RdsHandler._extract_dataframe_data(obj)
+        else:
+            ErrorJSON(f"Unsupported RDS object type: {obj_class}. Only 'Seurat' and 'data.frame' are supported.")
+        
+        # Update result with dimensions
+        result["nber_rows"] = n_genes
+        result["nber_cols"] = n_cells
+        if obj_class == "Seurat":
+            result["input_group"] = f"Seurat/{group_name}"
+        else:
+            result["input_group"] = group_name
+        
+        # Write gene and cell names + gene database info
+        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+        
+        # Write main expression matrix
+        stats = loom.write_expression_matrix(get_block=get_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
+        
+        # Transfer metadata
+        existing_paths = ({m.name for m in result["metadata"]} | LoomFile._reserved_paths())
+        
+        if obj_class == "Seurat":
+            RdsHandler._transfer_seurat_metadata(obj, group_name, loom, result, n_cells, n_genes, existing_paths)
+        
+        return stats
 
 class MtxHandler:
     """
