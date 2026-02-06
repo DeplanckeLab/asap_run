@@ -6,6 +6,7 @@ import json # For writing output files
 import numpy as np # For diverse array calculations
 import tarfile # To check if file is a TAR archive
 from pathlib import Path # Needed for file extension manipulation
+import shutil # For moving files and removing directories
 
 custom_help = """
 Preparsing Mode
@@ -32,52 +33,351 @@ class FileType:
     RAW_TEXT = 'RAW_TEXT'
     UNKNOWN = 'UNKNOWN'
 
-def extract_from_archive(file_path, sel):
-    with open(file_path, 'rb') as f:
-        magic = f.read(264)
+def cleanup_empty_dirs(base_path):
+    """Remove empty directories recursively."""
+    base_path = Path(base_path)
+    if not base_path.exists() or not base_path.is_dir():
+        return
     
-    # zip (can contain multiple files)
-    if magic.startswith(b'PK\x03\x04'):
-        import zipfile, shutil
-        with zipfile.ZipFile(file_path, 'r') as z:
-            # Filter only files (exclude directories)
-            file_paths = [f for f in z.namelist() if not f.endswith('/')]
-            if sel in file_paths:
-                # Extract the single file
-                extracted_path = z.extract(sel, path='.')
-                # Move the file to current dir, stripping folders
-                final_path = Path('.').resolve() / Path(sel).name
-                shutil.move(extracted_path, final_path)
-                # Optionally, remove the now-empty folder structure
-                file_path, archive_path = decompress_if_needed(str(final_path), sel)
-                return file_path[0]
-            else:
-                return None
+    for item in sorted(base_path.rglob('*'), reverse=True):
+        if item.is_dir() and not any(item.iterdir()):
+            try:
+                item.rmdir()
+            except:
+                pass
 
-    # tar (can contain multiple files)
-    if tarfile.is_tarfile(file_path):
-        import shutil
-        with tarfile.open(file_path, mode='r:') as t:
-            # Filter only files (exclude directories)
-            file_paths = [m.name for m in t.getmembers() if m.isfile()]
-            if sel in file_paths:
-                # Extract the single file
-                t.extract(sel, path='.', filter='data')
-                extracted_path = Path('.') / sel
-                # Move the file to current dir, stripping folders
-                final_path = Path('.').resolve() / Path(sel).name
-                shutil.move(extracted_path, final_path)
-                # Optionally, remove the now-empty folder structure
-                file_path, archive_path = decompress_if_needed(str(final_path), sel)
-                return file_path[0]
-            else:
-                return None
+def is_mtx_triplet(file_list):
+    """
+    Check if file list contains exactly ONE MTX triplet.
+    Returns True only if there's a single complete triplet (3 files).
+    Multiple triplets should be treated as a regular archive requiring --sel.
+    
+    Supported patterns:
+    1. Standard: matrix.mtx, barcodes.tsv, features.tsv/genes.tsv
+    2. Prefixed: PREFIX-matrix.mtx, PREFIX-barcodes.tsv, PREFIX-features.tsv
+    3. Alternative: *counts*.mtx, *cell_metadata*.csv, *gene_names*.csv
+    """
+    def base_name(path):
+        """Get base name without compression extensions."""
+        p = Path(path).name
+        suffix = Path(p).suffix
+        if suffix in {".gz", ".bz2", ".xz"}:
+            p = p[: -len(suffix)]
+        return p
+    
+    # Standard triplet check (exact names) - must be exactly 3 files
+    if len(file_list) == 3:
+        base_names = {base_name(p) for p in file_list}
+        allowed_sets = [
+            {"matrix.mtx", "barcodes.tsv", "features.tsv"},
+            {"matrix.mtx", "barcodes.tsv", "genes.tsv"}
+        ]
+        if base_names in allowed_sets:
+            return True
+    
+    # If not exactly 3 files, check if it's a single prefixed/variant triplet
+    # Group files by prefix
+    from collections import defaultdict
+    groups = defaultdict(lambda: {'matrix': None, 'barcodes': None, 'features': None})
+    
+    for fpath in file_list:
+        fname = base_name(fpath)
+        fname_lower = fname.lower()
+        
+        # Check for matrix file (.mtx extension)
+        if fname.endswith('.mtx'):
+            # Pattern 1: Standard "matrix.mtx"
+            if fname_lower == 'matrix.mtx':
+                groups['']['matrix'] = fpath
+            # Pattern 2: Prefixed "PREFIX-matrix.mtx" or "PREFIX_matrix.mtx"
+            elif 'matrix' in fname_lower:
+                for sep in ['-matrix', '_matrix']:
+                    if sep in fname_lower:
+                        prefix = fname_lower.split(sep)[0]
+                        groups[prefix]['matrix'] = fpath
+                        break
+            # Pattern 3: "counts" variant (*counts*.mtx)
+            elif 'count' in fname_lower:
+                # Extract common prefix (everything before 'count')
+                prefix = fname_lower.split('count')[0].rstrip('_-')
+                groups[prefix]['matrix'] = fpath
+        
+        # Check for barcodes/cell metadata file (.tsv or .csv extension)
+        elif fname.endswith('.tsv') or fname.endswith('.csv'):
+            # Pattern 1: Standard "barcodes.tsv"
+            if fname_lower in ('barcodes.tsv', 'barcode.tsv'):
+                groups['']['barcodes'] = fpath
+            # Pattern 2: Prefixed barcodes
+            elif 'barcode' in fname_lower:
+                for sep in ['-barcode', '_barcode']:
+                    if sep in fname_lower:
+                        prefix = fname_lower.split(sep)[0]
+                        groups[prefix]['barcodes'] = fpath
+                        break
+            # Pattern 3: "cell_metadata" variant
+            elif 'cell' in fname_lower and 'metadata' in fname_lower:
+                # Extract common prefix (everything before 'cell')
+                prefix = fname_lower.split('cell')[0].rstrip('_-')
+                groups[prefix]['barcodes'] = fpath
+            # Pattern 4: Features/genes
+            elif 'feature' in fname_lower:
+                if fname_lower in ('features.tsv', 'features.csv'):
+                    groups['']['features'] = fpath
+                else:
+                    for sep in ['-feature', '_feature']:
+                        if sep in fname_lower:
+                            prefix = fname_lower.split(sep)[0]
+                            groups[prefix]['features'] = fpath
+                            break
+            elif 'gene' in fname_lower:
+                if fname_lower in ('genes.tsv', 'genes.csv', 'gene_names.csv'):
+                    groups['']['features'] = fpath
+                else:
+                    for sep in ['-gene', '_gene']:
+                        if sep in fname_lower:
+                            prefix = fname_lower.split(sep)[0]
+                            groups[prefix]['features'] = fpath
+                            break
+                    # Pattern 3: "gene_names" variant
+                    if groups[fname_lower.split('gene')[0].rstrip('_-')]['features'] is None:
+                        prefix = fname_lower.split('gene')[0].rstrip('_-')
+                        groups[prefix]['features'] = fpath
+    
+    # Count complete triplets
+    complete_triplets = [prefix for prefix, files in groups.items() 
+                         if files['matrix'] and files['barcodes'] and files['features']]
+    
+    # Only return True if there's exactly ONE complete triplet
+    return len(complete_triplets) == 1 and len(file_list) == 3
 
-def decompress_if_needed(file_path, sel):
+def find_mtx_triplet_for_file(selected_file, all_files):
+    """
+    Given a selected file (e.g., matrix.mtx), find its companion triplet files.
+    Returns list of [matrix, barcodes, features] if found, else None.
+    
+    Supports multiple naming patterns:
+    1. Standard: matrix.mtx, barcodes.tsv, features.tsv/genes.tsv
+    2. Prefixed: PREFIX-matrix.mtx, PREFIX-barcodes.tsv, PREFIX-features.tsv
+    3. Alternative: *counts*.mtx, *cell_metadata*.csv, *gene_names*.csv
+    """
+    def base_name(path):
+        """Get base name without compression extensions."""
+        p = Path(path).name
+        suffix = Path(p).suffix
+        if suffix in {".gz", ".bz2", ".xz"}:
+            p = p[: -len(suffix)]
+        return p
+    
+    selected_base = base_name(selected_file)
+    selected_lower = selected_base.lower()
+    
+    # Detect what type of file was selected and extract prefix
+    prefix = None
+    file_type = None
+    
+    # Check for matrix file
+    if selected_base.endswith('.mtx'):
+        file_type = 'matrix'
+        if selected_lower == 'matrix.mtx':
+            prefix = ''
+        elif 'matrix' in selected_lower:
+            for sep in ['-matrix', '_matrix']:
+                if sep in selected_lower:
+                    prefix = selected_lower.split(sep)[0]
+                    break
+        elif 'count' in selected_lower:
+            prefix = selected_lower.split('count')[0].rstrip('_-')
+    
+    # Check for barcodes/cell metadata file
+    elif selected_base.endswith('.tsv') or selected_base.endswith('.csv'):
+        if selected_lower in ('barcodes.tsv', 'barcode.tsv'):
+            file_type = 'barcodes'
+            prefix = ''
+        elif 'barcode' in selected_lower:
+            file_type = 'barcodes'
+            for sep in ['-barcode', '_barcode']:
+                if sep in selected_lower:
+                    prefix = selected_lower.split(sep)[0]
+                    break
+        elif 'cell' in selected_lower and 'metadata' in selected_lower:
+            file_type = 'barcodes'
+            prefix = selected_lower.split('cell')[0].rstrip('_-')
+        elif selected_lower in ('features.tsv', 'features.csv', 'genes.tsv', 'genes.csv', 'gene_names.csv'):
+            file_type = 'features'
+            prefix = ''
+        elif 'feature' in selected_lower:
+            file_type = 'features'
+            for sep in ['-feature', '_feature']:
+                if sep in selected_lower:
+                    prefix = selected_lower.split(sep)[0]
+                    break
+        elif 'gene' in selected_lower:
+            file_type = 'features'
+            for sep in ['-gene', '_gene']:
+                if sep in selected_lower:
+                    prefix = selected_lower.split(sep)[0]
+                    break
+            if prefix is None:
+                prefix = selected_lower.split('gene')[0].rstrip('_-')
+    
+    if prefix is None or file_type is None:
+        return None
+    
+    # Now find the companion files with the same prefix
+    triplet = {'matrix': None, 'barcodes': None, 'features': None}
+    
+    for fpath in all_files:
+        fname = base_name(fpath)
+        fname_lower = fname.lower()
+        
+        # Check for matrix file
+        if fname.endswith('.mtx'):
+            if fname_lower == 'matrix.mtx' and prefix == '':
+                triplet['matrix'] = fpath
+            elif 'matrix' in fname_lower:
+                for sep in ['-matrix', '_matrix']:
+                    if sep in fname_lower:
+                        file_prefix = fname_lower.split(sep)[0]
+                        if file_prefix == prefix:
+                            triplet['matrix'] = fpath
+                        break
+            elif 'count' in fname_lower:
+                file_prefix = fname_lower.split('count')[0].rstrip('_-')
+                if file_prefix == prefix:
+                    triplet['matrix'] = fpath
+        
+        # Check for barcodes/cell metadata file
+        elif fname.endswith('.tsv') or fname.endswith('.csv'):
+            if fname_lower in ('barcodes.tsv', 'barcode.tsv') and prefix == '':
+                triplet['barcodes'] = fpath
+            elif 'barcode' in fname_lower:
+                for sep in ['-barcode', '_barcode']:
+                    if sep in fname_lower:
+                        file_prefix = fname_lower.split(sep)[0]
+                        if file_prefix == prefix:
+                            triplet['barcodes'] = fpath
+                        break
+            elif 'cell' in fname_lower and 'metadata' in fname_lower:
+                file_prefix = fname_lower.split('cell')[0].rstrip('_-')
+                if file_prefix == prefix:
+                    triplet['barcodes'] = fpath
+            # Check for features/genes
+            elif fname_lower in ('features.tsv', 'features.csv', 'genes.tsv', 'genes.csv', 'gene_names.csv') and prefix == '':
+                triplet['features'] = fpath
+            elif 'feature' in fname_lower:
+                for sep in ['-feature', '_feature']:
+                    if sep in fname_lower:
+                        file_prefix = fname_lower.split(sep)[0]
+                        if file_prefix == prefix:
+                            triplet['features'] = fpath
+                        break
+            elif 'gene' in fname_lower:
+                for sep in ['-gene', '_gene']:
+                    if sep in fname_lower:
+                        file_prefix = fname_lower.split(sep)[0]
+                        if file_prefix == prefix:
+                            triplet['features'] = fpath
+                        break
+                if triplet['features'] is None:
+                    file_prefix = fname_lower.split('gene')[0].rstrip('_-')
+                    if file_prefix == prefix:
+                        triplet['features'] = fpath
+    
+    # Return triplet if complete
+    if triplet['matrix'] and triplet['barcodes'] and triplet['features']:
+        return [triplet['matrix'], triplet['barcodes'], triplet['features']]
+    
+    return None
+
+def extract_and_process_mtx_triplet(archive_obj, file_paths, extract_dir, original_input=None):
+    """Extract and process MTX triplet files."""
+    canonical = {
+        "matrix.mtx": "matrix.mtx", "matrix": "matrix.mtx",
+        "barcodes.tsv": "barcodes.tsv", "barcodes": "barcodes.tsv",
+        "features.tsv": "features.tsv", "features": "features.tsv",
+        "genes.tsv": "genes.tsv", "genes": "genes.tsv"
+    }
+    
+    def base_name(path):
+        p = Path(path).name
+        suffix = Path(p).suffix
+        if suffix in {".gz", ".bz2", ".xz"}:
+            p = p[: -len(suffix)]
+        return p
+    
+    def get_canonical_name(fname):
+        """Determine canonical name for MTX triplet file."""
+        base = base_name(fname)
+        base_lower = base.lower()
+        
+        # Check if it's already a canonical name
+        if base in canonical:
+            return canonical[base]
+        
+        # Check for matrix files (.mtx extension)
+        if base.endswith('.mtx'):
+            return 'matrix.mtx'
+        
+        # Check for barcodes/cell metadata files (.tsv or .csv)
+        elif base.endswith('.tsv') or base.endswith('.csv'):
+            # Preserve the original extension
+            extension = Path(base).suffix  # .tsv or .csv
+            if 'barcode' in base_lower or ('cell' in base_lower and 'metadata' in base_lower):
+                return f'barcodes{extension}'
+            elif 'feature' in base_lower or 'gene' in base_lower:
+                return f'features{extension}'
+        
+        # Fallback - should not happen if triplet detection worked correctly
+        return base
+    
+    final_file_paths = []
+    for fname in file_paths:
+        # Extract to the designated directory
+        if isinstance(archive_obj, tarfile.TarFile):
+            archive_obj.extract(fname, path=extract_dir, filter='data')
+        else:  # zipfile
+            archive_obj.extract(fname, path=extract_dir)
+        
+        extracted_path = Path(extract_dir) / fname
+        # Decompress if needed
+        decompressed_path, _ = decompress_if_needed(str(extracted_path), None, original_input)
+        
+        # Delete the original compressed file if decompression happened
+        if str(extracted_path) != decompressed_path[0]:
+            try:
+                extracted_path.unlink()
+            except:
+                pass
+        
+        # Move to target location with canonical name (flatten structure)
+        target_base = get_canonical_name(fname)
+        target_path = Path(extract_dir) / target_base
+        if Path(decompressed_path[0]) != target_path:
+            shutil.move(decompressed_path[0], target_path)
+        final_file_paths.append(str(target_path))
+    
+    # Clean up any subdirectories that were created during extraction
+    for item in extract_dir.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+    
+    return final_file_paths
+
+def decompress_if_needed(file_path, sel, original_input=None):
+    """
+    Decompress files as needed. Returns (list_of_files, archive_path).
+    - For single-file compression (gz, bz2, xz): decompress and recurse
+    - For archives (zip, tar): handle according to content
+    - original_input: The original -f argument file path (never delete this)
+    """
+    # Track original input if this is the first call
+    if original_input is None:
+        original_input = file_path
+    
     with open(file_path, 'rb') as f:
         magic = f.read(264)
 
-    # gzip (cannot contain multiple files)
+    # gzip (single file compression)
     if magic.startswith(b'\x1f\x8b'):
         import subprocess
         output_path = Path(file_path).with_suffix('')
@@ -85,9 +385,9 @@ def decompress_if_needed(file_path, sel):
             output_path = output_path.with_name(output_path.name + '.out')
         with open(output_path, 'wb') as f_out:
             subprocess.run(["pigz", "-d", '-k', '-f', "-c", file_path], stdout=f_out, check=True)
-        return decompress_if_needed(str(output_path), sel)
+        return decompress_if_needed(str(output_path), sel, original_input)
 
-    # bzip2 (cannot contain multiple files)
+    # bzip2 (single file compression)
     if magic.startswith(b'BZh'):
         import subprocess
         output_path = Path(file_path).with_suffix('')
@@ -95,9 +395,9 @@ def decompress_if_needed(file_path, sel):
             output_path = output_path.with_name(output_path.name + '.out')
         with open(output_path, 'wb') as f_out:
             subprocess.run(["pbzip2", "-d", "-k", "-f", "-c", file_path], stdout=f_out, check=True)
-        return decompress_if_needed(str(output_path), sel)
+        return decompress_if_needed(str(output_path), sel, original_input)
         
-    # xz (cannot contain multiple files)
+    # xz (single file compression)
     if magic.startswith(b'\xfd7zXZ\x00'):
         import subprocess
         output_path = Path(file_path).with_suffix('')
@@ -105,117 +405,195 @@ def decompress_if_needed(file_path, sel):
             output_path = output_path.with_name(output_path.name + '.out')
         with open(output_path, 'wb') as f_out:
             subprocess.run(["pixz", "-d", "-k", "-c", file_path], stdout=f_out, check=True)
-        return decompress_if_needed(str(output_path), sel)
+        return decompress_if_needed(str(output_path), sel, original_input)
 
-    # zip (can contain multiple files)
+    # zip (multi-file archive)
     if magic.startswith(b'PK\x03\x04'):
-        import zipfile, shutil
+        import zipfile
         with zipfile.ZipFile(file_path, 'r') as z:
-            # Filter only files (exclude directories)
             file_paths = [f for f in z.namelist() if not f.endswith('/')]
+            
+            # Single file in archive
             if len(file_paths) == 1:
-                # Extract the single file
-                extracted_path = z.extract(file_paths[0], path='.')
-                # Move the file to current dir, stripping folders
-                final_path = Path('.').resolve() / Path(file_paths[0]).name
-                shutil.move(extracted_path, final_path)
-                # Optionally, remove the now-empty folder structure
-                return decompress_if_needed(str(final_path), sel)
-            else:
-                # Multiple files
-                if sel:
-                    # If sel is defined, extract the required file
-                    if sel in file_paths:
-                        # Extract the single file
-                        extracted_path = z.extract(sel, path='.')
-                        # Move the file to current dir, stripping folders
-                        final_path = Path('.').resolve() / Path(sel).name
-                        shutil.move(extracted_path, final_path)
-                        # Optionally, remove the now-empty folder structure
-                        return decompress_if_needed(str(final_path), sel)
-                    else:
-                        ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
+                extract_dir = Path(file_path).parent / Path(file_paths[0]).name.replace('.', '_')
+                extract_dir.mkdir(exist_ok=True)
+                z.extract(file_paths[0], path=extract_dir)
+                extracted_path = extract_dir / file_paths[0]
+                final_path = extract_dir / Path(file_paths[0]).name
+                if extracted_path != final_path:
+                    shutil.move(extracted_path, final_path)
+                cleanup_empty_dirs(extract_dir)
+                return decompress_if_needed(str(final_path), sel, original_input)
+            
+            # MTX triplet without --sel
+            if not sel and is_mtx_triplet(file_paths):
+                archive_stem = Path(file_path).stem
+                if archive_stem.endswith('.tar'):
+                    archive_stem = archive_stem[:-4]
+                extract_dir = Path(file_path).parent / archive_stem
+                extract_dir.mkdir(exist_ok=True)
+                final_paths = extract_and_process_mtx_triplet(z, file_paths, extract_dir, original_input)
+                return final_paths, None
+            
+            # Multiple files with --sel
+            if sel:
+                if sel not in file_paths:
+                    ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
+                
+                # Check if selected file is part of an MTX triplet
+                triplet_files = find_mtx_triplet_for_file(sel, file_paths)
+                
+                if triplet_files:
+                    # Extract the entire triplet
+                    archive_stem = Path(file_path).stem
+                    if archive_stem.endswith('.tar'):
+                        archive_stem = archive_stem[:-4]
+                    extract_dir = Path(file_path).parent / archive_stem
+                    extract_dir.mkdir(exist_ok=True)
+                    final_paths = extract_and_process_mtx_triplet(z, triplet_files, extract_dir, original_input)
+                    return final_paths, None
                 else:
-                    # MTX format in a tar archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
-                    # Determine base names before eventual comp. extension
-                    def base_name(path):
-                        p = Path(path).name
-                        suffix = Path(p).suffix
-                        if suffix in {".gz", ".bz2", ".xz"}:
-                            p = p[: -len(suffix)]
-                        return p
-                    base_names = {base_name(p) for p in file_paths}
-                    allowed_sets = [ {"matrix.mtx", "barcodes.tsv", "features.tsv"}, {"matrix.mtx", "barcodes.tsv", "genes.tsv"} ]
-                    canonical = { "matrix.mtx": "matrix.mtx", "matrix": "matrix.mtx", "barcodes.tsv": "barcodes.tsv", "barcodes": "barcodes.tsv", "features.tsv": "features.tsv", "features": "features.tsv", "genes.tsv": "genes.tsv", "genes": "genes.tsv" }
-                    if len(file_paths) == 3 and base_names in allowed_sets:
-                        final_file_paths = []
-                        for fname in file_paths:
-                            t.extract(fname, path='.', filter='data')
-                            extracted_path = Path('.') / fname
-                            decompressed_path, sel = decompress_if_needed(extracted_path, None) # Decompress if needed
-                            target_base = canonical[base_name(fname)] # Fix filename
-                            target_path = Path('.').resolve() / target_base
-                            shutil.move(decompressed_path[0], target_path)
-                            final_file_paths.append(str(target_path))
-                        return final_file_paths, None
-                    else:
-                        # If not, then return the list of files in the archive + the archive path
-                        return file_paths, file_path
+                    # Extract single file
+                    archive_stem = Path(file_path).stem
+                    if archive_stem.endswith('.tar'):
+                        archive_stem = archive_stem[:-4]
+                    extract_dir = Path(file_path).parent / archive_stem
+                    extract_dir.mkdir(exist_ok=True)
+                    
+                    # Extract only the selected file
+                    z.extract(sel, path=extract_dir)
+                    extracted_path = extract_dir / sel
+                    final_path = extract_dir / Path(sel).name
+                    if extracted_path != final_path:
+                        shutil.move(extracted_path, final_path)
+                    
+                    # Clean up any subdirectories created during extraction
+                    for item in extract_dir.iterdir():
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                    
+                    return decompress_if_needed(str(final_path), sel, original_input)
+            
+            # Multiple files without --sel: return listing
+            return file_paths, file_path
 
-    # tar (can contain multiple files)
+    # tar (multi-file archive)
     if tarfile.is_tarfile(file_path):
-        import shutil
         with tarfile.open(file_path, mode='r:') as t:
-            # Filter only files (exclude directories)
             file_paths = [m.name for m in t.getmembers() if m.isfile()]
+            
+            # Single file in archive
             if len(file_paths) == 1:
-                # Extract the single file
-                t.extract(file_paths[0], path='.', filter='data')
-                extracted_path = Path('.') / file_paths[0]
-                final_path = Path('.').resolve() / Path(file_paths[0]).name
-                shutil.move(extracted_path, final_path)
-                return decompress_if_needed(str(final_path), sel)
-            else:
-                # Multiple files
-                if sel:
-                    # If sel is defined, extract the required file
-                    if sel in file_paths:
-                        # Extract the single file
-                        t.extract(sel, path='.', filter='data')
-                        extracted_path = Path('.') / sel
-                        # Move the file to current dir, stripping folders
-                        final_path = Path('.').resolve() / Path(sel).name
-                        shutil.move(extracted_path, final_path)
-                        # Optionally, remove the now-empty folder structure
-                        return decompress_if_needed(str(final_path), sel)
-                    else:
-                        ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
+                extract_dir = Path(file_path).parent / Path(file_paths[0]).name.replace('.', '_')
+                extract_dir.mkdir(exist_ok=True)
+                t.extract(file_paths[0], path=extract_dir, filter='data')
+                extracted_path = extract_dir / file_paths[0]
+                final_path = extract_dir / Path(file_paths[0]).name
+                if extracted_path != final_path:
+                    shutil.move(extracted_path, final_path)
+                cleanup_empty_dirs(extract_dir)
+                return decompress_if_needed(str(final_path), sel, original_input)
+            
+            # MTX triplet without --sel
+            if not sel and is_mtx_triplet(file_paths):
+                archive_stem = Path(file_path).stem
+                if archive_stem.endswith('.tar'):
+                    archive_stem = archive_stem[:-4]
+                extract_dir = Path(file_path).parent / archive_stem
+                extract_dir.mkdir(exist_ok=True)
+                final_paths = extract_and_process_mtx_triplet(t, file_paths, extract_dir, original_input)
+                
+                # Delete the tar after MTX extraction ONLY if it's not the original input
+                tar_to_delete = Path(file_path)
+                original_input_path = Path(original_input).resolve() if original_input else None
+                if (tar_to_delete.exists() and 
+                    tar_to_delete.suffix in {'.tar', ''} and 
+                    original_input_path and 
+                    tar_to_delete.resolve() != original_input_path):
+                    try:
+                        tar_to_delete.unlink()
+                    except:
+                        pass
+                
+                return final_paths, None
+            
+            # Multiple files with --sel
+            if sel:
+                if sel not in file_paths:
+                    ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
+                
+                # Check if selected file is part of an MTX triplet
+                triplet_files = find_mtx_triplet_for_file(sel, file_paths)
+                
+                if triplet_files:
+                    # Extract the entire triplet
+                    archive_stem = Path(file_path).stem
+                    if archive_stem.endswith('.tar'):
+                        archive_stem = archive_stem[:-4]
+                    extract_dir = Path(file_path).parent / archive_stem
+                    extract_dir.mkdir(exist_ok=True)
+                    final_paths = extract_and_process_mtx_triplet(t, triplet_files, extract_dir, original_input)
+                    
+                    # Delete the tar after extraction ONLY if it's not the original input
+                    tar_to_delete = Path(file_path)
+                    original_input_path = Path(original_input).resolve() if original_input else None
+                    if (tar_to_delete.exists() and 
+                        tar_to_delete.suffix in {'.tar', ''} and 
+                        original_input_path and 
+                        tar_to_delete.resolve() != original_input_path):
+                        try:
+                            tar_to_delete.unlink()
+                        except:
+                            pass
+                    
+                    return final_paths, None
                 else:
-                    # MTX format in a tar archive. matrix.mtx barcodes.tsv and features.tsv || genes.tsv
-                    # Determine base names before eventual comp. extension
-                    def base_name(path):
-                        p = Path(path).name
-                        suffix = Path(p).suffix
-                        if suffix in {".gz", ".bz2", ".xz"}:
-                            p = p[: -len(suffix)]
-                        return p
-                    base_names = {base_name(p) for p in file_paths}
-                    allowed_sets = [ {"matrix.mtx", "barcodes.tsv", "features.tsv"}, {"matrix.mtx", "barcodes.tsv", "genes.tsv"} ]
-                    canonical = { "matrix.mtx": "matrix.mtx", "matrix": "matrix.mtx", "barcodes.tsv": "barcodes.tsv", "barcodes": "barcodes.tsv", "features.tsv": "features.tsv", "features": "features.tsv", "genes.tsv": "genes.tsv", "genes": "genes.tsv" }
-                    if len(file_paths) == 3 and base_names in allowed_sets:
-                        final_file_paths = []
-                        for fname in file_paths:
-                            t.extract(fname, path='.', filter='data')
-                            extracted_path = Path('.') / fname
-                            decompressed_path, sel = decompress_if_needed(extracted_path, None) # Decompress if needed
-                            target_base = canonical[base_name(fname)] # Fix filename
-                            target_path = Path('.').resolve() / target_base
-                            shutil.move(decompressed_path[0], target_path)
-                            final_file_paths.append(str(target_path))
-                        return final_file_paths, None
-                    else:
-                        # If not, then return the list of files in the archive + the archive path
-                        return file_paths, file_path
+                    # Extract single file
+                    archive_stem = Path(file_path).stem
+                    if archive_stem.endswith('.tar'):
+                        archive_stem = archive_stem[:-4]
+                    extract_dir = Path(file_path).parent / archive_stem
+                    extract_dir.mkdir(exist_ok=True)
+                    
+                    # Extract only the selected file
+                    t.extract(sel, path=extract_dir, filter='data')
+                    extracted_path = extract_dir / sel
+                    final_path = extract_dir / Path(sel).name
+                    if extracted_path != final_path:
+                        shutil.move(extracted_path, final_path)
+                    
+                    # Clean up any subdirectories created during extraction
+                    for item in extract_dir.iterdir():
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                    
+                    # Delete the tar after extraction ONLY if it's not the original input
+                    tar_to_delete = Path(file_path)
+                    original_input_path = Path(original_input).resolve() if original_input else None
+                    if (tar_to_delete.exists() and 
+                        tar_to_delete.suffix in {'.tar', ''} and 
+                        original_input_path and 
+                        tar_to_delete.resolve() != original_input_path):
+                        try:
+                            tar_to_delete.unlink()
+                        except:
+                            pass
+                    
+                    return decompress_if_needed(str(final_path), sel, original_input)
+            
+            # Multiple files without --sel: cache uncompressed tar if compressed
+            original_path = Path(file_path)
+            if original_path.suffix in {'.gz', '.bz2', '.xz'}:
+                # This is a compressed tar - cache the uncompressed version
+                cached_tar = original_path.with_suffix('')
+                if not cached_tar.exists() or cached_tar == original_path:
+                    # Already uncompressed or need different name
+                    pass
+                # Return listing with original compressed path
+                return file_paths, str(original_path)
+            else:
+                # Already uncompressed tar
+                return file_paths, file_path
 
     # Uncompressed single file
     return [file_path], None
@@ -302,22 +680,7 @@ def preparse(args):
                 except (Exception) as e:
                     ErrorJSON(str(e).strip() + '. Format is not handled?')
                 if first_line.startswith("%%MatrixMarket matrix"):
-                    # It's a unique file. Did we miss barcodes.tsv and genes/features.tsv ?
-                    file_paths = [file_path]
-                    if args.sel: # If it comes from an archive
-                        p = Path(args.sel)
-                        barcode_path = str(p.parent / "barcodes.tsv") if p.parent != Path('.') else "barcodes.tsv"
-                        barcode_file = extract_from_archive(args.f, barcode_path)
-                        if barcode_file: # If barcode file is found
-                            file_paths.append(barcode_file)
-                        feature_path = str(p.parent / "features.tsv") if p.parent != Path('.') else "features.tsv"
-                        feature_file = extract_from_archive(args.f, feature_path)
-                        if not feature_file:
-                            feature_path = str(p.parent / "genes.tsv") if p.parent != Path('.') else "genes.tsv"
-                            feature_file = extract_from_archive(args.f, feature_path)
-                        if feature_file: # If feature file is found
-                            file_paths.append(feature_file)
-                    MtxHandler.preparse(args, file_paths)
+                    MtxHandler.preparse(args, [file_path])
                 else:
                     TextHandler.preparse(args, file_path)
             else: # Not detected
@@ -398,205 +761,132 @@ class H5ADHandler:
     @staticmethod
     def extract_index(f, path):
         # Read gene names
-        try:
-            # Standard case: _index dataset
-            # Check attribute _index if exists
-            raw = f[path].attrs.get('_index', '_index')
-            index_path = raw.decode() if isinstance(raw, bytes) else raw
-            # Return 10 first values
-            return [v.decode() if isinstance(v, bytes) else str(v)
-                    for v in f[f"{path}/{index_path}"][:10]]
-        except KeyError:
-            # Fallback: compound dataset with named fields (e.g. f["/var"] is a structured array)
-            dset = f[path]
-            if isinstance(dset.dtype, np.dtype) and dset.dtype.names:
-                first_col = dset.dtype.names[0]
-                return [v[first_col].decode() if isinstance(v[first_col], bytes) else str(v[first_col])
-                       for v in dset[:10]]
+        if '_index' in f[path]:
+            # AnnData >= 0.7 style
+            # The index is typically stored in obs/_index or var/_index as a dataset
+            idx_data = f[path]['_index'][:]
+            if isinstance(idx_data[0], bytes):
+                return [x.decode('utf-8') for x in idx_data[:10]]
             else:
-                return [f"{path}:invalid_structure"]
+                return idx_data[:10].tolist()
+        else:
+            # Older style or fallback
+            return [f"Item_{i+1}" for i in range(10)]
     
     @staticmethod
     def preparse(args, file_path):
         result = {
             "detected_format": FileType.H5AD,
-            "file_path": file_path, # If it was compressed, it should be decompressed before
+            "file_path": file_path,
             "list_groups": []
         }
-
+        
         with h5py.File(file_path, 'r') as f:
-            for group in ['/X', '/raw/X', '/raw.X']:
-                if group in f:                
-                    # Get matrix dimensions
-                    nCells, nGenes = H5ADHandler.get_size(f, group)
-
-                    # Determine matrix format
-                    if isinstance(f[group], h5py.Group) and "data" in f[group]:
-                        matrix_format = f[group].attrs.get('h5sparse_format', None)
-                        if matrix_format is None:
-                            matrix_format = f[group].attrs.get('encoding-type', None)[:-7] # Other way to encore the type
-                        max_cells = min(10, nCells)
-                        max_genes = min(10, nGenes)
-                        matrix = [[0 for _ in range(max_genes)] for _ in range(max_cells)]
-                        if matrix_format == 'csr':
-                            indptr = f[f"{group}/indptr"][:max_cells + 1]
-                            indices = f[f"{group}/indices"][:indptr[-1]]
-                            data = f[f"{group}/data"][:indptr[-1]]
-                            for row in range(max_cells):
-                                start, end = indptr[row], indptr[row + 1]
-                                for idx in range(start, end):
-                                    col = indices[idx]
-                                    if col < max_genes:
-                                        matrix[row][col] = float(data[idx])
-                        elif matrix_format == 'csc':
-                            indptr = f[f"{group}/indptr"][:max_genes + 1]
-                            indices = f[f"{group}/indices"][:indptr[-1]]
-                            data = f[f"{group}/data"][:indptr[-1]]
-                            for col in range(max_genes):
-                                start, end = indptr[col], indptr[col + 1]
-                                for idx in range(start, end):
-                                    row = indices[idx]
-                                    if row < max_cells:
-                                        matrix[row][col] = float(data[idx])
-                        else:
-                            ErrorJSON("Unsupported or missing matrix format")
-                    else:
-                        # Dense matrix
-                        matrix = f[group][:min(10, nCells), :min(10, nGenes)].astype(float).tolist()
-
-                    # Load gene/cell names
-                    if group == '/raw.X':
-                        if '/raw.var' in f:   
-                            genes = H5ADHandler.extract_index(f, "/raw.var")
-                        else:
-                            genes = H5ADHandler.extract_index(f, "/var")
-                        if '/raw.obs' in f:   
-                            cells = H5ADHandler.extract_index(f, "/raw.obs")
-                        else:
-                            cells = H5ADHandler.extract_index(f, "/obs")
-                    elif group == '/raw/X':
-                        if '/raw/var' in f:   
-                            genes = H5ADHandler.extract_index(f, "/raw/var")
-                        else:
-                            genes = H5ADHandler.extract_index(f, "/var")
-                        if '/raw/obs' in f:   
-                            cells = H5ADHandler.extract_index(f, "/raw/obs")
-                        else:
-                            cells = H5ADHandler.extract_index(f, "/obs")
-                    else:
-                        genes = H5ADHandler.extract_index(f, "/var")
-                        cells = H5ADHandler.extract_index(f, "/obs")
-                    
-                    entry = {
-                        "group": group,
-                        "nber_cols": nCells,
-                        "nber_rows": nGenes,
-                        "is_count": int((np.array(matrix) % 1 == 0).all()),
-                        "genes": genes,
-                        "cells": cells,
-                        "matrix": matrix
-                    }
-                    result["list_groups"].append(entry)
-
+            # Get dimensions
+            nGenes, nCells = H5ADHandler.get_size(f, 'X')
+            
+            # Get gene and cell names
+            genes = H5ADHandler.extract_index(f, 'var')
+            cells = H5ADHandler.extract_index(f, 'obs')
+            
+            # Extract 10x10 matrix
+            x_group = f['X']
+            if 'data' in x_group and 'indices' in x_group and 'indptr' in x_group:
+                # Sparse CSR format
+                indptr = x_group['indptr'][:min(10, nCells) + 1]
+                data = x_group['data'][:indptr[-1]]
+                indices = x_group['indices'][:indptr[-1]]
+                matrix = [[0 for _ in range(min(10, nGenes))] for _ in range(min(10, nCells))]
+                for row in range(min(10, nCells)):
+                    start, end = indptr[row], indptr[row+1]
+                    for idx_pos in range(start, end):
+                        col = indices[idx_pos]
+                        if col < min(10, nGenes):
+                            matrix[row][col] = float(data[idx_pos])
+            else:
+                # Dense format
+                matrix = x_group[:min(10, nCells), :min(10, nGenes)].tolist()
+            
+            entry = {
+                "group": "X",
+                "nber_cols": nCells,
+                "nber_rows": nGenes,
+                "is_count": int((np.array(matrix) % 1 == 0).all()),
+                "genes": genes,
+                "cells": cells,
+                "matrix": matrix
+            }
+            result["list_groups"].append(entry)
+        
         json_str = json.dumps(result, ensure_ascii=False)
-
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
         else:
             print(json_str)
 
+
 class LoomHandler:
-    @staticmethod
-    def decode_list(arr):
-        return [v.decode() if isinstance(v, bytes) else str(v) for v in arr]
-    
     @staticmethod
     def preparse(args, file_path):
         result = {
             "detected_format": FileType.LOOM,
-            "loom_version": "unknown",
-            "file_path": file_path, # If it was compressed, it should be decompressed before
+            "file_path": file_path,
             "list_groups": []
         }
-
+        
         with h5py.File(file_path, 'r') as f:
-            if '/matrix' in f:
-                shape = f['/matrix'].shape
-                nGenes, nCells = int(shape[0]), int(shape[1])
-
-                max_genes = min(10, nGenes)
-                max_cells = min(10, nCells)
-                
-                # Extract 10x10 matrix (Dense)
-                matrix = f['/matrix'][:max_genes, :max_cells].astype(float).tolist()
-
-                # Loom version
-                if '/attrs/LOOM_SPEC_VERSION' in f:
-                    ds = f['/attrs/LOOM_SPEC_VERSION']
-                    val = ds[()]  # read scalar dataset
-                    result["loom_version"] = val.decode() if isinstance(val, bytes) else str(val)
-                elif 'LOOM_SPEC_VERSION' in f.attrs: # e.g. 2.0.0
-                    version = f.attrs['LOOM_SPEC_VERSION']
-                    result["loom_version"] = version.decode() if isinstance(version, bytes) else str(version)
-                elif 'version' in f.attrs: # e.g. 0.2.0
-                    version = f.attrs['version']
-                    result["loom_version"] = version.decode() if isinstance(version, bytes) else str(version)
-                
-                # Load gene names
-                if '/row_attrs/Gene' in f:   
-                    genes = LoomHandler.decode_list(f['/row_attrs/Gene'][:max_genes])
-                elif '/row_attrs/Accession' in f:   
-                    genes = LoomHandler.decode_list(f['/row_attrs/Accession'][:max_genes])
-                elif '/row_attrs/id' in f: # Very old
-                    genes = LoomHandler.decode_list(f['/row_attrs/id'][:max_genes])
-                elif '/row_attrs/GeneName' in f: # Seen in few datasets
-                    genes = LoomHandler.decode_list(f['/row_attrs/GeneName'][:max_genes])
-                else:
-                    genes = [f"Gene_{i+1}" for i in range(max_genes)]
-                
-                # Load cell names
-                if '/col_attrs/CellID' in f:   
-                    cells = LoomHandler.decode_list(f['/col_attrs/CellID'][:max_cells])
-                elif '/col_attrs/id' in f:
-                    cells = LoomHandler.decode_list(f['/col_attrs/id'][:max_cells])
-                else:
-                    cells = [f"Cell_{i+1}" for i in range(max_cells)]
-  
-                entry = {
-                    "group": "/matrix",
-                    "nber_cols": nCells,
-                    "nber_rows": nGenes,
-                    "is_count": int((np.array(matrix) % 1 == 0).all()),
-                    "genes": genes,
-                    "cells": cells,
-                    "matrix": matrix
-                }
-                result["list_groups"].append(entry)
-
+            # Get dimensions
+            matrix_shape = f['matrix'].shape
+            nGenes, nCells = matrix_shape
+            
+            # Get gene and cell names
+            genes = [g.decode('utf-8') if isinstance(g, bytes) else str(g) 
+                    for g in f['row_attrs']['Gene'][:min(10, nGenes)]]
+            cells = [c.decode('utf-8') if isinstance(c, bytes) else str(c)
+                    for c in f['col_attrs']['CellID'][:min(10, nCells)]]
+            
+            # Extract 10x10 matrix
+            matrix = f['matrix'][:min(10, nGenes), :min(10, nCells)].tolist()
+            
+            entry = {
+                "group": "matrix",
+                "nber_cols": nCells,
+                "nber_rows": nGenes,
+                "is_count": int((np.array(matrix) % 1 == 0).all()),
+                "genes": genes,
+                "cells": cells,
+                "matrix": matrix
+            }
+            result["list_groups"].append(entry)
+        
         json_str = json.dumps(result, ensure_ascii=False)
-
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
         else:
             print(json_str)
+
 
 class RdsHandler:
     @staticmethod
     def preparse(args, file_path):
         result = {
-            "warnings": [],
             "detected_format": FileType.RDS,
-            "file_path": file_path, # Does not change for RDS files
-            "list_groups": []
+            "file_path": file_path,
+            "list_groups": [],
+            "warnings": []
         }
+
+        # Try to import rpy2
+        try:
+            import rpy2.robjects as ro
+            from rpy2.robjects.packages import importr
+        except ImportError:
+            ErrorJSON("rpy2 is not installed. Cannot read RDS files.")
         
-        # Import rpy2 for reading R objects in Python
-        import rpy2.rinterface_lib.callbacks
-        rpy2.rinterface_lib.callbacks.consolewrite_warnerror = lambda *args: None # Suppress console output from R
-        from rpy2.robjects.packages import importr
-        from rpy2.robjects import r
+        # Initialize R
+        r = ro.r
         
         # Import base package for reading RDS files
         base = importr('base')
@@ -624,7 +914,7 @@ class RdsHandler:
                     layers = [str(x) for x in layers_r]
                     if "counts" in layers:
                         # 10x10 matrix        
-                        matrix_r = r(f'function(obj) as(GetAssayData(obj, layer="counts", assay="{assay}")[1:10, 1:10], "matrix")')(obj) # This can throw a warning (I modified src or BPCells to avoid this)
+                        matrix_r = r(f'function(obj) as(GetAssayData(obj, layer="counts", assay="{assay}")[1:10, 1:10], "matrix")')(obj)
                         matrix = np.array(matrix_r).tolist()
                         
                         # Global dims
@@ -656,12 +946,12 @@ class RdsHandler:
             n_rows = len(df)
             entry = {
                 "group": "data_frame",
-                "nber_cols": nCells,
-                "nber_rows": nGenes,
-                "is_count": int((np.array(matrix) % 1 == 0).all()),
-                "genes": genes,
-                "cells": cells,
-                "matrix": matrix
+                "nber_cols": len(df.columns),
+                "nber_rows": n_rows,
+                "is_count": 0,
+                "genes": df.index[:10].tolist() if hasattr(df, 'index') else [f"Row_{i+1}" for i in range(10)],
+                "cells": df.columns[:10].tolist(),
+                "matrix": df.iloc[:10, :10].values.tolist()
             }
             result["list_groups"].append(entry)
         else:
@@ -699,24 +989,71 @@ class MtxHandler:
             "list_groups": []
         }
         
-        # Cell names
+        # Cell names - try to find barcodes file (TSV or CSV)
         cells = [f"Cell_{i+1}" for i in range(10)]
-        barcode_path = next((p for p in file_paths if Path(p).name == "barcodes.tsv"), None)
+        # Look for barcodes.tsv or barcodes.csv
+        barcode_path = next((p for p in file_paths if Path(p).name in ["barcodes.tsv", "barcodes.csv"]), None)
+        
         if barcode_path:
+            # Standard TSV format (one barcode per line)
             with open(barcode_path, "r") as f:
-                cells = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
+                lines = [line.strip() for _, line in zip(range(11), f)]  # Read 11 lines
+                
+                # Check if first line is a header (contains commas or many tabs suggesting metadata columns)
+                if lines and (',' in lines[0] or lines[0].count('\t') > 2):
+                    # Skip header row, extract first column from remaining lines
+                    cells = [line.split('\t')[0].split(',')[0].strip('"') for line in lines[1:] if line]
+                else:
+                    # No header, just barcode per line
+                    cells = [line.split('\t')[0] for line in lines if line]
+                
+                cells = cells[:10]  # Keep only first 10
+        else:
+            # Try CSV format with metadata (cell_metadata*.csv)
+            barcode_path = next((p for p in file_paths 
+                                if 'cell' in Path(p).name.lower() and 
+                                   'metadata' in Path(p).name.lower() and 
+                                   Path(p).suffix == '.csv'), None)
+            if barcode_path:
+                # CSV with metadata - extract first column (row names) or barcode column
+                import csv
+                with open(barcode_path, "r") as f:
+                    reader = csv.DictReader(f)
+                    cells = []
+                    for i, row in enumerate(reader):
+                        if i >= 10:
+                            break
+                        # Try barcode column first, then first column (row names)
+                        if 'barcode' in row:
+                            cells.append(row['barcode'])
+                        else:
+                            # First column is typically the row index/names
+                            cells.append(list(row.values())[0])
 
-        # Gene names
+        # Gene names - try TSV or CSV format
         genes = [f"Gene_{i+1}" for i in range(10)]
-        feature_path = next((p for p in file_paths if Path(p).name == "features.tsv"), None)
+        # Look for features.tsv, features.csv, genes.tsv, or genes.csv
+        feature_path = next((p for p in file_paths if Path(p).name in ["features.tsv", "features.csv"]), None)
         if not feature_path:
-            feature_path = next((p for p in file_paths if Path(p).name == "genes.tsv"), None)
+            feature_path = next((p for p in file_paths if Path(p).name in ["genes.tsv", "genes.csv"]), None)
+        if not feature_path:
+            # Try CSV format (gene_names*.csv)
+            feature_path = next((p for p in file_paths 
+                                if 'gene' in Path(p).name.lower() and 
+                                   Path(p).suffix == '.csv'), None)
+        
         if feature_path:
-            with open(feature_path, "r") as f:
-                genes = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
+            if feature_path.endswith('.tsv'):
+                # TSV format
+                with open(feature_path, "r") as f:
+                    genes = [line.strip().split('\t')[0] for _, line in zip(range(10), f)]
+            elif feature_path.endswith('.csv'):
+                # CSV format - one gene per line, no header
+                with open(feature_path, "r") as f:
+                    genes = [line.strip() for _, line in zip(range(10), f)]
         
         # MTX file
-        matrix_path = next((p for p in file_paths if Path(p).name not in {"barcodes.tsv", "features.tsv", "genes.tsv"}), None)
+        matrix_path = next((p for p in file_paths if Path(p).name not in {"barcodes.tsv", "barcodes.csv", "features.tsv", "features.csv", "genes.tsv", "genes.csv"}), None)
         if not matrix_path: # This should not happen
             ErrorJSON("No matrix found?")
 
@@ -921,3 +1258,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    

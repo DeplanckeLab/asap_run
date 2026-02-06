@@ -1007,10 +1007,252 @@ class RdsHandler:
         ErrorJSON("RdsHandler is not implemented yet")
 
 class MtxHandler:
+    """
+    Handler for Matrix Market (MTX) format files.
+    Expects either:
+    - A single matrix.mtx file, OR
+    - A triplet: matrix.mtx + barcodes.tsv + (features.tsv | genes.tsv)
+    """
+    @staticmethod
+    def _discover_mtx_files(matrix_path: str) -> tuple[str, str, str]:
+        """
+        Discover the MTX triplet files (matrix, barcodes, features).
+        """       
+        matrix_dir = Path(matrix_path).parent
+        
+        # Find barcodes file
+        barcode_candidates = ['barcodes.tsv', 'barcodes.csv']
+        barcodes_path = None
+        for name in barcode_candidates:
+            candidate = matrix_dir / name
+            if candidate.exists():
+                barcodes_path = str(candidate)
+                break
+                        
+        # Find features/genes file
+        feature_candidates = ['features.tsv', 'genes.tsv', 'features.csv', 'genes.csv', 'gene_names.csv', 'features.csv']
+        features_path = None
+        for name in feature_candidates:
+            candidate = matrix_dir / name
+            if candidate.exists():
+                features_path = str(candidate)
+                break
+        
+        return matrix_path, barcodes_path, features_path
+
+    @staticmethod
+    def _read_barcodes(file_path: str) -> list[str]:
+        """
+        Read cell barcodes from barcodes file.
+        Supports TSV (one barcode per line) and CSV (with optional headers).
+        """
+        import csv
+        
+        try:
+            if file_path.endswith('.tsv'):
+                with open(file_path, 'r') as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                    
+                    # Check if first line has multiple columns (likely a header)
+                    has_header = lines and lines[0].count('\t') > 0
+                    start_idx = 1 if has_header else 0
+                    
+                    # Extract first tab-delimited field from each line
+                    return [line.split('\t')[0].strip('"') for line in lines[start_idx:]]
+                    
+            elif file_path.endswith('.csv'):
+                with open(file_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    # Use 'barcode' column if it exists, otherwise use first column
+                    return [row.get('barcode', list(row.values())[0]) for row in reader]
+            else:
+                ErrorJSON(f"Unsupported barcode file format: {file_path}")
+                
+        except Exception as e:
+            ErrorJSON(f"Failed to read barcodes file {file_path}: {str(e)}")
+    
+    @staticmethod
+    def _read_features(file_path: str) -> tuple[list[str], list[str]]:
+        """
+        Read gene/feature information from features file.
+        Returns: (gene_ids, gene_names)
+        
+        Supports:
+        - features.tsv/genes.tsv: tab-separated (gene_id, gene_name, [feature_type])
+        - gene_names*.csv: one gene per line, no header
+        """
+        
+        try:
+            with open(file_path, 'r') as f:
+                if file_path.endswith('.tsv'):
+                    lines = [line.strip().split('\t') for line in f if line.strip()]
+                    gene_ids = [parts[0] for parts in lines if parts]
+                    gene_names = [parts[1] if len(parts) >= 2 else parts[0] for parts in lines if parts]
+                    return gene_ids, gene_names
+                elif file_path.endswith('.csv'):
+                    genes = [line.strip() for line in f if line.strip()]
+                    return genes, genes
+                else:
+                    ErrorJSON(f"Unsupported features file format: {file_path}")
+                    
+        except Exception as e:
+            ErrorJSON(f"Failed to read features file {file_path}: {str(e)}")
+    
+    @staticmethod
+    def _parse_mtx_header(matrix_path: str) -> tuple[int, int, int, bool]:
+        """
+        Parse MTX header to get dimensions and format.
+        Returns: (n_genes, n_cells, nnz, is_pattern)
+        """
+        is_pattern = False
+        n_genes = n_cells = nnz = -1
+        
+        try:
+            with open(matrix_path, 'r') as f:
+                # Read first line (format specification)
+                first_line = f.readline().strip()
+                if not first_line.startswith('%%MatrixMarket'):
+                    ErrorJSON(f"Invalid MTX file: missing MatrixMarket header in {matrix_path}")
+                
+                # Check if it's a pattern matrix (binary)
+                if 'pattern' in first_line.lower():
+                    is_pattern = True
+                
+                # Skip comment lines
+                for line in f:
+                    if line.startswith('%'):
+                        continue
+                    # Parse dimension line
+                    parts = line.strip().split()
+                    if len(parts) != 3:
+                        ErrorJSON(f"Invalid MTX dimension line in {matrix_path}: expected 3 values, got {len(parts)}")
+                    n_genes, n_cells, nnz = map(int, parts)
+                    break
+                else:
+                    ErrorJSON(f"MTX file {matrix_path} has no dimension line")
+        except Exception as e:
+            ErrorJSON(f"Failed to parse MTX header from {matrix_path}: {str(e)}")
+        
+        return n_genes, n_cells, nnz, is_pattern
+    
+    @staticmethod
+    def _create_mtx_block_reader(matrix_path: str, n_genes: int, n_cells: int, nnz: int, is_pattern: bool):
+        """
+        Create a block reader for MTX files.
+        Returns: get_block(start, end) -> scipy.sparse.csr_matrix (cells x genes)
+        
+        Strategy: Read entire MTX into memory as COO, convert to CSR, then slice by cells.
+        """
+        # Read all coordinate data
+        rows = np.zeros(nnz, dtype=np.int32)
+        cols = np.zeros(nnz, dtype=np.int32)
+        data = np.ones(nnz, dtype=DEFAULT_NP_DTYPE) if is_pattern else np.zeros(nnz, dtype=DEFAULT_NP_DTYPE)
+        
+        try:
+            with open(matrix_path, 'r') as f:
+                # Skip header and comments
+                for line in f:
+                    if not line.startswith('%'):
+                        break  # We've already read dimension line, skip it
+                
+                # Read data lines
+                idx = 0
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    
+                    if is_pattern:
+                        if len(parts) != 2:
+                            continue
+                        row, col = map(int, parts)
+                        val = 1.0
+                    else:
+                        if len(parts) != 3:
+                            continue
+                        row, col = map(int, parts[:2])
+                        val = float(parts[2])
+                    
+                    if idx >= nnz:
+                        break
+                    
+                    # MTX is 1-indexed, convert to 0-indexed
+                    rows[idx] = row - 1
+                    cols[idx] = col - 1
+                    data[idx] = val
+                    idx += 1
+        except Exception as e:
+            ErrorJSON(f"Failed to read MTX data from {matrix_path}: {str(e)}")
+        
+        # Create COO matrix (genes x cells)
+        coo = sp.coo_matrix((data, (rows, cols)), shape=(n_genes, n_cells), dtype=DEFAULT_NP_DTYPE)
+        
+        # Convert to CSC for efficient column slicing (cells are columns)
+        csc = coo.tocsc()
+        
+        def get_block(start: int, end: int):
+            """
+            Extract cells from start to end.
+            Returns: sparse CSR matrix of shape (cells x genes)
+            """
+            # Slice columns (cells) from CSC matrix -> still CSC with shape (genes, end-start)
+            block_csc = csc[:, start:end]
+            # Transpose to (cells x genes) and convert to CSR for efficient row operations
+            block_csr = block_csc.T.tocsr()
+            return block_csr
+        
+        return get_block
+    
     @staticmethod
     def parse(args, file_path: str, out_dir: Path, gene_db: MapGene, loom: LoomFile, result):
-        ErrorJSON("MtxHandler is not implemented yet")
-
+        """
+        Parse MTX format files.
+        """
+        # Discover the triplet files
+        matrix_path, barcodes_path, features_path = MtxHandler._discover_mtx_files(file_path)
+        
+        if matrix_path is None:
+            ErrorJSON("No matrix.mtx file found in input")
+        
+        result["input_group"] = Path(matrix_path).name
+        
+        # Parse MTX header
+        n_genes, n_cells, nnz, is_pattern = MtxHandler._parse_mtx_header(matrix_path)
+        result["nber_rows"] = n_genes
+        result["nber_cols"] = n_cells
+        
+        # Read cell barcodes
+        if barcodes_path:
+            cells = MtxHandler._read_barcodes(barcodes_path)
+            if len(cells) != n_cells:
+                ErrorJSON(f"Barcodes file has {len(cells)} entries but matrix has {n_cells} cells.")
+        else:
+            cells = [f"Cell_{i+1}" for i in range(n_cells)]
+        
+        # Read gene/feature information
+        if features_path:
+            gene_ids, gene_names = MtxHandler._read_features(features_path)
+            if len(gene_ids) != n_genes:
+                ErrorJSON(f"Features file has {len(gene_ids)} entries but matrix has {n_genes} genes.")
+        else:
+            gene_ids = [f"Gene_{i+1}" for i in range(n_genes)]
+            gene_names = [f"Gene_{i+1}" for i in range(n_genes)]
+        
+        # Validate uniqueness of gene IDs (gene names can legitimately be duplicated)
+        if len(set(gene_ids)) != len(gene_ids):
+            ErrorJSON("Gene IDs are not unique in features file")
+        if len(set(cells)) != len(cells):
+            ErrorJSON("Cell barcodes are not unique in barcodes file")
+        
+        # Write gene and cell names + Chr/Biotypes info from DB
+        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cells, original_gene_names=gene_ids, gene_db=gene_db, gene_db_queries=gene_ids, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+        
+        # Write expression matrix
+        get_block = MtxHandler._create_mtx_block_reader(matrix_path, n_genes, n_cells, nnz, is_pattern)
+        stats = loom.write_expression_matrix(get_block=get_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
+        
+        return stats
+    
 class TextHandler:
     @staticmethod
     def _decode_delim(delim: str) -> str:
