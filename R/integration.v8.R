@@ -41,12 +41,12 @@ output_convergence_plot <- args[5]
 #output_mapping_orig <- "/data/gardeux/mapping.orig.txt"
 
 # Test 2: 2 droso datasets, no metadata
-input_loom_path_list <- "/data/gardeux/output.1.loom,/data/gardeux/output.2.loom"
-input_batch_path_list <- "null,null"
-input_n_pcs <- 30
-output_convergence_plot <- "/data/gardeux/convergence.plot.png"
-output_rds_path <- "/data/gardeux/seurat.rds"
-output_mapping_orig <- "/data/gardeux/mapping.orig.txt"
+#input_loom_path_list <- "/data/gardeux/output.1.loom,/data/gardeux/output.2.loom"
+#input_batch_path_list <- "null,null"
+#input_n_pcs <- 30
+#output_convergence_plot <- "/data/gardeux/convergence.plot.png"
+#output_rds_path <- "/data/gardeux/seurat.rds"
+#output_mapping_orig <- "/data/gardeux/mapping.orig.txt"
 
 # Parameters
 set.seed(42)
