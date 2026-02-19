@@ -2,6 +2,7 @@
 ## Project: ASAP
 ## Script purpose: Integration
 ## Date: 2025-03-14
+## Updated: 2026-02-19
 ## Author: Vincent Gardeux (vincent.gardeux@epfl.ch)
 ##################################################
 
@@ -39,6 +40,14 @@ output_convergence_plot <- args[5]
 #output_rds_path <- "/data/gardeux/seurat.rds"
 #output_mapping_orig <- "/data/gardeux/mapping.orig.txt"
 
+# Test 2: 2 droso datasets, no metadata
+input_loom_path_list <- "/data/gardeux/output.1.loom,/data/gardeux/output.2.loom"
+input_batch_path_list <- "null,null"
+input_n_pcs <- 30
+output_convergence_plot <- "/data/gardeux/convergence.plot.png"
+output_rds_path <- "/data/gardeux/seurat.rds"
+output_mapping_orig <- "/data/gardeux/mapping.orig.txt"
+
 # Parameters
 set.seed(42)
 data.warnings <- NULL
@@ -53,6 +62,7 @@ if(length(input_loom_list) != length(input_batch_list)) error.json(paste0("Loom 
 
 # Load each Loom file and build corresponding Seurat object
 data.seurat.list <- list()
+common.genes <- c()
 for(i in 1:length(input_loom_list)){
   loom_path <- input_loom_list[i]
   batch_path <- input_batch_list[i]
@@ -60,28 +70,46 @@ for(i in 1:length(input_loom_list)){
   # Error case: Loom file does not exist
   if(!file.exists(loom_path)) error.json(paste0("This file: '", loom_path, "', does not exist!"))
   
-  # Open the existing Loom in read-only mode and recuperate the infos (not optimized for OUT-OF-RAM computation)
+  # Open the existing Loom in read-only mode and recuperate the info (not optimized for OUT-OF-RAM computation)
   data.loom <- open_with_lock(loom_path, "r")
   data.matrix <- fetch_dataset(data.loom, "/matrix", transpose = T)
+  data.genes <- fetch_dataset(data.loom, "/row_attrs/Accession", transpose = F)
+  data.cols <- fetch_dataset(data.loom, "/col_attrs/CellID", transpose = F)
   data.batch <- fetch_dataset(data.loom, batch_path, transpose = T)
   close_all()
+  
+  # Keep rows where gene is not __unknown and not a duplicate
+  keep <- data.genes != "__unknown" & !duplicated(data.genes)
+  data.matrix <- data.matrix[keep, ]
+  data.genes <- data.genes[keep]
+  
+  # Find common genes
+  common.genes
+  
+  # Assign gene/cell names
+  colnames(data.matrix) <- data.cols
+  rownames(data.matrix) <- data.genes
   
   # Error case: Path in Loom file does not exist
   if(is.null(data.matrix)) error.json(paste0("This file: '", loom_path, "', does not contain any dataset at path '", "/matrix", "'!"))
   if(is.null(data.batch) && batch_path != "null") error.json(paste0("This file: '", loom_path, "', does not contain any dataset at path '", batch_path, "'!"))
   
   # Creating Seurat object
-  data.seurat.list[[i]] <- CreateSeuratObject(counts = data.matrix, min.cells = 0, min.features = 0) # Create our Seurat object using our data matrix (no filtering)
+  data.seurat <- CreateSeuratObject(counts = as(as.matrix(data.matrix), "dgCMatrix"), min.cells = 0, min.features = 0) # Create our Seurat object using our data matrix (no filtering)
   if(is.null(data.batch)) { 
-    data.seurat.list[[i]]$orig.ident <- paste0("ASAP_C_", i) # Created 
+    data.seurat$orig.ident <- paste0("ASAP_C_", i) # Created 
   } else {
-    data.seurat.list[[i]]$orig.ident <- paste0("ASAP_I_", data.batch) # Imported. To avoid duplicate batch names from different datasets.
+    data.seurat$orig.ident <- paste0("ASAP_I_", data.batch) # Imported. To avoid duplicate batch names from different datasets.
   }
-  data.seurat.list[[i]] <- RenameCells(data.seurat.list[[i]], new.names = paste0(colnames(data.seurat.list[[i]]), "_", data.seurat.list[[i]]$orig.ident))
+  data.seurat <- RenameCells(data.seurat, new.names = paste0(colnames(data.seurat), "_", data.seurat$orig.ident))
+  data.seurat.list[[i]] <- data.seurat
   
   # Update mapping orig / original loom file
-  output_orig_mapping[[loom_path]] <- unique(data.seurat.list[[i]]$orig.ident)
+  output_orig_mapping[[loom_path]] <- unique(data.seurat$orig.ident)
 }
+
+# Restrict/arrange the objects to have matching genes
+# Should I do this with Seurat v5?
 
 # Merge the seurat objects (if needed)
 if(length(data.seurat.list) > 1){
