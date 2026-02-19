@@ -749,29 +749,72 @@ class H510xHandler:
 class H5ADHandler:
     @staticmethod
     def get_size(f, path):
-        # Get matrix dimensions
         shape = f[path].attrs.get('shape', None)
         if shape is None:
             shape = f[path].attrs.get('h5sparse_shape', None)
-        if shape is None: # Dense matrix?
-            shape = f[path].shape  # fallback: dense matrix or explicitly stored shape
+        if shape is None:
+            shape = f[path].shape
         return tuple(int(x) for x in shape)
-    
+
     @staticmethod
-    def extract_index(f, path):
-        # Read gene names
-        if '_index' in f[path]:
-            # AnnData >= 0.7 style
-            # The index is typically stored in obs/_index or var/_index as a dataset
-            idx_data = f[path]['_index'][:]
-            if isinstance(idx_data[0], bytes):
-                return [x.decode('utf-8') for x in idx_data[:10]]
+    def extract_index(f, path, orientation="Item", n=10):
+        if path not in f:
+            return [f"{orientation}_{i+1}" for i in range(n)]
+        grp = f[path]
+        try:
+            # _index is an ATTRIBUTE naming which dataset holds the index
+            if '_index' in grp.attrs:
+                idx_col = grp.attrs['_index']
+                idx_data = grp[idx_col][:]
+            elif '_index' in grp:
+                # fallback: stored as a dataset directly
+                idx_data = grp['_index'][:]
             else:
-                return idx_data[:10].tolist()
+                return [f"{orientation}_{i+1}" for i in range(n)]
+            if len(idx_data) > 0 and isinstance(idx_data[0], (bytes, np.bytes_)):
+                return [x.decode('utf-8') for x in idx_data[:n]]
+            return [str(x) for x in idx_data[:n]]
+        except Exception:
+            return [f"{orientation}_{i+1}" for i in range(n)]
+
+    @staticmethod
+    def extract_matrix(f, path, nCells, nGenes, n=10):
+        """Extract top-left n x n submatrix from a sparse or dense dataset."""
+        nr, nc = min(n, nCells), min(n, nGenes)
+        grp = f[path]
+        encoding = grp.attrs.get('encoding-type', '')
+        matrix = [[0.0] * nc for _ in range(nr)]
+
+        if isinstance(grp, h5py.Dataset):
+            # Dense
+            matrix = grp[:nr, :nc].tolist()
+        elif 'data' in grp and 'indices' in grp and 'indptr' in grp:
+            if 'csc' in encoding:
+                # CSC: columns are compressed
+                indptr = grp['indptr'][:nc + 1]
+                data = grp['data'][:int(indptr[-1])]
+                indices = grp['indices'][:int(indptr[-1])]
+                for col in range(nc):
+                    start, end = int(indptr[col]), int(indptr[col + 1])
+                    for k in range(start, end):
+                        row = int(indices[k])
+                        if row < nr:
+                            matrix[row][col] = float(data[k])
+            else:
+                # CSR (default)
+                indptr = grp['indptr'][:nr + 1]
+                data = grp['data'][:int(indptr[-1])]
+                indices = grp['indices'][:int(indptr[-1])]
+                for row in range(nr):
+                    start, end = int(indptr[row]), int(indptr[row + 1])
+                    for k in range(start, end):
+                        col = int(indices[k])
+                        if col < nc:
+                            matrix[row][col] = float(data[k])
         else:
-            # Older style or fallback
-            return [f"Item_{i+1}" for i in range(10)]
-    
+            raise ValueError(f"Unrecognized matrix format at {path}")
+        return matrix
+
     @staticmethod
     def preparse(args, file_path):
         result = {
@@ -779,44 +822,65 @@ class H5ADHandler:
             "file_path": file_path,
             "list_groups": []
         }
-        
+
         with h5py.File(file_path, 'r') as f:
-            # Get dimensions
-            nGenes, nCells = H5ADHandler.get_size(f, 'X')
-            
-            # Get gene and cell names
-            genes = H5ADHandler.extract_index(f, 'var')
-            cells = H5ADHandler.extract_index(f, 'obs')
-            
-            # Extract 10x10 matrix
-            x_group = f['X']
-            if 'data' in x_group and 'indices' in x_group and 'indptr' in x_group:
-                # Sparse CSR format
-                indptr = x_group['indptr'][:min(10, nCells) + 1]
-                data = x_group['data'][:indptr[-1]]
-                indices = x_group['indices'][:indptr[-1]]
-                matrix = [[0 for _ in range(min(10, nGenes))] for _ in range(min(10, nCells))]
-                for row in range(min(10, nCells)):
-                    start, end = indptr[row], indptr[row+1]
-                    for idx_pos in range(start, end):
-                        col = indices[idx_pos]
-                        if col < min(10, nGenes):
-                            matrix[row][col] = float(data[idx_pos])
-            else:
-                # Dense format
-                matrix = x_group[:min(10, nCells), :min(10, nGenes)].tolist()
-            
-            entry = {
-                "group": "X",
-                "nber_cols": nCells,
-                "nber_rows": nGenes,
-                "is_count": int((np.array(matrix) % 1 == 0).all()),
-                "genes": genes,
-                "cells": cells,
-                "matrix": matrix
-            }
-            result["list_groups"].append(entry)
-        
+            # X shape is (n_cells, n_genes)
+            nCells, nGenes = H5ADHandler.get_size(f, 'X')
+
+            genes = H5ADHandler.extract_index(f, 'var', orientation='Gene')
+            cells = H5ADHandler.extract_index(f, 'obs', orientation='Cell')
+
+            # Collect all matrix paths to report
+            matrix_paths = []
+
+            if 'X' in f:
+                matrix_paths.append(('X', 'X', nCells, nGenes))
+
+            if 'raw' in f:
+                raw_grp = f['raw']
+                # raw/X uses raw's own var (may differ in gene count)
+                raw_nGenes = nGenes
+                if 'var' in raw_grp:
+                    # raw can have more genes than filtered X
+                    raw_var_size = raw_grp['var'][list(raw_grp['var'].keys())[0]].shape[0] if raw_grp['var'].keys() else nGenes
+                    raw_nGenes = raw_var_size
+                if 'X' in raw_grp:
+                    raw_nCells, raw_nGenes = H5ADHandler.get_size(f, 'raw/X')
+                    matrix_paths.append(('raw/X', 'raw/X', raw_nCells, raw_nGenes))
+
+            if 'layers' in f:
+                for layer_name in f['layers']:
+                    layer_path = f'layers/{layer_name}'
+                    lCells, lGenes = H5ADHandler.get_size(f, layer_path)
+                    matrix_paths.append((layer_name, layer_path, lCells, lGenes))
+
+            for group_label, path, nC, nG in matrix_paths:
+                # For raw, genes may differ — re-extract from raw/var
+                if path.startswith('raw/'):
+                    g = H5ADHandler.extract_index(f, 'raw/var', orientation='Gene')
+                    c = cells
+                else:
+                    g, c = genes, cells
+
+                try:
+                    matrix = H5ADHandler.extract_matrix(f, path, nC, nG)
+                    arr = np.array(matrix)
+                    is_count = int((arr % 1 == 0).all())
+                except Exception as e:
+                    matrix = []
+                    is_count = -1
+
+                entry = {
+                    "group": group_label,
+                    "nber_cols": nC,   # cells
+                    "nber_rows": nG,   # genes
+                    "is_count": is_count,
+                    "genes": g,
+                    "cells": c,
+                    "matrix": matrix
+                }
+                result["list_groups"].append(entry)
+
         json_str = json.dumps(result, ensure_ascii=False)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
