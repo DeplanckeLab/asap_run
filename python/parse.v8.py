@@ -594,7 +594,7 @@ class H5ADHandler:
             stats = loom.write_expression_matrix(get_block=block_reader, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
 
             ## Transfer Metadata
-            existing_paths = ({m.name for m in result["metadata"]} | LoomFile._reserved_paths())
+            existing_paths = (input_group | {m.name for m in result["metadata"]} | LoomFile._reserved_paths())
             
             # Transfer OBS (Cells)
             H5ADHandler._transfer_metadata(f, obs_path, loom, result, n_cells, n_genes, "CELL", existing_paths)
