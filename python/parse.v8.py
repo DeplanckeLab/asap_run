@@ -151,6 +151,17 @@ class H5ADHandler:
         return None
 
     @staticmethod
+    def _decode_enum_if_needed(item: h5py.Dataset) -> np.ndarray | None:
+        """If dataset is H5T_ENUM, decode integer codes to string labels. Returns None if not enum."""
+        enum_dict = h5py.check_enum_dtype(item.dtype)
+        if enum_dict is None:
+            return None
+        # Invert {label: code} -> {code: label}
+        code_to_label = {v: k for k, v in enum_dict.items()}
+        codes = item[:]
+        return np.array([code_to_label.get(int(c), "nan") for c in codes.flat], dtype=object).reshape(codes.shape)
+    
+    @staticmethod
     def _detect_sparse_encoding(node: h5py.Group, n_cells: int, n_genes: int) -> str:
         enc = node.attrs.get("encoding-type", None)
         if isinstance(enc, bytes): enc = enc.decode()
@@ -277,11 +288,15 @@ class H5ADHandler:
                         values = item[:]
                 
                 else:
-                    raw_values = item[:]
-                    if raw_values.dtype.kind in ('S', 'U', 'O'):
-                        values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values], dtype=object)
+                    decoded = _decode_enum_if_needed(item)
+                    if decoded is not None:
+                        values = decoded
                     else:
-                        values = raw_values
+                        raw_values = item[:]
+                        if raw_values.dtype.kind in ('S', 'U', 'O'):
+                            values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values], dtype=object)
+                        else:
+                            values = raw_values
             
             # ---- CASE 2: Compound dataset ----
             else:
@@ -479,7 +494,11 @@ class H5ADHandler:
                     continue
                 
                 try:
-                    val = item[()]
+                    decoded = _decode_enum_if_needed(item)
+                    if decoded is not None:
+                        val = decoded
+                    else:
+                        val = item[()]
                     if isinstance(val, (bytes, np.bytes_)):
                         val = val.decode("utf-8")
                     elif isinstance(val, np.ndarray) and val.dtype.kind in ("S", "U"):
