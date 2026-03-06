@@ -494,7 +494,7 @@ class H5ADHandler:
                     continue
                 
                 try:
-                    decoded = _decode_enum_if_needed(item)
+                    decoded = H5ADHandler._decode_enum_if_needed(item)
                     if decoded is not None:
                         val = decoded
                     else:
