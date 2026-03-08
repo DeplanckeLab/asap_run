@@ -53,9 +53,36 @@ rm(data.loom)
 ### Normalize the raw matrix
 data.seurat <- NormalizeData(data.seurat, normalization.method = "LogNormalize", scale.factor = 10000, verbose = F)
 
+# Extract normalized matrix in a Seurat-version-compatible way.
+# Seurat v5 stores normalized values in Assay5 layers (not @data slot).
+get_normalized_matrix <- function(seurat_obj, assay_name = "RNA") {
+  if(is.null(seurat_obj@assays[[assay_name]])) {
+    error.json(paste0("Assay '", assay_name, "' not found in Seurat object"))
+  }
+  assay_obj <- seurat_obj@assays[[assay_name]]
+
+  if(inherits(assay_obj, "Assay5")) {
+    if(!exists("LayerData", mode = "function")) {
+      error.json("Seurat Assay5 detected but LayerData() is not available")
+    }
+    norm <- LayerData(object = seurat_obj, assay = assay_name, layer = "data")
+    if(is.null(norm)) {
+      error.json("Normalized data layer 'data' is missing in Assay5 object")
+    }
+    return(as.matrix(norm))
+  }
+
+  if("data" %in% slotNames(assay_obj)) {
+    return(as.matrix(assay_obj@data))
+  }
+
+  error.json(paste0("Unsupported assay class for normalization output: ", class(assay_obj)[1]))
+}
+
 # Writing the dataset in the loom file
 data.loom <- open_with_lock(input_loom, "r+")
-add_matrix_dataset(handle = data.loom, dataset_path = output_dataset_path, dataset_object = t(as.matrix(data.seurat@assays$RNA@data)))
+normalized_matrix <- get_normalized_matrix(data.seurat, assay_name = "RNA")
+add_matrix_dataset(handle = data.loom, dataset_path = output_dataset_path, dataset_object = t(normalized_matrix))
 datasetSize <- get_dataset_size(data.loom, output_dataset_path)
 close_all()
 
