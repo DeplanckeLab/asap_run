@@ -726,10 +726,10 @@ class H510xHandler:
                   
                     # Valid group
                     entry = {
-                        "group":    group_name,
+                        "group": f'/{group_name}',
                         "nber_cols": nCells,
                         "nber_rows": nGenes,
-                        "is_count":  int((np.array(matrix) % 1 == 0).all()),
+                        "is_count": int((np.array(matrix) % 1 == 0).all()),
                         "genes": genes,
                         "cells": [b.decode() for b in grp["barcodes"][:min(10,nCells)]],
                         "matrix": matrix
@@ -825,18 +825,18 @@ class H5ADHandler:
 
         with h5py.File(file_path, 'r') as f:
             # X shape is (n_cells, n_genes)
-            nCells, nGenes = H5ADHandler.get_size(f, 'X')
+            nCells, nGenes = H5ADHandler.get_size(f, '/X')
 
-            genes = H5ADHandler.extract_index(f, 'var', orientation='Gene')
-            cells = H5ADHandler.extract_index(f, 'obs', orientation='Cell')
+            genes = H5ADHandler.extract_index(f, '/var', orientation='Gene')
+            cells = H5ADHandler.extract_index(f, '/obs', orientation='Cell')
 
             # Collect all matrix paths to report
             matrix_paths = []
 
-            if 'X' in f:
-                matrix_paths.append(('X', 'X', nCells, nGenes))
+            if '/X' in f:
+                matrix_paths.append(('/X', nCells, nGenes))
 
-            if 'raw' in f:
+            if '/raw' in f:
                 raw_grp = f['raw']
                 # raw/X uses raw's own var (may differ in gene count)
                 raw_nGenes = nGenes
@@ -845,18 +845,18 @@ class H5ADHandler:
                     raw_var_size = raw_grp['var'][list(raw_grp['var'].keys())[0]].shape[0] if raw_grp['var'].keys() else nGenes
                     raw_nGenes = raw_var_size
                 if 'X' in raw_grp:
-                    raw_nCells, raw_nGenes = H5ADHandler.get_size(f, 'raw/X')
-                    matrix_paths.append(('raw/X', 'raw/X', raw_nCells, raw_nGenes))
+                    raw_nCells, raw_nGenes = H5ADHandler.get_size(f, '/raw/X')
+                    matrix_paths.append(('/raw/X', raw_nCells, raw_nGenes))
 
-            if 'layers' in f:
-                for layer_name in f['layers']:
-                    layer_path = f'layers/{layer_name}'
+            if '/layers' in f:
+                for layer_name in f['/layers']:
+                    layer_path = f'/layers/{layer_name}'
                     lCells, lGenes = H5ADHandler.get_size(f, layer_path)
-                    matrix_paths.append((layer_name, layer_path, lCells, lGenes))
+                    matrix_paths.append((layer_path, lCells, lGenes))
 
-            for group_label, path, nC, nG in matrix_paths:
+            for path, nC, nG in matrix_paths:
                 # For raw, genes may differ — re-extract from raw/var
-                if path.startswith('raw/'):
+                if path.startswith('/raw/'):
                     g = H5ADHandler.extract_index(f, 'raw/var', orientation='Gene')
                     c = cells
                 else:
@@ -871,7 +871,7 @@ class H5ADHandler:
                     is_count = -1
 
                 entry = {
-                    "group": group_label,
+                    "group": path,
                     "nber_cols": nC,   # cells
                     "nber_rows": nG,   # genes
                     "is_count": is_count,
@@ -899,7 +899,7 @@ class LoomHandler:
         
         with h5py.File(file_path, 'r') as f:
             # Get dimensions
-            matrix_shape = f['matrix'].shape
+            matrix_shape = f['/matrix'].shape
             nGenes, nCells = matrix_shape
             
             # Get gene and cell names
@@ -909,10 +909,10 @@ class LoomHandler:
                     for c in f['col_attrs']['CellID'][:min(10, nCells)]]
             
             # Extract 10x10 matrix
-            matrix = f['matrix'][:min(10, nGenes), :min(10, nCells)].tolist()
+            matrix = f['/matrix'][:min(10, nGenes), :min(10, nCells)].tolist()
             
             entry = {
-                "group": "matrix",
+                "group": "/matrix",
                 "nber_cols": nCells,
                 "nber_rows": nGenes,
                 "is_count": int((np.array(matrix) % 1 == 0).all()),
@@ -1251,7 +1251,7 @@ class TextHandler:
             is_count = int((np.array(matrix) % 1 == 0).all())
 
         entry = {
-            "group": "text_file",
+            "group": Path(file_path).name,
             "nber_cols": int(matrix.shape[1]),
             "nber_rows": int(nGenes),
             "is_count": is_count,
