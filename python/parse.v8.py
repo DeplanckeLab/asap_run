@@ -285,16 +285,25 @@ class H5ADHandler:
                             return cats[c] if 0 <= c < len(cats) else "nan"
                         values = np.array([map_code(c) for c in codes], dtype=object)
                     else:
-                        values = item[:]
+                        # H5T_ENUM datasets have integer backing dtype and are caught by the
+                        # branch above, so _decode_enum_if_needed must be tried here before
+                        # falling back to raw integers (e.g. AnnData boolean columns).
+                        decoded = H5ADHandler._decode_enum_if_needed(item)
+                        if decoded is not None:
+                            values = np.array([str(v) for v in decoded.flat], dtype=object).reshape(decoded.shape)
+                        else:
+                            values = item[:]
                 
                 else:
                     decoded = H5ADHandler._decode_enum_if_needed(item)
                     if decoded is not None:
-                        values = decoded
+                        values = np.array([str(v) for v in decoded.flat], dtype=object).reshape(decoded.shape)
                     else:
                         raw_values = item[:]
                         if raw_values.dtype.kind in ('S', 'U', 'O'):
                             values = np.array([v.decode() if isinstance(v, bytes) else str(v) for v in raw_values], dtype=object)
+                        elif raw_values.dtype.kind == 'b':  # plain boolean -> string
+                            values = np.array([str(bool(v)) for v in raw_values], dtype=object)
                         else:
                             values = raw_values
             
@@ -303,7 +312,8 @@ class H5ADHandler:
                 raw_values = node[col]
                 
                 # If integer codes and categories exist, decode them
-                if np.issubdtype(np.array(raw_values).dtype, np.integer):
+                raw_arr = np.asarray(raw_values)
+                if np.issubdtype(raw_arr.dtype, np.integer):
                     cats = H5ADHandler._find_categories_for_column(f, group_path, col)
                     if cats is not None:
                         def map_code(c):
@@ -312,12 +322,15 @@ class H5ADHandler:
                             return cats[c] if 0 <= c < len(cats) else "nan"
                         values = np.array([map_code(c) for c in raw_values], dtype=object)
                     else:
-                        values = raw_values
+                        # Compound field values lose H5T_ENUM metadata after field extraction,
+                        # so emit as plain integers.
+                        values = raw_arr
+                elif raw_arr.dtype.kind in ('S', 'U', 'O'):
+                    values = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in raw_arr], dtype=object)
+                elif raw_arr.dtype.kind == 'b':  # plain boolean -> string
+                    values = np.array([str(bool(v)) for v in raw_arr], dtype=object)
                 else:
-                    if np.array(raw_values).dtype.kind in ('S', 'U', 'O'):
-                        values = np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in raw_values], dtype=object)
-                    else:
-                        values = raw_values
+                    values = raw_arr
             
             if values is None:
                 continue
