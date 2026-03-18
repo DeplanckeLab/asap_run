@@ -2399,7 +2399,7 @@ class MapGene:
 
 # Dispatch table to run appropriate parsing function depending on filetype
 dispatch = {
-    'H5_10X': H510xHandler.parse,
+    'H5_10x': H510xHandler.parse,
     'H5AD': H5ADHandler.parse,
     'LOOM': LoomHandler.parse,
     'RDS': RdsHandler.parse,
@@ -2534,7 +2534,7 @@ def main():
     parser = argparse.ArgumentParser(description='Parsing Mode Script', add_help=False)
     parser.add_argument('-f', metavar='File to parse', required=True)
     parser.add_argument('-o', metavar='Output folder', required=False)
-    parser.add_argument('--filetype', metavar='File type', choices=['H5_10X', 'H5AD', 'LOOM', 'RDS', 'MTX', 'RAW_TEXT'], required=True)
+    parser.add_argument('--filetype', metavar='File type', choices=['H5_10x', 'H5AD', 'LOOM', 'RDS', 'MTX', 'RAW_TEXT'], required=True)
     parser.add_argument('--header', metavar='[RAW_TEXT] Is there a header', choices=['true', 'false'], default='true', required=False)
     parser.add_argument('--col', metavar='[RAW_TEXT] Which column contains row names', choices=['none', 'first', 'last'], default='first', required=False)
     parser.add_argument('--sel', metavar='In case of multiple matrices, which one to use', default=None, required=False)

@@ -24,7 +24,7 @@ Options:
 #  --metadata        Export metadata fields (absent: false). Only working with certain formats.
 
 class FileType:
-    H5_10X = 'H5_10X'
+    H5_10x = 'H5_10x'
     H5AD = 'H5AD'
     LOOM = 'LOOM'
     RDS = 'RDS'
@@ -611,7 +611,7 @@ def check_file_type(file_path):
             root_groups = [key for key in f.keys() if isinstance(f[key], h5py.Group)]
             for group_name in root_groups:
                 if {'barcodes', 'data', 'indices', 'indptr', 'shape'}.issubset(f[group_name].keys()):
-                    return FileType.H5_10X
+                    return FileType.H5_10x
             
             # Loom format detection
             if {'matrix', 'row_attrs', 'col_attrs'}.issubset(f.keys()):
@@ -665,7 +665,7 @@ def preparse(args):
             # Detect file type from magic bytes or hdf5 reader
             file_type = check_file_type(file_path)
             # Call appropriate handler
-            if file_type == FileType.H5_10X:
+            if file_type == FileType.H5_10x:
                 H510xHandler.preparse(args, file_path)
             elif file_type == FileType.H5AD:
                 H5ADHandler.preparse(args, file_path)
@@ -691,7 +691,7 @@ class H510xHandler:
     def preparse(args, file_path):
         # build the JSON-able structure
         result = {
-            "detected_format": FileType.H5_10X,
+            "detected_format": FileType.H5_10x,
             "file_path": file_path, # If it was compressed, it should be decompressed before
             "list_groups": []
         }
