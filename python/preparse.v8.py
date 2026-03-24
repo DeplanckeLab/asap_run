@@ -595,6 +595,17 @@ def decompress_if_needed(file_path, sel, original_input=None):
                 # Already uncompressed tar
                 return file_paths, file_path
 
+    # File has a compression-like extension but magic bytes didn't match any known
+    # compressed format. Strip the extension so downstream tools (e.g. pandas)
+    # don't try to decompress a plain file.
+    p = Path(file_path)
+    if p.suffix in {'.gz', '.bz2', '.xz'}:
+        new_path = p.with_suffix('')
+        if str(new_path) == str(p):  # edge-case: no stem change
+            new_path = p.with_name(p.stem + '.out')
+        shutil.copy2(str(p), str(new_path))
+        return decompress_if_needed(str(new_path), sel, original_input)
+
     # Uncompressed single file
     return [file_path], None
 
@@ -1318,4 +1329,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
