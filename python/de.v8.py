@@ -579,6 +579,23 @@ def run(args: argparse.Namespace) -> None:
     write_loom_dataset(loom_path, args.output_dataset, data_out)
     print(f"DE results written to: {args.output_dataset}")
 
+    # ── Write DE results to TSV ────────────────────────────────────────────
+    out_tsv = os.path.join(output_dir, "output.tsv")
+    with open(out_tsv, "w", encoding="utf-8") as fh:
+        fh.write("\t".join(["ensembl_id", "gene_name"] + DE_HEADERS) + "\n")
+        for i in range(n_genes):
+            row = [
+                ens_ids[i],
+                gene_names[i],
+                f"{out_lfc[i]}"   if not np.isnan(out_lfc[i])   else "NA",
+                f"{out_pvals[i]}" if not np.isnan(out_pvals[i]) else "NA",
+                f"{out_fdr[i]}"   if not np.isnan(out_fdr[i])   else "NA",
+                f"{ave_g1[i]}",
+                f"{ave_g2[i]}",
+            ]
+            fh.write("\t".join(row) + "\n")
+    print(f"TSV written to: {out_tsv}")
+
     # ── Volcano plot ───────────────────────────────────────────────────────
     if compute_FC:
         write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
