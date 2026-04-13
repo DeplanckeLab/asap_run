@@ -6,4 +6,8 @@ build.log
 
 R/normalization.asap.3.R.bkp
 
+# Ignore temporary notebooks
 .ipynb_checkpoints
+
+# Ignore all compiled Java classes
+java/bin

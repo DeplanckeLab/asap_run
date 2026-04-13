@@ -5,6 +5,7 @@ import argparse        # Argument parsing
 import json            # For writing output files
 import os              # For path/directory operations
 import sys             # For ErrorJSON exit
+import time            # For retry sleep
 import warnings        # For non-fatal warnings
 from pathlib import Path  # For path manipulation
 from typing import Final
@@ -13,11 +14,11 @@ from typing import Final
 import h5py            # For reading/writing loom (HDF5) files
 import numpy as np     # For array calculations
 import scipy.sparse as sp  # For sparse matrix handling
+import pandas as pd # For matrix computation
 
 ## DE / stats (scanpy, anndata, statsmodels, pydeseq2 imported lazily where needed)
-# scanpy, anndata  → run_scanpy_method()
-# pydeseq2         → run_deseq2()
-# statsmodels      → bh_fdr()
+# scanpy, anndata  → run_scanpy_method() / run_scanpy_all_markers()
+# pydeseq2         → run_deseq2() / run_deseq2_all_markers()
 
 ## Constants
 AVAILABLE_METHODS: Final[list] = [
@@ -29,45 +30,98 @@ AVAILABLE_METHODS: Final[list] = [
 ]
 COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
 BATCH_SUPPORT:      Final[set] = {"deseq2"}
-
-DE_HEADERS: Final[list] = [
-    "log Fold-Change",
-    "p-value",
-    "FDR",
-    "Avg. Exp. Group 1",
-    "Avg. Exp. Group 2",
-]
-
+DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2"]
 DE_NB_COLS: Final[int] = 5  # Number of DE output columns stored per gene
 
-
 ## Error handling
-
 class ErrorJSON(Exception):
     """
     Prints a JSON error payload to stdout and exits immediately.
-    Mirrors error.json() from de.R.
     """
     def __init__(self, message: str):
         super().__init__(message)
         print(json.dumps({"displayed_error": message}, ensure_ascii=False))
-        sys.exit(1)
+        os._exit(1)
 
+## Loom File I/O class
+class LoomHandler:
+    """
+    Wraps h5py access to a loom (HDF5) file with:
+      - persistent open/close lifecycle (avoids reopening for every operation)
+      - automatic retry on locked file (up to MAX_RETRIES attempts, RETRY_DELAY s apart)
+      - clear ErrorJSON on file-not-found or unrecoverable I/O errors
+      - context-manager support (with LoomHandler(...) as loom:)
+    """
 
-## Loom I/O helpers
+    MAX_RETRIES: int   = 50  # Maximum number of open attempts when file is locked
+    RETRY_DELAY: float = 2.0  # Seconds to wait between retry attempts
 
-def _decode_str_array(arr: np.ndarray) -> np.ndarray:
-    """Decode a bytes/object array to a plain Python-str array."""
-    if arr.dtype.kind in ("S", "O"):
-        return np.array(
-            [v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in arr]
-        )
-    return arr.astype(str)
+    def __init__(self, loom_path: str, mode: str = "r"):
+        """
+        Parameters
+        ----------
+        loom_path : str
+            Path to the .loom (HDF5) file.
+        mode : str
+            h5py open mode. Use "r" for read-only (default), "r+" for read-write.
+        """
+        self._path  = loom_path
+        self._mode  = mode
+        self._file: h5py.File | None = None
 
+    def open(self) -> None:
+        """
+        Open the loom file, retrying on BlockingIOError (file locked by another process).
+        Raises ErrorJSON immediately on file-not-found or any other OSError.
+        """
+        if not Path(self._path).is_file():
+            ErrorJSON(f"Loom file not found: {self._path}")
 
-def read_loom_vector(loom_path: str, dataset_path: str) -> np.ndarray | None:
-    """Read a 1-D dataset from a loom file. Returns None if the path is absent."""
-    with h5py.File(loom_path, "r") as f:
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                self._file = h5py.File(self._path, self._mode)
+                return
+            except BlockingIOError:
+                # File is locked — wait and retry
+                if attempt == self.MAX_RETRIES:
+                    ErrorJSON(f"Loom file is still locked after {self.MAX_RETRIES} attempts: {self._path}")
+                warnings.warn(f"Loom file locked (attempt {attempt}/{self.MAX_RETRIES}), retrying in {self.RETRY_DELAY:.0f}s ...")
+                time.sleep(self.RETRY_DELAY)
+            except OSError as exc:
+                ErrorJSON(f"Cannot open loom file {self._path!r}: {exc}")
+
+    def close(self) -> None:
+        """Close the loom file if it is currently open."""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def __enter__(self) -> "LoomHandler":
+        self.open()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
+
+    def _require_open(self) -> h5py.File:
+        """Return the open file handle, or raise if the file has not been opened."""
+        if self._file is None:
+            raise RuntimeError("LoomHandler: file is not open — call open() first.")
+        return self._file
+
+    @staticmethod
+    def _decode_str_array(arr: np.ndarray) -> np.ndarray:
+        """Decode a bytes/object array to a plain Python-str array."""
+        if arr.dtype.kind in ("S", "O"):
+            return np.array([v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v) for v in arr])
+        return arr.astype(str)
+
+    def read_vector(self, dataset_path: str) -> np.ndarray | None:
+        """
+        Read a 1-D dataset from the open loom file.
+        Returns None if the path is absent or does not point to a Dataset.
+        """
+        f = self._require_open()
         if dataset_path not in f:
             return None
         node = f[dataset_path]
@@ -75,22 +129,19 @@ def read_loom_vector(loom_path: str, dataset_path: str) -> np.ndarray | None:
             return None
         return node[:]
 
-
-def read_loom_matrix(loom_path: str, dataset_path: str) -> np.ndarray | None:
-    """
-    Read an expression matrix from a loom file.
-    Returns a dense float64 array of shape (n_genes, n_cells), or None if absent.
-    Handles dense datasets and CSR/CSC sparse groups.
-    """
-    with h5py.File(loom_path, "r") as f:
+    def read_matrix(self, dataset_path: str) -> np.ndarray | None:
+        """
+        Read an expression matrix from the open loom file.
+        Returns a dense float64 array of shape (n_genes, n_cells), or None if absent.
+        Handles dense datasets and CSR/CSC sparse groups.
+        """
+        f = self._require_open()
         if dataset_path not in f:
             return None
         node = f[dataset_path]
 
         # Sparse group (CSR / CSC)
-        if isinstance(node, h5py.Group) and all(
-            k in node for k in ("data", "indices", "indptr")
-        ):
+        if isinstance(node, h5py.Group) and all(k in node for k in ("data", "indices", "indptr")):
             enc = node.attrs.get("encoding-type", b"csr_matrix")
             if isinstance(enc, bytes):
                 enc = enc.decode()
@@ -115,12 +166,11 @@ def read_loom_matrix(loom_path: str, dataset_path: str) -> np.ndarray | None:
         if isinstance(node, h5py.Dataset):
             return node[:].astype(np.float64)
 
-    return None
+        return None
 
-
-def write_loom_dataset(loom_path: str, dataset_path: str, data: np.ndarray) -> None:
-    """Write (or overwrite) a dataset inside an existing loom file."""
-    with h5py.File(loom_path, "r+") as f:
+    def write_dataset(self, dataset_path: str, data: np.ndarray) -> None:
+        """Write (or overwrite) a dataset inside the open loom file."""
+        f = self._require_open()
         if dataset_path in f:
             del f[dataset_path]
         parent = dataset_path.rsplit("/", 1)[0]
@@ -128,114 +178,245 @@ def write_loom_dataset(loom_path: str, dataset_path: str, data: np.ndarray) -> N
             f.require_group(parent)
         f.create_dataset(dataset_path, data=data, compression="gzip", compression_opts=4)
 
-
-## Statistical helpers
-
-def bh_fdr(pvals: np.ndarray) -> np.ndarray:
+## Statistical helpers class
+class StatisticalHelper:
     """
-    Benjamini-Hochberg FDR correction, matching R's p.adjust(method = 'fdr').
-    NaN p-values are preserved as NaN in the output.
+    Contains all stat functions and visualization.
+    """   
+    @staticmethod
+    def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[str], ens_ids: list[str], output_dir: str) -> None:
+        """Writes a plotly volcano plot to output.plot.json."""
+        try:
+            import plotly.graph_objects as go
+    
+            not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
+            x      = logfc[not_na]
+            y      = -np.log10(pvals[not_na])
+            na_idx = np.where(not_na)[0]
+            text   = [
+                f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
+                f"<br>Ensembl: {ens_ids[i]}<br>Gene: {gene_names[i]}"
+                for lfc, pv, i in zip(x, pvals[not_na], na_idx)
+            ]
+            fig = go.Figure(go.Scatter(x=x, y=y, mode="markers", text=text, hoverinfo="text", marker=dict(size=4, opacity=0.7)))
+            fig.update_layout(title="Volcano plot", xaxis_title="log Fold-Change", yaxis_title="-log10(p-value)")
+            fig.write_json(os.path.join(output_dir, "output.plot.json"))
+        except Exception as exc:
+            warnings.warn(f"Could not generate volcano plot: {exc}")
+
+## Output helpers
+def write_tsv(
+    out_path:   str,
+    ens_ids:    list[str],
+    gene_names: list[str],
+    rows:       list[tuple],  # (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2) per group
+) -> None:
     """
-    from statsmodels.stats.multitest import multipletests
-
-    out   = np.full_like(pvals, np.nan, dtype=float)
-    valid = ~np.isnan(pvals)
-    if valid.any():
-        _, adj, _, _ = multipletests(pvals[valid], method="fdr_bh")
-        out[valid] = adj
-    return out
-
-
-def log2_pseudo_mean(x: np.ndarray, is_log2: bool) -> np.ndarray:
+    Write DE results to a TSV file.
+    rows is a list of (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2).
+    If group_label is not None for the first entry, a leading 'group' column is included.
     """
-    Per-gene log2 pseudo-mean, replicating the FC logic from de.R.
-    x shape: (n_genes, n_cells_subset)
-    """
-    if is_log2:
-        # log2(mean(2^x - 1) + 1)  [ExpMean from Seurat]
-        return np.log2(np.mean(np.exp2(x) - 1, axis=1) + 1)
-    else:
-        # sign(m) * log2(|m| + 1)
-        m = np.mean(x, axis=1)
-        return np.sign(m) * np.log2(np.abs(m) + 1)
+    has_group = rows[0][0] is not None
+    headers   = (["group", "ensembl_id", "gene_name"] if has_group else ["ensembl_id", "gene_name"]) + DE_HEADERS
+    n_genes   = len(gene_names)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\t".join(headers) + "\n")
+        for grp, lfc, pvals, fdr, ave_g1, ave_g2 in rows:
+            for i in range(n_genes):
+                row = []
+                if has_group:
+                    row.append(grp)
+                row += [
+                    ens_ids[i],
+                    gene_names[i],
+                    f"{lfc[i]}"   if not np.isnan(lfc[i])   else "NA",
+                    f"{pvals[i]}" if not np.isnan(pvals[i]) else "NA",
+                    f"{fdr[i]}"   if not np.isnan(fdr[i])   else "NA",
+                    f"{ave_g1[i]}",
+                    f"{ave_g2[i]}",
+                ]
+                fh.write("\t".join(row) + "\n")
 
+
+def build_result_json(
+    output_dataset: str,
+    n_genes:        int,
+    unique_groups:  list[str] | None = None,  # None → Modes B/C; provided → Mode A
+) -> dict:
+    """
+    Build the output.json metadata dict.
+    If unique_groups is provided (Mode A), produces multi-group metadata with flat
+    headers labelled by group name.
+    Otherwise (Modes B/C), produces single-comparison metadata.
+    """
+    if unique_groups is not None:
+        n_groups         = len(unique_groups)
+        all_headers_flat = [f"{h} ({grp})" for grp in unique_groups for h in DE_HEADERS]
+        return {
+            "metadata": [
+                {
+                    "name":      output_dataset,
+                    "on":        "GENE",
+                    "type":      "NUMERIC",
+                    "nber_cols": DE_NB_COLS * n_groups,
+                    "nber_rows": n_genes,
+                    "headers":   all_headers_flat,
+                    "groups":    unique_groups,
+                }
+            ]
+        }
+    return {
+        "metadata": [
+            {
+                "name":      output_dataset,
+                "on":        "GENE",
+                "type":      "NUMERIC",
+                "nber_cols": DE_NB_COLS,
+                "nber_rows": n_genes,
+                "headers":   DE_HEADERS,
+            }
+        ]
+    }
 
 ## DE method runners
-
 def run_scanpy_method(
     data_matrix:  np.ndarray,   # (n_genes, n_cells) — already subset to G1 + G2 cells
     group_labels: np.ndarray,   # 1-D int array: 1 or 2 per cell
     gene_names:   list[str],
     method:       str,
-    n_cores:      int,
-) -> tuple[np.ndarray, np.ndarray]:
+    is_count:     bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Wraps scanpy.tl.rank_genes_groups for any native scanpy method.
-    Returns (pvals, logFCs) both shape (n_genes,), NaN for genes not returned.
+    Returns (pvals, padj, lfc, ave_g1, ave_g2) all shape (n_genes,), NaN for genes not returned.
     """
-    import anndata as ad
-    import scanpy as sc
-    import pandas as pd
+    import anndata as ad # Lazy loading
+    import scanpy as sc # Lazy loading
 
     n_genes, n_cells = data_matrix.shape
 
     adata = ad.AnnData(X=data_matrix.T.astype(np.float32))
     adata.obs_names = [f"cell_{i}" for i in range(n_cells)]
     adata.var_names = gene_names
-    adata.obs["group"] = pd.Categorical(
-        [str(g) for g in group_labels], categories=["1", "2"]
-    )
+    adata.obs["group"] = pd.Categorical([str(g) for g in group_labels], categories=["1", "2"])
 
     sc.settings.verbosity = 0
-    sc.tl.rank_genes_groups(
-        adata,
-        groupby="group",
-        groups=["1"],
-        reference="2",
-        method=method,
-        use_raw=False,
-        n_genes=n_genes,
-    )
+    if is_count:
+        # Normalize to 10 000 counts per cell, then log1p-transform. This ensures rank_genes_groups computes LFC on a comparable log scale.
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+    # If data is already normalized+logged, scanpy's LFC = mean(expr_g1) − mean(expr_g2) in log space  =  valid log fold-change.
+    sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
 
     res          = adata.uns["rank_genes_groups"]
     result_genes = np.array(res["names"]["1"])
     result_pvals = np.array(res["pvals"]["1"])
+    result_padj  = np.array(res["pvals_adj"]["1"])
     result_lfc   = np.array(res["logfoldchanges"]["1"])
 
+    # Build an index mapping: gene name → original position
     gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+
+    # Map result_genes (scanpy order) → original indices in one shot
+    original_idx = np.array([gene_to_idx[g] for g in result_genes])
+
     pvals = np.full(n_genes, np.nan)
-    lfcs  = np.full(n_genes, np.nan)
-    for rg, rp, rl in zip(result_genes, result_pvals, result_lfc):
-        idx = gene_to_idx.get(rg)
-        if idx is not None:
-            pvals[idx] = rp
-            lfcs[idx]  = rl
+    lfc   = np.full(n_genes, np.nan)
+    padj  = np.full(n_genes, np.nan)
+    pvals[original_idx] = result_pvals
+    lfc[original_idx]   = result_lfc
+    padj[original_idx]  = result_padj
 
-    return pvals, lfcs
+    # Averages computed on adata.X — already normalized+logged if is_count=True, or the original scale if is_count=False. Either way, consistent with the LFC.
+    # np.asarray + ravel guards against adata.X being sparse after preprocessing (sparse .mean() returns a matrix, not a 1-D array).
+    mask_1 = group_labels == 1
+    mask_2 = group_labels == 2
+    ave_g1 = np.asarray(adata.X[mask_1, :].mean(axis=0)).ravel()  # shape (n_genes,)
+    ave_g2 = np.asarray(adata.X[mask_2, :].mean(axis=0)).ravel()
 
+    return pvals, padj, lfc, ave_g1, ave_g2
+
+def run_scanpy_all_markers(
+    data_matrix:  np.ndarray,   # (n_genes, n_cells) — all cells
+    group_labels: np.ndarray,   # 1-D str array: group name per cell
+    gene_names:   list[str],
+    method:       str,
+    is_count:     bool = False,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Runs scanpy.tl.rank_genes_groups for ALL groups simultaneously vs. rest
+    (equivalent to Seurat's FindAllMarkers). This is a single-pass operation —
+    much faster than looping over groups individually.
+
+    Returns a dict keyed by group name:
+        group_name → (pvals, padj, lfc, ave_g1, ave_g2)  each shape (n_genes,)
+    where ave_g1 is the mean expression of that group and ave_g2 is the mean
+    of all remaining cells.
+    """
+    import anndata as ad
+    import scanpy as sc
+
+    n_genes, n_cells = data_matrix.shape
+    unique_groups = sorted(set(group_labels))
+
+    adata = ad.AnnData(X=data_matrix.T.astype(np.float32))
+    adata.obs_names = [f"cell_{i}" for i in range(n_cells)]
+    adata.var_names = gene_names
+    adata.obs["group"] = pd.Categorical(group_labels.tolist(), categories=unique_groups)
+
+    sc.settings.verbosity = 0
+    if is_count:
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+
+    # Single pass: all groups vs. rest simultaneously
+    sc.tl.rank_genes_groups(adata, groupby="group", reference="rest", method=method, use_raw=False, n_genes=n_genes)
+
+    res = adata.uns["rank_genes_groups"]
+    # Build an index mapping: gene name → original position
+    gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+
+    results: dict = {}
+    for grp in unique_groups:
+        result_genes = np.array(res["names"][grp])
+        result_pvals = np.array(res["pvals"][grp])
+        result_padj  = np.array(res["pvals_adj"][grp])
+        result_lfc   = np.array(res["logfoldchanges"][grp])
+    
+        # Map result_genes (scanpy order) → original indices in one shot
+        original_idx = np.array([gene_to_idx[g] for g in result_genes])
+        
+        pvals = np.full(n_genes, np.nan)
+        lfc   = np.full(n_genes, np.nan)
+        padj  = np.full(n_genes, np.nan)
+        pvals[original_idx] = result_pvals
+        lfc[original_idx]   = result_lfc
+        padj[original_idx]  = result_padj
+
+        # np.asarray + ravel guards against adata.X being sparse after preprocessing (sparse .mean() returns a matrix, not a 1-D array).
+        mask_grp  = np.array(group_labels) == grp
+        mask_rest = ~mask_grp
+        ave_g1 = np.asarray(adata.X[mask_grp, :].mean(axis=0)).ravel()   # shape (n_genes,)
+        ave_g2 = np.asarray(adata.X[mask_rest, :].mean(axis=0)).ravel()
+
+        results[grp] = (pvals, padj, lfc, ave_g1, ave_g2)
+
+    return results
 
 def run_deseq2(
     data_matrix:  np.ndarray,         # (n_genes, n_cells), integer counts
     group_labels: np.ndarray,         # 1-D int array: 1 or 2 per cell
     batch_data:   np.ndarray | None,  # (n_cells, n_covariates) or None
-    batch_names:  list[str],
+    batch_names:  list[str],          # This method allows for batch as covariate in the model
     gene_names:   list[str],
     n_cores:      int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs DESeq2 via pydeseq2 (counts required).
-    Returns (pvals, padj, log2FoldChange) all shape (n_genes,), NaN for untested genes.
+    Returns (pvals, padj, lfc, ave_g1, ave_g2) all shape (n_genes,), NaN for untested genes.
     """
-    try:
-        from pydeseq2.dds import DeseqDataSet
-        from pydeseq2.ds  import DeseqStats
-    except ImportError:
-        ErrorJSON(
-            "pydeseq2 is required for the 'deseq2' method. "
-            "Install it with: pip install pydeseq2"
-        )
-
-    import pandas as pd
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds  import DeseqStats
 
     n_genes, n_cells = data_matrix.shape
     counts   = np.round(data_matrix.T).astype(int)  # cells x genes
@@ -250,124 +431,67 @@ def run_deseq2(
     design_factors = (batch_names + ["group"]) if batch_names else ["group"]
 
     dds = DeseqDataSet(counts=counts_df, metadata=meta, design_factors=design_factors, quiet=True)
-    dds.deseq2()
+    dds.deseq2(n_cpus=n_cores)
 
     stat_res = DeseqStats(dds, contrast=("group", "1", "2"), quiet=True)
     stat_res.summary()
     df = stat_res.results_df
 
-    pvals = np.full(n_genes, np.nan)
-    padj  = np.full(n_genes, np.nan)
-    lfc   = np.full(n_genes, np.nan)
-    for i, gname in enumerate(gene_names):
-        if gname in df.index:
-            pvals[i] = df.loc[gname, "pvalue"]
-            padj[i]  = df.loc[gname, "padj"]
-            lfc[i]   = df.loc[gname, "log2FoldChange"]
+    # Reindex by gene_names in one vectorised step; genes absent from results become NaN.
+    df_reindexed = df.reindex(gene_names)
+    pvals = df_reindexed["pvalue"].to_numpy()
+    padj  = df_reindexed["padj"].to_numpy()
+    lfc   = df_reindexed["log2FoldChange"].to_numpy()
 
-    return pvals, padj, lfc
+    # Use DESeq2's own size-factor-normalized counts (stored by pydeseq2 after dds.deseq2()).
+    # This is the natural scale for DESeq2 averages — comparable to its LFC.
+    normed = dds.layers["normed_counts"]  # (n_cells, n_genes), numpy array
+    mask_1 = np.array(meta["group"] == "1")
+    mask_2 = np.array(meta["group"] == "2")
+    ave_g1 = normed[mask_1, :].mean(axis=0)
+    ave_g2 = normed[mask_2, :].mean(axis=0)
 
+    return pvals, padj, lfc, ave_g1, ave_g2
 
-## Volcano plot
+def run_deseq2_all_markers(
+    data_matrix:  np.ndarray,         # (n_genes, n_cells), integer counts
+    group_labels: np.ndarray,         # 1-D str array: group name per cell
+    batch_data:   np.ndarray | None,
+    batch_names:  list[str],
+    gene_names:   list[str],
+    n_cores:      int,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """
+    Runs DESeq2 for ALL groups vs. rest (FindAllMarkers equivalent for DESeq2).
+    Loops once per group — unavoidable since DESeq2 is inherently pairwise.
 
-def write_volcano_json(
-    logfc:      np.ndarray,
-    pvals:      np.ndarray,
-    gene_names: list[str],
-    ens_ids:    list[str],
-    output_dir: str,
-) -> None:
-    """Writes a plotly volcano plot to output.plot.json, mirroring de.R."""
-    try:
-        import plotly.graph_objects as go
+    Returns a dict keyed by group name:
+        group_name → (pvals, padj, lfc, ave_g1, ave_g2)  each shape (n_genes,)
+    """
+    unique_groups = sorted(set(group_labels))
+    results: dict = {}
 
-        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
-        x      = logfc[not_na]
-        y      = -np.log10(pvals[not_na])
-        na_idx = np.where(not_na)[0]
-        text   = [
-            f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
-            f"<br>Ensembl: {ens_ids[i]}<br>Gene: {gene_names[i]}"
-            for lfc, pv, i in zip(x, pvals[not_na], na_idx)
-        ]
-        fig = go.Figure(go.Scatter(
-            x=x, y=y, mode="markers", text=text, hoverinfo="text",
-            marker=dict(size=4, opacity=0.7),
-        ))
-        fig.update_layout(
-            title="Volcano plot",
-            xaxis_title="log Fold-Change",
-            yaxis_title="-log10(p-value)",
-        )
-        fig.write_json(os.path.join(output_dir, "output.plot.json"))
-    except Exception as exc:
-        warnings.warn(f"Could not generate volcano plot: {exc}")
+    for grp in unique_groups:
+        print(f"  DESeq2: running group {grp!r} vs. rest ...")
+        binary_labels = np.where(group_labels == grp, 1, 2).astype(int)
+        pvals, padj, lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, binary_labels, batch_data, batch_names, gene_names, n_cores)
+        results[grp] = (pvals, padj, lfc, ave_g1, ave_g2)
 
-
-## Argument helpers
-
-def _null(s: str | None) -> bool:
-    """Returns True if a string argument represents an absent/null value."""
-    return s is None or s.strip().lower() in ("", "null", "na", "none")
-
-
-def positive_int(value: str) -> int:
-    try:
-        ivalue = int(value)
-    except ValueError:
-        ErrorJSON(f"--nb-cores must be a positive integer and {value!r} is not an integer")
-    if ivalue <= 0:
-        ErrorJSON("--nb-cores must be a positive integer")
-    return ivalue
-
-
-## Help text
-
-custom_help = """
-Differential Expression Mode (Python / Scanpy)
-
-Options:
-  -f %s                  Path to the input .loom file.
-  -o %s                  Output folder (default: same directory as -f).
-  --method %s            DE method to use. One of:
-                           wilcoxon | t-test | t-test_overestim_var | logreg | deseq2
-  --input-dataset %s     Loom path to the expression matrix to use (e.g. /layers/norm_data).
-  --output-dataset %s    Loom path where DE results will be written (e.g. /row_attrs/_de_1_wilcoxon).
-  --batch %s             Comma-separated loom paths for batch/covariate columns, or "null".
-                           Only used by deseq2.
-  --group-dataset %s     Loom path to the obs-level metadata defining group 1 cells.
-  --group-dataset-2 %s   Loom path to the obs-level metadata defining group 2 cells (optional).
-                           If omitted, group 2 = all cells not in group 1 (marker genes mode).
-  --group1 %s            Value in --group-dataset that labels group-1 cells.
-  --group2 %s            Value in --group-dataset-2 (or --group-dataset) for group-2 cells.
-                           If omitted, runs group-1 vs. all others (marker gene mode).
-  --is-count %s          Whether the matrix contains raw counts: true | false (default: false).
-                           Required true for deseq2.
-  --nb-cores %i          Number of cores for parallelisable steps (default: 8).
-  --help                 Show this help message and exit.
-"""
-
+    return results
 
 ## Core logic
-
 def run(args: argparse.Namespace) -> None:
     """Core DE logic, called after argument validation."""
 
-    # Resolve output directory (mirrors parse_v8.py)
+    # Resolve output directory
     input_path = Path(args.f).resolve()
     output_dir = Path(args.o).resolve() if args.o else input_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = str(output_dir)
 
-    # ── Validate method ────────────────────────────────────────────────────
+    # Parse scalar arguments
     method = args.method.strip()
-    if method not in AVAILABLE_METHODS:
-        ErrorJSON(
-            f"{method!r} is not a supported method. "
-            f"Available: {', '.join(AVAILABLE_METHODS)}"
-        )
 
-    # ── Parse scalar arguments ─────────────────────────────────────────────
     is_count_raw = args.is_count.strip().lower()
     if is_count_raw == "true":
         is_count_table = True
@@ -381,238 +505,233 @@ def run(args: argparse.Namespace) -> None:
     if method in COUNT_ONLY_METHODS and not is_count_table:
         ErrorJSON(f"Data should be a count table in order to run {method}")
 
-    group_1 = args.group1.strip()
-    group_2 = args.group2.strip() if not _null(args.group2) else None
-
-    if (
-        group_2 is not None
-        and (_null(args.group_dataset_2) or args.group_dataset_2 == args.group_dataset)
-        and group_1 == group_2
-    ):
-        ErrorJSON("Cannot compute DE from the same group.")
-
-    data_warnings: list[dict] = []
-
-    # ── Read loom ──────────────────────────────────────────────────────────
-    loom_path = str(input_path)
-
-    data_matrix = read_loom_matrix(loom_path, args.input_dataset)
-    if data_matrix is None:
-        ErrorJSON(f"Input dataset {args.input_dataset!r} does not exist in the Loom file")
-
-    n_genes, n_cells = data_matrix.shape
-
-    # Gene annotations (used for volcano plot and output labeling)
-    ens_raw  = read_loom_vector(loom_path, "/row_attrs/Accession")
-    gene_raw = read_loom_vector(loom_path, "/row_attrs/Gene")
-    ens_ids    = _decode_str_array(ens_raw).tolist()   if ens_raw  is not None else [f"gene_{i}" for i in range(n_genes)]
-    gene_names = _decode_str_array(gene_raw).tolist()  if gene_raw is not None else [f"gene_{i}" for i in range(n_genes)]
-
-    # ── Read group metadata ────────────────────────────────────────────────
-    groups_raw_1 = read_loom_vector(loom_path, args.group_dataset)
-    if groups_raw_1 is None:
-        ErrorJSON(f"Group dataset {args.group_dataset!r} does not exist in the Loom file")
-    groups_1 = _decode_str_array(groups_raw_1)
-
-    # Group 2 may come from a different metadata column (new feature vs. de.R)
-    use_separate_g2_col = (
-        not _null(args.group_dataset_2)
-        and args.group_dataset_2 != args.group_dataset
-    )
-    if use_separate_g2_col:
-        groups_raw_2 = read_loom_vector(loom_path, args.group_dataset_2)
-        if groups_raw_2 is None:
-            ErrorJSON(f"Group dataset 2 {args.group_dataset_2!r} does not exist in the Loom file")
-        groups_2 = _decode_str_array(groups_raw_2)
+    # Determine the execution mode (3 modes) from the supplied group arguments
+    group1           = None if _null(args.group1)           else args.group1.strip()
+    group2           = None if _null(args.group2)           else args.group2.strip()
+    group_dataset_2  = None if _null(args.group_dataset_2)  else args.group_dataset_2.strip()
+    if group1 is None:
+        # Mode A — FindAllMarkers
+        if group2 is not None or group_dataset_2 is not None:
+            ErrorJSON("When --group1 is omitted (FindAllMarkers mode), --group2 and --group-dataset-2 must also be omitted.")
+        mode = "all_markers"
+    elif group2 is None and group_dataset_2 is None:
+        # Mode B — Single-group marker
+        mode = "single_marker"
     else:
-        groups_2 = groups_1  # same column, same semantics
+        # Mode C — Standard two-group DE: require both group2 and group_dataset_2
+        if group2 is None:
+            ErrorJSON("When --group-dataset-2 is provided, --group2 must also be provided.")
+        if group_dataset_2 is None:
+            # group_dataset_2 defaults to group_dataset when only group2 is given
+            group_dataset_2 = args.group_dataset.strip()
+        mode = "two_group"
 
-    # ── Read batch / covariate metadata ────────────────────────────────────
-    batch_names: list[str] = []
-    batch_data:  np.ndarray | None = None
+    # Init warning list
+    data_warnings: list = []
 
-    if not _null(args.batch):
-        batch_paths = [p.strip() for p in args.batch.split(",") if p.strip()]
-        if batch_paths:
-            cols = []
-            for bp in batch_paths:
-                bvec = read_loom_vector(loom_path, bp)
-                if bvec is None:
-                    ErrorJSON(f"Batch dataset {bp!r} does not exist in the Loom file")
-                cols.append(bvec.reshape(-1))
-                leaf = bp.split("/")[-1].lstrip("_")
-                batch_names.append(leaf)
-            batch_data = np.column_stack(cols)  # (n_cells, n_batch_cols)
-            print(f"{len(batch_paths)} covariate(s) detected: {', '.join(batch_names)}")
+    # Open the loom file for reading (close it afterwards to avoid locking during DE)
+    with LoomHandler(str(input_path), mode="r") as loom:
+        # Read count matrix from Loom file
+        data_matrix = loom.read_matrix(args.input_dataset)
+        if data_matrix is None:
+            ErrorJSON(f"Input dataset {args.input_dataset!r} does not exist in the Loom file")
+        n_genes, n_cells = data_matrix.shape
 
-    # Warn if batch was requested for a method that does not support it
-    if batch_data is not None and method not in BATCH_SUPPORT:
-        data_warnings.append({
-            "name": f"Method '{method}' does not support covariates — batch column(s) ignored.",
-            "description": (
-                f"Covariate-aware DE is currently only supported by: "
-                f"{', '.join(sorted(BATCH_SUPPORT))}."
-            ),
-        })
-        batch_data  = None
-        batch_names = []
+        # Gene annotations (used for volcano plot and output labeling)
+        ens_raw  = loom.read_vector("/row_attrs/Accession")
+        gene_raw = loom.read_vector("/row_attrs/Gene")
+        ens_ids    = LoomHandler._decode_str_array(ens_raw).tolist()   if ens_raw  is not None else [f"Gene_{i}" for i in range(n_genes)]
+        gene_names = LoomHandler._decode_str_array(gene_raw).tolist()  if gene_raw is not None else [f"Gene_{i}" for i in range(n_genes)]
 
-    # ── Assign cells to groups ─────────────────────────────────────────────
-    cell_group = np.zeros(n_cells, dtype=int)  # 0 = unassigned
-    cell_group[groups_1 == group_1] = 1
+        # Read primary group metadata (always required)
+        groups_raw_1 = loom.read_vector(args.group_dataset)
+        if groups_raw_1 is None:
+            ErrorJSON(f"Group dataset {args.group_dataset!r} does not exist in the Loom file")
+        groups_1 = LoomHandler._decode_str_array(groups_raw_1)
 
-    if group_2 is not None:
-        # Explicit two-group comparison
-        candidates_1 = np.where(groups_1 == group_1)[0]
-        candidates_2 = np.where(groups_2 == group_2)[0]
+        # Group 2 metadata (only for Mode C, may come from a different column)
+        if mode == "two_group":
+            if group_dataset_2 != args.group_dataset:
+                groups_raw_2 = loom.read_vector(group_dataset_2)
+                if groups_raw_2 is None:
+                    ErrorJSON(f"Group dataset 2 {group_dataset_2!r} does not exist in the Loom file")
+                groups_2 = LoomHandler._decode_str_array(groups_raw_2)
+            else:
+                groups_2 = groups_1  # same column
+        else:
+            groups_2 = None
+
+        # Read batch / covariate metadata
+        batch_names: list[str] = []
+        batch_data:  np.ndarray | None = None
+        if not _null(args.batch):
+            batch_paths = [p.strip() for p in args.batch.split(",") if p.strip()]
+            if batch_paths:
+                cols = []
+                for bp in batch_paths:
+                    bvec = loom.read_vector(bp)
+                    if bvec is None:
+                        ErrorJSON(f"Batch dataset {bp!r} does not exist in the Loom file")
+                    cols.append(bvec.reshape(-1))
+                    leaf = bp.split("/")[-1].lstrip("_")
+                    batch_names.append(leaf)
+                batch_data = np.column_stack(cols)  # (n_cells, n_batch_cols)
+                print(f"{len(batch_paths)} covariate(s) detected: {', '.join(batch_names)}")
+        if batch_data is not None and method not in BATCH_SUPPORT: # Warn if batch was requested for a method that does not support it
+            data_warnings.append(f"Method '{method}' does not support covariates — batch column(s) ignored. Covariate-aware DE is currently only supported by: {', '.join(sorted(BATCH_SUPPORT))}.")
+            batch_data  = None
+            batch_names = []
+
+    # Loom file is now closed
+
+    # ------------------------------------------------------------------ #
+    # Mode A — FindAllMarkers                                             #
+    # ------------------------------------------------------------------ #
+    if mode == "all_markers":
+        unique_groups = sorted(set(groups_1))
+        if len(unique_groups) < 2:
+            ErrorJSON("FindAllMarkers mode requires at least 2 distinct groups in --group-dataset.")
+
+        # Validate minimum cell count per group
+        for grp in unique_groups:
+            cnt = (groups_1 == grp).sum()
+            if cnt < 3:
+                ErrorJSON(f"Group {grp!r} contains only {cnt} cell(s); at least 3 are required.")
+
+        print(f"FindAllMarkers mode: {len(unique_groups)} groups detected — {', '.join(unique_groups)}")
+        print(f"Running DE method: {method} on {n_genes} genes ...")
+
+        if method == "deseq2":
+            all_results = run_deseq2_all_markers(data_matrix, groups_1, batch_data, batch_names, gene_names, nb_cores)
+        else:
+            all_results = run_scanpy_all_markers(data_matrix, groups_1, gene_names, method, is_count=is_count_table)
+
+        # Stack results as (5 * n_groups, n_genes) in DE_HEADERS order [lfc, pvals, fdr, ave_g1, ave_g2] per group.
+        blocks = []
+        for grp in unique_groups:
+            pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
+            blocks.append(np.vstack([lfc, pvals, padj, ave_g1, ave_g2]))
+        data_out = np.vstack(blocks)  # shape: (5 * n_groups, n_genes)
+
+        # Loom output
+        with LoomHandler(str(input_path), mode="r+") as loom:
+            loom.write_dataset(args.output_dataset, data_out)
+            print(f"DE results written to: {args.output_dataset}")
+
+        # TSV output — Extra leading column "group" to identify which group each row belongs to.
+        tsv_rows = [(grp, *all_results[grp][2:3], *all_results[grp][0:2], *all_results[grp][3:5]) for grp in unique_groups]  # (grp, lfc, pvals, fdr, ave_g1, ave_g2)
+        out_tsv = os.path.join(output_dir, "output.tsv")
+        write_tsv(out_tsv, ens_ids, gene_names, tsv_rows)
+        print(f"TSV written to: {out_tsv}")
+
+        # Volcano plot — use the first group as a representative
+        first_grp = unique_groups[0]
+        StatisticalHelper.write_volcano_json(all_results[first_grp][2], all_results[first_grp][0], gene_names, ens_ids, output_dir)
+
+        # JSON metadata
+        result = build_result_json(args.output_dataset, n_genes, unique_groups=unique_groups)
+
+    # ------------------------------------------------------------------ #
+    # Mode B — Single-group marker (group1 vs. all other cells)           #
+    # ------------------------------------------------------------------ #
+    elif mode == "single_marker":
+        candidates_1 = np.where(groups_1 == group1)[0]
+        if len(candidates_1) == 0:
+            ErrorJSON(f"Group 1 label {group1!r} was not found in {args.group_dataset!r}.")
+
+        cell_group = np.zeros(n_cells, dtype=int)
+        cell_group[candidates_1] = 1
+        cell_group[cell_group == 0] = 2  # all other cells become group 2
+
+        if (cell_group == 1).sum() < 3:
+            ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
+        if (cell_group == 2).sum() < 3:
+            ErrorJSON("Group 2 (all other cells) contains fewer than 3 cells.")
+
+        print(f"Marker gene mode: {group1!r} vs. all other cells.")
+        print(f"Group 1: {(cell_group == 1).sum()} cells | Group 2: {(cell_group == 2).sum()} cells")
+        print(f"Running DE method: {method} on {n_genes} genes ...")
+
+        if method == "deseq2":
+            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, cell_group, batch_data, batch_names, gene_names, nb_cores)
+        else:
+            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix, cell_group, gene_names, method, is_count=is_count_table)
+
+        data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
+
+        # LOOM - write dataset in Loom
+        with LoomHandler(str(input_path), mode="r+") as loom:
+            loom.write_dataset(args.output_dataset, data_out)
+            print(f"DE results written to: {args.output_dataset}")
+
+        # TSV — no extra "group" column
+        out_tsv = os.path.join(output_dir, "output.tsv")
+        write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
+        print(f"TSV written to: {out_tsv}")
+
+        # VOLCANO plot - write as JSON
+        StatisticalHelper.write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+
+        # JSON for output JSON file
+        result = build_result_json(args.output_dataset, n_genes)
+
+    # ------------------------------------------------------------------ #
+    # Mode C — Standard two-group DE                                      #
+    # ------------------------------------------------------------------ #
+    else:  # mode == "two_group"
+        candidates_1 = np.where(groups_1 == group1)[0]
+        candidates_2 = np.where(groups_2 == group2)[0]
+
+        if len(candidates_1) == 0:
+            ErrorJSON(f"Group 1 label {group1!r} was not found in {args.group_dataset!r}.")
+        if len(candidates_2) == 0:
+            ErrorJSON(f"Group 2 label {group2!r} was not found in {group_dataset_2!r}.")
+
+        # Remove cells that appear in both groups from group 2
         overlap = np.intersect1d(candidates_1, candidates_2)
         if len(overlap) > 0:
-            data_warnings.append({
-                "name": (
-                    f"{len(overlap)} cell(s) appear in both group 1 ({group_1!r}) "
-                    f"and group 2 ({group_2!r})."
-                ),
-                "description": (
-                    "These cells were removed from group 2 to avoid overlap. "
-                    f"Affected indices (first 20): {overlap[:20].tolist()}"
-                    + (" ..." if len(overlap) > 20 else "")
-                ),
-            })
+            data_warnings.append(f"{len(overlap)} cell(s) appear in both group 1 ({group1!r}) and group 2 ({group2!r}). These cells were removed from group 2 to avoid overlap. Affected indices (first 20): {overlap[:20].tolist()} {' ...' if len(overlap) > 20 else ''}")
         non_overlap_2 = np.setdiff1d(candidates_2, candidates_1)
+
+        cell_group = np.zeros(n_cells, dtype=int)
+        cell_group[candidates_1]  = 1
         cell_group[non_overlap_2] = 2
-        print(f"Two-group DE: {group_1!r} vs {group_2!r} — discarding unassigned cells.")
-    else:
-        # Marker gene mode: group 1 vs. all remaining cells
-        cell_group[cell_group == 0] = 2
-        print(f"Marker gene mode: {group_1!r} vs. all other cells.")
 
-    # ── Filter to assigned cells ───────────────────────────────────────────
-    keep_idx    = np.where(cell_group > 0)[0]
-    data_matrix = data_matrix[:, keep_idx]
-    cell_group  = cell_group[keep_idx]
-    if batch_data is not None:
-        batch_data = batch_data[keep_idx]
+        # Keep only assigned cells
+        keep_idx        = np.where(cell_group > 0)[0]
+        data_matrix_sub = data_matrix[:, keep_idx]
+        cell_group_sub  = cell_group[keep_idx]
+        batch_data_sub  = batch_data[keep_idx] if batch_data is not None else None
 
-    cells_1 = cell_group == 1
-    cells_2 = cell_group == 2
+        if (cell_group_sub == 1).sum() < 3:
+            ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
+        if (cell_group_sub == 2).sum() < 3:
+            ErrorJSON(f"Group 2 ({group2!r}) contains fewer than 3 cells after removing overlapping cells.")
 
-    if cells_1.sum() < 3:
-        ErrorJSON("Group 1 should contain at least 3 cells")
-    if cells_2.sum() < 3:
-        ErrorJSON("Group 2 should contain at least 3 cells")
+        print(f"Two-group DE: {group1!r} vs {group2!r} — discarding unassigned cells.")
+        print(f"Group 1: {(cell_group_sub == 1).sum()} cells | Group 2: {(cell_group_sub == 2).sum()} cells")
+        print(f"Running DE method: {method} on {n_genes} genes ...")
 
-    print(f"Group 1: {cells_1.sum()} cells | Group 2: {cells_2.sum()} cells")
-
-    # ── Detect data type ───────────────────────────────────────────────────
-    is_log2    = True
-    compute_FC = True
-
-    if is_count_table or data_matrix.max() > 35:
-        is_log2 = False
-    if data_matrix.min() < 0:
-        compute_FC     = False
-        is_log2        = False
-        is_count_table = False
-        data_warnings.append({
-            "name": "Data has negative values — no FC will be computed.",
-            "description": "Select another dataset if you want to compute Fold-Change.",
-        })
-
-    # ── Compute log2 Fold-Change ───────────────────────────────────────────
-    total_diff = np.full(n_genes, np.nan)
-    if compute_FC:
-        total_diff = (
-            log2_pseudo_mean(data_matrix[:, cells_1], is_log2)
-            - log2_pseudo_mean(data_matrix[:, cells_2], is_log2)
-        )
-
-    # ── Run DE ─────────────────────────────────────────────────────────────
-    print(f"Running DE method: {method} on {n_genes} genes ...")
-
-    out_pvals = np.full(n_genes, np.nan)
-    out_fdr   = np.full(n_genes, np.nan)
-    out_lfc   = total_diff.copy()
-
-    if method == "deseq2":
-        pvals_all, fdr_all, lfc_all = run_deseq2(
-            data_matrix, cell_group, batch_data, batch_names, gene_names, nb_cores
-        )
-        out_pvals = pvals_all
-        out_fdr   = fdr_all
-        # DESeq2 provides its own shrunken LFC; prefer it over the naive mean difference
-        out_lfc   = lfc_all
-
-    else:
-        pvals_all, lfc_scanpy = run_scanpy_method(
-            data_matrix, cell_group, gene_names, method, nb_cores
-        )
-        out_pvals = pvals_all
-        out_fdr   = bh_fdr(pvals_all)
-        # Use naive log2 FC when available (consistent with de.R for all non-DESeq2 methods)
-        if not compute_FC:
-            out_lfc = lfc_scanpy
-
-    # ── FC sanity check (mirrors de.R) ────────────────────────────────────
-    ave_g1 = data_matrix[:, cells_1].mean(axis=1)
-    ave_g2 = data_matrix[:, cells_2].mean(axis=1)
-    not_na = ~np.isnan(out_lfc)
-    if not_na.any():
-        correct   = int(np.sum(np.sign(ave_g1[not_na] - ave_g2[not_na]) == np.sign(out_lfc[not_na])))
-        incorrect = int(not_na.sum()) - correct
-        if correct >= incorrect:
-            print("SANITY CHECK: OK")
+        if method == "deseq2":
+            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix_sub, cell_group_sub, batch_data_sub, batch_names, gene_names, nb_cores)
         else:
-            print("SANITY CHECK: flipping logFC sign so that positive = higher in group 1")
-            out_lfc = -out_lfc
+            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix_sub, cell_group_sub, gene_names, method, is_count=is_count_table)
 
-    # ── Assemble output matrix (5 x n_genes) ─────────────────────────────
-    # Layout mirrors de.R: t(data.out) stored as (5, n_genes) in loom
-    data_out = np.vstack([
-        out_lfc,    # row 0: logFC
-        out_pvals,  # row 1: pval
-        out_fdr,    # row 2: FDR
-        ave_g1,     # row 3: AveG1
-        ave_g2,     # row 4: AveG2
-    ])
+        data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
 
-    # ── Write DE results to loom ──────────────────────────────────────────
-    write_loom_dataset(loom_path, args.output_dataset, data_out)
-    print(f"DE results written to: {args.output_dataset}")
+        with LoomHandler(str(input_path), mode="r+") as loom:
+            loom.write_dataset(args.output_dataset, data_out)
+            print(f"DE results written to: {args.output_dataset}")
 
-    # ── Write DE results to TSV ────────────────────────────────────────────
-    out_tsv = os.path.join(output_dir, "output.tsv")
-    with open(out_tsv, "w", encoding="utf-8") as fh:
-        fh.write("\t".join(["ensembl_id", "gene_name"] + DE_HEADERS) + "\n")
-        for i in range(n_genes):
-            row = [
-                ens_ids[i],
-                gene_names[i],
-                f"{out_lfc[i]}"   if not np.isnan(out_lfc[i])   else "NA",
-                f"{out_pvals[i]}" if not np.isnan(out_pvals[i]) else "NA",
-                f"{out_fdr[i]}"   if not np.isnan(out_fdr[i])   else "NA",
-                f"{ave_g1[i]}",
-                f"{ave_g2[i]}",
-            ]
-            fh.write("\t".join(row) + "\n")
-    print(f"TSV written to: {out_tsv}")
+        out_tsv = os.path.join(output_dir, "output.tsv")
+        write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
+        print(f"TSV written to: {out_tsv}")
 
-    # ── Volcano plot ───────────────────────────────────────────────────────
-    if compute_FC:
-        write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+        StatisticalHelper.write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
 
-    # ── Write output.json ──────────────────────────────────────────────────
-    result: dict = {
-        "metadata": [
-            {
-                "name":      args.output_dataset,
-                "on":        "GENE",
-                "type":      "NUMERIC",
-                "nber_cols": DE_NB_COLS,
-                "nber_rows": n_genes,
-                "headers":   DE_HEADERS,
-            }
-        ]
-    }
+        result = build_result_json(args.output_dataset, n_genes)
+
+    # JSON output
     if data_warnings:
         result["warnings"] = data_warnings
 
@@ -621,9 +740,60 @@ def run(args: argparse.Namespace) -> None:
         json.dump(result, fh, ensure_ascii=False, allow_nan=True)
     print(f"JSON written to: {out_json}")
 
+## Argument helpers
+def _null(s: str | None) -> bool:
+    """Returns True if a string argument represents an absent/null value."""
+    return s is None or s.strip().lower() in ("", "null", "na", "none")
+
+## Validator
+def positive_int(value: str) -> int:
+    try:
+        ivalue = int(value)
+    except ValueError:
+        ErrorJSON(f"--nb-cores must be a positive integer and {value!r} is not an integer")
+    if ivalue <= 0:
+        ErrorJSON("--nb-cores must be a positive integer")
+    return ivalue
+
+## Help text
+custom_help = """
+Differential Expression (Python / Scanpy)
+
+Execution modes
+───────────────
+  FindAllMarkers  Omit --group1 (and --group2 / --group-dataset-2).
+                  Every group in --group-dataset is tested vs. all other cells.
+                  Output TSV contains an extra leading "group" column.
+
+  Single marker   Provide --group1 only (omit --group2 / --group-dataset-2).
+                  Runs group1 vs. all other cells.
+
+  Two-group DE    Provide all four group arguments.
+                  Standard pairwise DE; overlapping cells are removed from group 2.
+
+Options:
+  -f %s                  Path to the input .loom file.
+  -o %s                  Output folder (default: same directory as -f).
+  --method %s            DE method to use. One of:
+                           wilcoxon | t-test | t-test_overestim_var | logreg | deseq2
+  --input-dataset %s     Loom path to the expression matrix to use (e.g. /layers/norm_data).
+  --output-dataset %s    Loom path where DE results will be written (e.g. /row_attrs/_de_1_wilcoxon).
+  --batch %s             Comma-separated loom paths for batch/covariate columns, or "null".
+                           Only used by deseq2.
+  --group-dataset %s     Loom path to the obs-level metadata column (always required).
+  --group-dataset-2 %s   Loom path to the obs-level metadata defining group 2 cells (two-group DE only).
+                           If omitted, defaults to --group-dataset.
+  --group1 %s            Value in --group-dataset that labels group-1 cells.
+                           If omitted, runs FindAllMarkers across all groups.
+  --group2 %s            Value in --group-dataset-2 (or --group-dataset) for group-2 cells.
+                           Required when --group-dataset-2 is provided.
+  --is-count %s          Whether the matrix contains raw counts: true | false (default: false).
+                           Required true for deseq2.
+  --nb-cores %i          Number of cores for parallelisable steps (default: 8).
+  --help                 Show this help message and exit.
+"""
 
 ## Entry point
-
 def main() -> None:
     if "--help" in sys.argv:
         print(custom_help)
@@ -632,26 +802,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Differential Expression Script", add_help=False)
     parser.add_argument("-f",                metavar="Input loom file",                                                  required=True)
     parser.add_argument("-o",                metavar="Output folder",                                                    required=False)
-    parser.add_argument("--method",          metavar="DE method",           choices=AVAILABLE_METHODS,                   required=True)
+    parser.add_argument("--method",          metavar="DE method",                       choices=AVAILABLE_METHODS,       required=True)
     parser.add_argument("--input-dataset",   metavar="Input matrix dataset",                                             required=True,  dest="input_dataset")
     parser.add_argument("--output-dataset",  metavar="Output DE dataset",                                                required=True,  dest="output_dataset")
     parser.add_argument("--batch",           metavar="Batch/covariate datasets",        default="null",                  required=False)
-    parser.add_argument("--group-dataset",   metavar="Group 1 metadata path",                                            required=True,  dest="group_dataset")
+    parser.add_argument("--group-dataset",   metavar="Group metadata path",                                              required=True,  dest="group_dataset")
     parser.add_argument("--group-dataset-2", metavar="Group 2 metadata path",           default=None,                    required=False, dest="group_dataset_2")
-    parser.add_argument("--group1",          metavar="Group 1 label",                                                    required=True)
-    parser.add_argument("--group2",          metavar="Group 2 label (null = 1-vs-rest)", default="null",                 required=False)
+    parser.add_argument("--group1",          metavar="Group 1 label (null = all)",      default="null",                  required=False)
+    parser.add_argument("--group2",          metavar="Group 2 label",                   default="null",                  required=False)
     parser.add_argument("--is-count",        metavar="Is count table [true|false]",     default="false",                 required=False, dest="is_count")
-    parser.add_argument("--nb-cores",        metavar="Number of cores",                 default=8, type=positive_int,    required=False, dest="nb_cores")
+    parser.add_argument("--nb-cores",        metavar="Number of cores [for DESeq2]",    default=8, type=positive_int,    required=False, dest="nb_cores")
 
     args = parser.parse_args()
 
-    # Validate input file (mirrors parse_v8.py main())
-    input_path = Path(args.f).resolve()
-    if not input_path.is_file():
-        ErrorJSON(f"Input file not found: {args.f}")
-
     run(args)
-
 
 if __name__ == "__main__":
     main()
