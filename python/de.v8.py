@@ -25,7 +25,6 @@ AVAILABLE_METHODS: Final[list] = [
     "wilcoxon",              # Wilcoxon rank-sum test           (scanpy)
     "t-test",                # Student's t-test, pooled var     (scanpy)
     "t-test_overestim_var",  # Student's t-test, per-gene var   (scanpy)
-    "logreg",                # Logistic regression              (scanpy)
     "deseq2",                # Negative-binomial GLM            (pydeseq2, counts only)
 ]
 COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
@@ -178,39 +177,8 @@ class LoomHandler:
             f.require_group(parent)
         f.create_dataset(dataset_path, data=data, compression="gzip", compression_opts=4)
 
-## Statistical helpers class
-class StatisticalHelper:
-    """
-    Contains all stat functions and visualization.
-    """   
-    @staticmethod
-    def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[str], ens_ids: list[str], output_dir: str) -> None:
-        """Writes a plotly volcano plot to output.plot.json."""
-        try:
-            import plotly.graph_objects as go
-    
-            not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
-            x      = logfc[not_na]
-            y      = -np.log10(pvals[not_na])
-            na_idx = np.where(not_na)[0]
-            text   = [
-                f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
-                f"<br>Ensembl: {ens_ids[i]}<br>Gene: {gene_names[i]}"
-                for lfc, pv, i in zip(x, pvals[not_na], na_idx)
-            ]
-            fig = go.Figure(go.Scatter(x=x, y=y, mode="markers", text=text, hoverinfo="text", marker=dict(size=4, opacity=0.7)))
-            fig.update_layout(title="Volcano plot", xaxis_title="log Fold-Change", yaxis_title="-log10(p-value)")
-            fig.write_json(os.path.join(output_dir, "output.plot.json"))
-        except Exception as exc:
-            warnings.warn(f"Could not generate volcano plot: {exc}")
-
 ## Output helpers
-def write_tsv(
-    out_path:   str,
-    ens_ids:    list[str],
-    gene_names: list[str],
-    rows:       list[tuple],  # (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2) per group
-) -> None:
+def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: list[tuple]) -> None:
     """
     Write DE results to a TSV file.
     rows is a list of (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2).
@@ -237,16 +205,30 @@ def write_tsv(
                 ]
                 fh.write("\t".join(row) + "\n")
 
+def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[str], ens_ids: list[str], output_dir: str) -> None:
+    """Writes a plotly volcano plot to output.plot.json."""
+    try:
+        import plotly.graph_objects as go
 
-def build_result_json(
-    output_dataset: str,
-    n_genes:        int,
-    unique_groups:  list[str] | None = None,  # None → Modes B/C; provided → Mode A
-) -> dict:
+        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
+        x      = logfc[not_na]
+        y      = -np.log10(pvals[not_na])
+        na_idx = np.where(not_na)[0]
+        text   = [
+            f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
+            f"<br>Ensembl: {ens_ids[i]}<br>Gene: {gene_names[i]}"
+            for lfc, pv, i in zip(x, pvals[not_na], na_idx)
+        ]
+        fig = go.Figure(go.Scatter(x=x, y=y, mode="markers", text=text, hoverinfo="text", marker=dict(size=4, opacity=0.7)))
+        fig.update_layout(title="Volcano plot", xaxis_title="log Fold-Change", yaxis_title="-log10(p-value)")
+        fig.write_json(os.path.join(output_dir, "output.plot.json"))
+    except Exception as exc:
+        warnings.warn(f"Could not generate volcano plot: {exc}")
+
+def build_result_json(output_dataset: str, n_genes: int, unique_groups:  list[str] | None = None) -> dict:
     """
     Build the output.json metadata dict.
-    If unique_groups is provided (Mode A), produces multi-group metadata with flat
-    headers labelled by group name.
+    If unique_groups is provided (Mode A), produces multi-group metadata with flat headers labelled by group name.
     Otherwise (Modes B/C), produces single-comparison metadata.
     """
     if unique_groups is not None:
@@ -306,8 +288,10 @@ def run_scanpy_method(
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
     # If data is already normalized+logged, scanpy's LFC = mean(expr_g1) − mean(expr_g2) in log space  =  valid log fold-change.
-    sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
-
+    with warnings.catch_warnings(): # PerformanceWarning: DataFrame is highly fragmented. [...]
+        warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module="scanpy")
+        sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
+    
     res          = adata.uns["rank_genes_groups"]
     result_genes = np.array(res["names"]["1"])
     result_pvals = np.array(res["pvals"]["1"])
@@ -370,7 +354,9 @@ def run_scanpy_all_markers(
         sc.pp.log1p(adata)
 
     # Single pass: all groups vs. rest simultaneously
-    sc.tl.rank_genes_groups(adata, groupby="group", reference="rest", method=method, use_raw=False, n_genes=n_genes)
+    with warnings.catch_warnings(): # PerformanceWarning: DataFrame is highly fragmented. [...]
+        warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module="scanpy")
+        sc.tl.rank_genes_groups(adata, groupby="group", reference="rest", method=method, use_raw=False, n_genes=n_genes)
 
     res = adata.uns["rank_genes_groups"]
     # Build an index mapping: gene name → original position
@@ -409,7 +395,6 @@ def run_deseq2(
     batch_data:   np.ndarray | None,  # (n_cells, n_covariates) or None
     batch_names:  list[str],          # This method allows for batch as covariate in the model
     gene_names:   list[str],
-    n_cores:      int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Runs DESeq2 via pydeseq2 (counts required).
@@ -429,9 +414,12 @@ def run_deseq2(
 
     counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_names)
     design_factors = (batch_names + ["group"]) if batch_names else ["group"]
-
-    dds = DeseqDataSet(counts=counts_df, metadata=meta, design_factors=design_factors, quiet=True)
-    dds.deseq2(n_cpus=n_cores)
+    design = "~ " + " + ".join(design_factors)
+    
+    dds = DeseqDataSet(counts=counts_df, metadata=meta, design=design, quiet=True, n_cpus = 1) # n_cpus intentionally set to 1: pydeseq2 multiprocessing triggers a Python 3.12 ResourceTracker bug (ChildProcessError on worker cleanup). Single-threaded is also typically faster for per-group DESeq2 runs due to joblib spawn overhead.
+    with warnings.catch_warnings(): # UserWarning: Every gene contains at least one zero, cannot compute log geometric means. Switching to iterative mode.
+        warnings.filterwarnings("ignore", category=UserWarning, message="Every gene contains at least one zero")
+        dds.deseq2()
 
     stat_res = DeseqStats(dds, contrast=("group", "1", "2"), quiet=True)
     stat_res.summary()
@@ -459,7 +447,6 @@ def run_deseq2_all_markers(
     batch_data:   np.ndarray | None,
     batch_names:  list[str],
     gene_names:   list[str],
-    n_cores:      int,
 ) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """
     Runs DESeq2 for ALL groups vs. rest (FindAllMarkers equivalent for DESeq2).
@@ -468,13 +455,13 @@ def run_deseq2_all_markers(
     Returns a dict keyed by group name:
         group_name → (pvals, padj, lfc, ave_g1, ave_g2)  each shape (n_genes,)
     """
-    unique_groups = sorted(set(group_labels))
+    unique_groups = sorted(set(group_labels.tolist()))
     results: dict = {}
 
     for grp in unique_groups:
         print(f"  DESeq2: running group {grp!r} vs. rest ...")
         binary_labels = np.where(group_labels == grp, 1, 2).astype(int)
-        pvals, padj, lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, binary_labels, batch_data, batch_names, gene_names, n_cores)
+        pvals, padj, lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, binary_labels, batch_data, batch_names, gene_names)
         results[grp] = (pvals, padj, lfc, ave_g1, ave_g2)
 
     return results
@@ -499,8 +486,6 @@ def run(args: argparse.Namespace) -> None:
         is_count_table = False
     else:
         ErrorJSON("--is-count should be 'true' or 'false'")
-
-    nb_cores = args.nb_cores  # already validated as positive_int
 
     if method in COUNT_ONLY_METHODS and not is_count_table:
         ErrorJSON(f"Data should be a count table in order to run {method}")
@@ -602,7 +587,7 @@ def run(args: argparse.Namespace) -> None:
         print(f"Running DE method: {method} on {n_genes} genes ...")
 
         if method == "deseq2":
-            all_results = run_deseq2_all_markers(data_matrix, groups_1, batch_data, batch_names, gene_names, nb_cores)
+            all_results = run_deseq2_all_markers(data_matrix, groups_1, batch_data, batch_names, gene_names)
         else:
             all_results = run_scanpy_all_markers(data_matrix, groups_1, gene_names, method, is_count=is_count_table)
 
@@ -626,7 +611,7 @@ def run(args: argparse.Namespace) -> None:
 
         # Volcano plot — use the first group as a representative
         first_grp = unique_groups[0]
-        StatisticalHelper.write_volcano_json(all_results[first_grp][2], all_results[first_grp][0], gene_names, ens_ids, output_dir)
+        write_volcano_json(all_results[first_grp][2], all_results[first_grp][0], gene_names, ens_ids, output_dir)
 
         # JSON metadata
         result = build_result_json(args.output_dataset, n_genes, unique_groups=unique_groups)
@@ -653,7 +638,7 @@ def run(args: argparse.Namespace) -> None:
         print(f"Running DE method: {method} on {n_genes} genes ...")
 
         if method == "deseq2":
-            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, cell_group, batch_data, batch_names, gene_names, nb_cores)
+            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, cell_group, batch_data, batch_names, gene_names)
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix, cell_group, gene_names, method, is_count=is_count_table)
 
@@ -670,7 +655,7 @@ def run(args: argparse.Namespace) -> None:
         print(f"TSV written to: {out_tsv}")
 
         # VOLCANO plot - write as JSON
-        StatisticalHelper.write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+        write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
 
         # JSON for output JSON file
         result = build_result_json(args.output_dataset, n_genes)
@@ -713,7 +698,7 @@ def run(args: argparse.Namespace) -> None:
         print(f"Running DE method: {method} on {n_genes} genes ...")
 
         if method == "deseq2":
-            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix_sub, cell_group_sub, batch_data_sub, batch_names, gene_names, nb_cores)
+            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix_sub, cell_group_sub, batch_data_sub, batch_names, gene_names)
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix_sub, cell_group_sub, gene_names, method, is_count=is_count_table)
 
@@ -727,7 +712,7 @@ def run(args: argparse.Namespace) -> None:
         write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
         print(f"TSV written to: {out_tsv}")
 
-        StatisticalHelper.write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+        write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
 
         result = build_result_json(args.output_dataset, n_genes)
 
@@ -744,16 +729,6 @@ def run(args: argparse.Namespace) -> None:
 def _null(s: str | None) -> bool:
     """Returns True if a string argument represents an absent/null value."""
     return s is None or s.strip().lower() in ("", "null", "na", "none")
-
-## Validator
-def positive_int(value: str) -> int:
-    try:
-        ivalue = int(value)
-    except ValueError:
-        ErrorJSON(f"--nb-cores must be a positive integer and {value!r} is not an integer")
-    if ivalue <= 0:
-        ErrorJSON("--nb-cores must be a positive integer")
-    return ivalue
 
 ## Help text
 custom_help = """
@@ -775,7 +750,7 @@ Options:
   -f %s                  Path to the input .loom file.
   -o %s                  Output folder (default: same directory as -f).
   --method %s            DE method to use. One of:
-                           wilcoxon | t-test | t-test_overestim_var | logreg | deseq2
+                           wilcoxon | t-test | t-test_overestim_var | deseq2
   --input-dataset %s     Loom path to the expression matrix to use (e.g. /layers/norm_data).
   --output-dataset %s    Loom path where DE results will be written (e.g. /row_attrs/_de_1_wilcoxon).
   --batch %s             Comma-separated loom paths for batch/covariate columns, or "null".
@@ -789,7 +764,6 @@ Options:
                            Required when --group-dataset-2 is provided.
   --is-count %s          Whether the matrix contains raw counts: true | false (default: false).
                            Required true for deseq2.
-  --nb-cores %i          Number of cores for parallelisable steps (default: 8).
   --help                 Show this help message and exit.
 """
 
@@ -811,7 +785,6 @@ def main() -> None:
     parser.add_argument("--group1",          metavar="Group 1 label (null = all)",      default="null",                  required=False)
     parser.add_argument("--group2",          metavar="Group 2 label",                   default="null",                  required=False)
     parser.add_argument("--is-count",        metavar="Is count table [true|false]",     default="false",                 required=False, dest="is_count")
-    parser.add_argument("--nb-cores",        metavar="Number of cores [for DESeq2]",    default=8, type=positive_int,    required=False, dest="nb_cores")
 
     args = parser.parse_args()
 
