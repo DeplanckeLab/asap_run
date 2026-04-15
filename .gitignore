@@ -9,5 +9,6 @@ R/normalization.asap.3.R.bkp
 # Ignore temporary notebooks
 .ipynb_checkpoints
 
-# Ignore all compiled Java classes
-java/bin
+# Ignore all compiled Java classes except ASAP.jar
+java/bin/*
+!java/bin/ASAP.jar
