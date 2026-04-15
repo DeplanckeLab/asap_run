@@ -857,6 +857,11 @@ public class H5ADHandler
 	    		long[] shape = reader.int64().getMDArrayAttr(path, "shape").getAsFlatArray();
 	    		g.nbCells = shape[0];
 	    		g.nbGenes = shape[1];
+	    	} else if(reader.object().hasAttribute(path, "h5sparse_shape")) 
+	    	{
+	    		long[] shape = reader.int64().getMDArrayAttr(path, "h5sparse_shape").getAsFlatArray();
+	    		g.nbCells = shape[0];
+	    		g.nbGenes = shape[1];
 	    	}
 	    	else return null;
 		}
