@@ -10,6 +10,14 @@ import warnings        # For non-fatal warnings
 from pathlib import Path  # For path manipulation
 from typing import Final
 
+## Database
+from contextlib import contextmanager
+from typing import Any, Optional
+from urllib.parse import urlparse
+import psycopg2
+from psycopg2.extensions import connection as PGConnection
+from psycopg2.extras import RealDictCursor
+
 ## Scientific stack
 import h5py            # For reading/writing loom (HDF5) files
 import numpy as np     # For array calculations
@@ -31,6 +39,8 @@ COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
 BATCH_SUPPORT:      Final[set] = {"deseq2"}
 DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2"]
 DE_NB_COLS: Final[int] = 5  # Number of DE output columns stored per gene
+DEFAULT_DB_PORT: Final[int] = 5432
+DEFAULT_CONNECT_TIMEOUT: Final[int] = 10
 
 ## Error handling
 class ErrorJSON(Exception):
@@ -494,6 +504,23 @@ def run(args: argparse.Namespace) -> None:
     group1           = None if _null(args.group1)           else args.group1.strip()
     group2           = None if _null(args.group2)           else args.group2.strip()
     group_dataset_2  = None if _null(args.group_dataset_2)  else args.group_dataset_2.strip()
+
+    # Optional annotation-id based resolution: numeric group ids -> group names from annots.list_cat_json
+    if args.id is not None:
+        if _null(args.dburl):
+            ErrorJSON("--dburl is required when using --id")
+        user_env = get_env("POSTGRES_USER", required=True)
+        pass_env = get_env("POSTGRES_PASSWORD", required=True)
+        host, port, dbname = parse_host_string(args.dburl)
+        db = DBManager(host=host, dbname=dbname, port=port, user=user_env, password=pass_env)
+        db.connect()
+        try:
+            group1 = _resolve_group_name_from_annotation_id(args.id, group1, db)
+            group2 = _resolve_group_name_from_annotation_id(args.id, group2, db)
+        finally:
+            db.disconnect()
+
+    # Determine in which mode we run this script
     if group1 is None:
         # Mode A — FindAllMarkers
         if group2 is not None or group_dataset_2 is not None:
@@ -725,10 +752,148 @@ def run(args: argparse.Namespace) -> None:
         json.dump(result, fh, ensure_ascii=False, allow_nan=True)
     print(f"JSON written to: {out_json}")
 
-## Argument helpers
+## Helpers
 def _null(s: str | None) -> bool:
     """Returns True if a string argument represents an absent/null value."""
     return s is None or s.strip().lower() in ("", "null", "na", "none")
+    
+def _parse_positive_int(value: str) -> int:
+    """argparse type: positive integer (> 0)."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        ErrorJSON(f"Expected a positive integer, got {value!r}")
+    if parsed <= 0:
+        ErrorJSON(f"Expected a positive integer, got {value!r}")
+    return parsed
+
+def get_env(name: str, required: bool = False, default: str | None = None) -> str | None:
+    value = os.getenv(name, default)
+    if required and not value:
+        ErrorJSON(f"Missing required environment variable: {name}")
+    return value
+
+def parse_host_string(s: str):
+    if not s:
+        ErrorJSON("Missing dburl")
+    if "://" not in s:
+        s = "postgresql://" + s
+    u = urlparse(s)
+
+    if not u.hostname:
+        ErrorJSON("Missing host")
+    host = u.hostname
+
+    port = None
+    if u.netloc:
+        hostport = u.netloc.rsplit("@", 1)[-1]
+        parts = hostport.split(":")
+        if len(parts) == 2:
+            if parts[1].isdigit():
+                port = int(parts[1])
+            else:
+                ErrorJSON(f"Invalid port: {parts[1]!r}")
+    if port is None:
+        port = DEFAULT_DB_PORT
+
+    dbname = u.path.lstrip("/")
+    if not dbname:
+        ErrorJSON("Missing dbname")
+
+    return host, port, dbname
+
+## Database stuff
+class DBManager:
+    def __init__(self, *, dbname: str, user: str, password: str, host: str, port: int, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT, sslmode: Optional[str] = None) -> None:
+        self._base_conn_kwargs: dict[str, Any] = {
+            "dbname": dbname,
+            "user": user,
+            "password": password,
+            "port": port,
+            "connect_timeout": connect_timeout,
+            "host": host,
+        }
+        if sslmode is not None:
+            self._base_conn_kwargs["sslmode"] = sslmode
+        self._conn: PGConnection | None = None
+
+    def connect(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.cursor().execute("SELECT 1")
+                return
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                self._conn = None
+
+        try:
+            self._conn = psycopg2.connect(**self._base_conn_kwargs)
+        except Exception as e:
+            ErrorJSON(f"Failed to connect to PostgreSQL: {e}")
+
+    def disconnect(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+        finally:
+            self._conn = None
+
+    @contextmanager
+    def _cursor(self):
+        if self._conn is None or self._conn.closed:
+            ErrorJSON("Not connected. Call connect() first.")
+        cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        try:
+            yield cur
+        finally:
+            cur.close()
+
+    def get_list_cat_json(self, annotation_id: int) -> list[str]:
+        sql = "SELECT list_cat_json FROM annots WHERE id = %s"
+        with self._cursor() as cur:
+            cur.execute(sql, (annotation_id,))
+            rows = cur.fetchall()
+
+        if not rows:
+            ErrorJSON(f"No list_cat_json found in annots table with id = {annotation_id}")
+        if len(rows) > 1:
+            ErrorJSON(f"Too many list_cat_json rows found in annots table with id = {annotation_id}")
+
+        raw_json = rows[0].get("list_cat_json")
+        if raw_json is None:
+            ErrorJSON(f"No list_cat_json found in annots table with id = {annotation_id}")
+
+        try:
+            categories = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            ErrorJSON(f"Invalid JSON in annots.list_cat_json for id = {annotation_id}: {exc}")
+
+        if not isinstance(categories, list):
+            ErrorJSON(f"annots.list_cat_json should contain a JSON array for id = {annotation_id}")
+
+        return [str(cat) if cat is not None else "" for cat in categories]
+
+def _resolve_group_name_from_annotation_id(annotation_id: int, group_value: str | None, db: DBManager) -> str | None:
+    """Resolve a numeric group/category id to its display name using annots.list_cat_json."""
+    if _null(group_value):
+        return None
+
+    raw_group = group_value.strip()
+    if not raw_group.isdigit():
+        return raw_group
+
+    group_id = int(raw_group)
+    if group_id <= 0:
+        ErrorJSON(f"--group value should be a positive integer when used with --id. You entered {group_value!r}")
+
+    categories = db.get_list_cat_json(annotation_id)
+    if group_id > len(categories):
+        ErrorJSON(f"Group id {group_id} is out of range for annots.id = {annotation_id}. Available ids: 1..{len(categories)}")
+
+    group_name = categories[group_id - 1]
+    if str(group_name).strip() == "":
+        ErrorJSON(f"Group id {group_id} resolved to an empty group name for annots.id = {annotation_id}")
+    return str(group_name)
 
 ## Help text
 custom_help = """
@@ -760,8 +925,16 @@ Options:
                            If omitted, defaults to --group-dataset.
   --group1 %s            Value in --group-dataset that labels group-1 cells.
                            If omitted, runs FindAllMarkers across all groups.
+                           When --id is provided, a positive integer group id is resolved
+                           to its group name via annots.list_cat_json.
   --group2 %s            Value in --group-dataset-2 (or --group-dataset) for group-2 cells.
                            Required when --group-dataset-2 is provided.
+                           When --id is provided, a positive integer group id is resolved
+                           to its group name via annots.list_cat_json.
+  --id %s                Annotation id in DB table annots. Used to resolve numeric
+                           --group1 / --group2 ids to group names via list_cat_json.
+  --dburl %s             PostgreSQL DB URL (format HOST:PORT/DB). Required with --id.
+                           Credentials are read from POSTGRES_USER / POSTGRES_PASSWORD.
   --is-count %s          Whether the matrix contains raw counts: true | false (default: false).
                            Required true for deseq2.
   --help                 Show this help message and exit.
@@ -784,6 +957,8 @@ def main() -> None:
     parser.add_argument("--group-dataset-2", metavar="Group 2 metadata path",           default=None,                    required=False, dest="group_dataset_2")
     parser.add_argument("--group1",          metavar="Group 1 label (null = all)",      default="null",                  required=False)
     parser.add_argument("--group2",          metavar="Group 2 label",                   default="null",                  required=False)
+    parser.add_argument("--dburl",           metavar="PostgreSQL DB URL",              default=None,                    required=False)
+    parser.add_argument("--id",              metavar="Annotation id",                   type=_parse_positive_int,         required=False)
     parser.add_argument("--is-count",        metavar="Is count table [true|false]",     default="false",                 required=False, dest="is_count")
 
     args = parser.parse_args()
