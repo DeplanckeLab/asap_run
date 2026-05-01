@@ -632,7 +632,9 @@ def run(args: argparse.Namespace) -> None:
     group_dataset_2_path: str | None = None  # resolved loom path for group 2's annotation column (None → defaults to group_dataset_path in Mode C)
     group1: str | None = group1_raw
     group2: str | None = group2_raw
-    all_categories: list[str] | None = None  # full category list from DB, populated when --split-files is set
+    all_categories:   list[str] | None = None  # full category list from DB, populated when --split-files is set
+    list_cats_json_1: list[str] | None = None  # ordered category list for annotation 1 (for output JSON)
+    list_cats_json_2: list[str] | None = None  # ordered category list for annotation 2 (for output JSON, only when different from annotation 1)
 
     if use_db_g1:
         # ── DB-based resolution ─────────────────────────────────────────────────
@@ -651,9 +653,10 @@ def run(args: argparse.Namespace) -> None:
                 data_warnings.append(f"--group-dataset is redundant when --group-dataset-id is set (DB resolved path: {db_g1_path!r}). It can be omitted.")
             group_dataset_path = db_g1_path
 
-            # Fetch category list for --split-files (needed to map group names → 1-based DB index)
+            # Always fetch the category list for annotation 1 (used for output JSON and --split-files)
+            list_cats_json_1 = db.get_list_cat_json(args.group_dataset_id)
             if split_files:
-                all_categories = db.get_list_cat_json(args.group_dataset_id)
+                all_categories = list_cats_json_1
 
             # Resolve group1 numeric label → display name (if applicable)
             group1 = _resolve_group_name_from_annotation_id(args.group_dataset_id, group1_raw, db)
@@ -669,6 +672,8 @@ def run(args: argparse.Namespace) -> None:
                 group_dataset_2_path = db_g2_path
                 # Resolve group2 numeric label → display name using its own annotation id
                 group2 = _resolve_group_name_from_annotation_id(args.group_dataset_id2, group2_raw, db)
+                # Fetch category list for annotation 2 (different from annotation 1)
+                list_cats_json_2 = db.get_list_cat_json(args.group_dataset_id2)
             else:
                 # Both groups share the same annotation column — resolve group2 with group 1's id
                 group2 = _resolve_group_name_from_annotation_id(args.group_dataset_id, group2_raw, db)
@@ -758,6 +763,13 @@ def run(args: argparse.Namespace) -> None:
             batch_names = []
 
     # Loom file is now closed
+
+    # Derive category lists from loom data when DB was not used (path-based resolution)
+    if list_cats_json_1 is None:
+        list_cats_json_1 = sorted(set(groups_1.tolist()))
+    if list_cats_json_2 is None and groups_2 is not None and group_dataset_2_path != group_dataset_path:
+        list_cats_json_2 = sorted(set(groups_2.tolist()))
+
     result: dict = {}
     tsv_path: str | None = None
     split_tsv_paths: list[str] = []
@@ -952,6 +964,9 @@ def run(args: argparse.Namespace) -> None:
         result["overlapping_cells"] = len(overlap)
 
     # JSON output
+    result["list_cats_json"] = list_cats_json_1
+    if list_cats_json_2 is not None:
+        result["list_cats_json_2"] = list_cats_json_2
     if tsv_path is not None:
         result["tsv_path"] = tsv_path
     if split_tsv_paths:
