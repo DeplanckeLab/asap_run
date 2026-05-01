@@ -30,15 +30,21 @@ import pandas as pd # For matrix computation
 
 ## Constants
 AVAILABLE_METHODS: Final[list] = [
-    "wilcoxon",              # Wilcoxon rank-sum test           (scanpy)
-    "t-test",                # Student's t-test, pooled var     (scanpy)
-    "t-test_overestim_var",  # Student's t-test, per-gene var   (scanpy)
-    "deseq2",                # Negative-binomial GLM            (pydeseq2, counts only)
+    "wilcoxon",             # Wilcoxon rank-sum test           (scanpy)
+    "t_test",               # Student's t-test, pooled var     (scanpy)
+    "t_test_overestim_var", # Student's t-test, per-gene var   (scanpy)
+    "deseq2",               # Negative-binomial GLM            (pydeseq2, counts only)
 ]
+METHOD_NAME_MAP: Final[dict[str, str]] = {
+    "wilcoxon": "wilcoxon",
+    "t_test": "t-test",
+    "t_test_overestim_var": "t-test_overestim_var",
+    "deseq2": "deseq2",
+}
 COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
 BATCH_SUPPORT:      Final[set] = {"deseq2"}
 DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2"]
-DE_NB_COLS: Final[int] = 5  # Number of DE output columns stored per gene
+DE_NB_COLS: Final[int] = len(DE_HEADERS)  # Number of DE output columns stored per gene
 DEFAULT_DB_PORT: Final[int] = 5432
 DEFAULT_CONNECT_TIMEOUT: Final[int] = 10
 
@@ -185,10 +191,14 @@ class LoomHandler:
         parent = dataset_path.rsplit("/", 1)[0]
         if parent and parent not in f:
             f.require_group(parent)
-        f.create_dataset(dataset_path, data=data, compression="gzip", compression_opts=4)
+        dtype = None
+        if isinstance(data, np.ndarray) and data.dtype.kind in ("U", "S", "O"):
+            dtype = h5py.string_dtype(encoding="utf-8")
+            data = data.astype(object)
+        f.create_dataset(dataset_path, data=data, dtype=dtype, compression="gzip", compression_opts=4)
 
 ## Output helpers
-def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: list[tuple]) -> None:
+def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: list[tuple]) -> str:
     """
     Write DE results to a TSV file.
     rows is a list of (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2).
@@ -200,7 +210,9 @@ def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: li
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\t".join(headers) + "\n")
         for grp, lfc, pvals, fdr, ave_g1, ave_g2 in rows:
-            for i in range(n_genes):
+            pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)  # NaN → inf so they sort last
+            sort_idx = np.lexsort((-lfc, pvals_for_sort))  # primary: ascending p-value; secondary: descending lfc
+            for i in sort_idx:
                 row = []
                 if has_group:
                     row.append(grp)
@@ -214,8 +226,9 @@ def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: li
                     f"{ave_g2[i]}",
                 ]
                 fh.write("\t".join(row) + "\n")
+    return out_path
 
-def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[str], ens_ids: list[str], output_dir: str) -> None:
+def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[str], ens_ids: list[str], output_dir: str) -> str | None:
     """Writes a plotly volcano plot to output.plot.json."""
     try:
         import plotly.graph_objects as go
@@ -231,28 +244,30 @@ def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[st
         ]
         fig = go.Figure(go.Scatter(x=x, y=y, mode="markers", text=text, hoverinfo="text", marker=dict(size=4, opacity=0.7)))
         fig.update_layout(title="Volcano plot", xaxis_title="log Fold-Change", yaxis_title="-log10(p-value)")
-        fig.write_json(os.path.join(output_dir, "output.plot.json"))
+        out_path = os.path.join(output_dir, "output.plot.json")
+        fig.write_json(out_path)
+        return out_path
     except Exception as exc:
         warnings.warn(f"Could not generate volcano plot: {exc}")
+        return None
 
-def build_result_json(output_dataset: str, n_genes: int, unique_groups:  list[str] | None = None) -> dict:
+def build_result_json(output_dataset: str | None, n_genes: int, unique_groups:  list[str] | None = None) -> dict:
     """
     Build the output.json metadata dict.
     If unique_groups is provided (Mode A), produces multi-group metadata with flat headers labelled by group name.
     Otherwise (Modes B/C), produces single-comparison metadata.
     """
     if unique_groups is not None:
-        n_groups         = len(unique_groups)
         all_headers_flat = [f"{h} ({grp})" for grp in unique_groups for h in DE_HEADERS]
         return {
             "metadata": [
                 {
                     "name":      output_dataset,
-                    "on":        "GENE",
+                    "on":        "GLOBAL",
                     "type":      "NUMERIC",
-                    "nber_cols": DE_NB_COLS * n_groups,
+                    "nber_cols": len(all_headers_flat),
                     "nber_rows": n_genes,
-                    "headers":   all_headers_flat,
+                    "header":   all_headers_flat,
                     "groups":    unique_groups,
                 }
             ]
@@ -261,14 +276,77 @@ def build_result_json(output_dataset: str, n_genes: int, unique_groups:  list[st
         "metadata": [
             {
                 "name":      output_dataset,
-                "on":        "GENE",
+                "on":        "GLOBAL",
                 "type":      "NUMERIC",
                 "nber_cols": DE_NB_COLS,
                 "nber_rows": n_genes,
-                "headers":   DE_HEADERS,
+                "header":   DE_HEADERS,
             }
         ]
     }
+
+def build_metadata_matrix_single(ens_ids: list[str], gene_names: list[str], lfc: np.ndarray, pvals: np.ndarray, fdr: np.ndarray, ave_g1: np.ndarray, ave_g2: np.ndarray) -> tuple[np.ndarray, list[str]]:
+    headers = ["ensembl_id", "gene_name"] + DE_HEADERS
+    # Sort: ascending p-value (NaN last), secondary: descending lfc
+    pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)
+    sort_idx = np.lexsort((-lfc, pvals_for_sort))
+    ens_ids_s   = [ens_ids[i]   for i in sort_idx]
+    gene_names_s = [gene_names[i] for i in sort_idx]
+    lfc_s   = lfc[sort_idx];   pvals_s = pvals[sort_idx]
+    fdr_s   = fdr[sort_idx];   ave_g1_s = ave_g1[sort_idx];  ave_g2_s = ave_g2[sort_idx]
+    data = np.column_stack([
+        np.array(ens_ids_s, dtype=object),
+        np.array(gene_names_s, dtype=object),
+        np.array([f"{v}" if not np.isnan(v) else "NA" for v in lfc_s], dtype=object),
+        np.array([f"{v}" if not np.isnan(v) else "NA" for v in pvals_s], dtype=object),
+        np.array([f"{v}" if not np.isnan(v) else "NA" for v in fdr_s], dtype=object),
+        np.array([f"{v}" for v in ave_g1_s], dtype=object),
+        np.array([f"{v}" for v in ave_g2_s], dtype=object),
+    ])
+    return data, headers
+
+def build_metadata_matrix_all_markers(ens_ids: list[str], gene_names: list[str], unique_groups: list[str], all_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]) -> tuple[np.ndarray, list[str]]:
+    """
+    Builds the metadata matrix for FindAllMarkers in the same tall format as the TSV:
+    one row per gene per group, sorted by ascending p-value then descending lfc,
+    with a leading 'group' column. Matches write_tsv() output exactly.
+    """
+    headers = ["group", "ensembl_id", "gene_name"] + DE_HEADERS
+    rows = []
+    for grp in unique_groups:
+        pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
+        pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)
+        sort_idx = np.lexsort((-lfc, pvals_for_sort))
+        for i in sort_idx:
+            rows.append([
+                grp,
+                ens_ids[i],
+                gene_names[i],
+                f"{lfc[i]}"   if not np.isnan(lfc[i])   else "NA",
+                f"{pvals[i]}" if not np.isnan(pvals[i]) else "NA",
+                f"{padj[i]}"  if not np.isnan(padj[i])  else "NA",
+                f"{ave_g1[i]}",
+                f"{ave_g2[i]}",
+            ])
+    return np.array(rows, dtype=object), headers
+
+def write_metadata_dataset(loom_path: str, dataset_path: str, data: np.ndarray, headers: list[str]) -> str:
+    """Writes metadata dataset under /attrs and stores the column names as an attribute."""
+    if not dataset_path.startswith("/attrs/"):
+        ErrorJSON("--write-metadata path should refer to the /attrs/ path (e.g. /attrs/_de_2_wilcoxon)")
+    with LoomHandler(loom_path, mode="r+") as loom:
+        loom.write_dataset(dataset_path, data)
+        node = loom._require_open()[dataset_path]
+        if "column_names" in node.attrs:
+            del node.attrs["column_names"]
+        node.attrs["column_names"] = np.array(headers, dtype=h5py.string_dtype(encoding="utf-8"))
+    return dataset_path
+
+def _count_tested(pvals: np.ndarray) -> int:
+    return int(np.sum(~np.isnan(pvals)))
+
+def _count_significant(fdr: np.ndarray, cutoff: float = 0.05) -> int:
+    return int(np.sum((~np.isnan(fdr)) & (fdr <= cutoff)))
 
 ## DE method runners
 def run_scanpy_method(
@@ -301,7 +379,7 @@ def run_scanpy_method(
     with warnings.catch_warnings(): # PerformanceWarning: DataFrame is highly fragmented. [...]
         warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module="scanpy")
         sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
-    
+
     res          = adata.uns["rank_genes_groups"]
     result_genes = np.array(res["names"]["1"])
     result_pvals = np.array(res["pvals"]["1"])
@@ -321,12 +399,12 @@ def run_scanpy_method(
     lfc[original_idx]   = result_lfc
     padj[original_idx]  = result_padj
 
-    # Averages computed on adata.X — already normalized+logged if is_count=True, or the original scale if is_count=False. Either way, consistent with the LFC.
+    # Averages computed on the original input matrix (--input-dataset values, before any normalization/log-transform).
     # np.asarray + ravel guards against adata.X being sparse after preprocessing (sparse .mean() returns a matrix, not a 1-D array).
     mask_1 = group_labels == 1
     mask_2 = group_labels == 2
-    ave_g1 = np.asarray(adata.X[mask_1, :].mean(axis=0)).ravel()  # shape (n_genes,)
-    ave_g2 = np.asarray(adata.X[mask_2, :].mean(axis=0)).ravel()
+    ave_g1 = data_matrix[:, mask_1].mean(axis=1)  # shape (n_genes,)
+    ave_g2 = data_matrix[:, mask_2].mean(axis=1)
 
     return pvals, padj, lfc, ave_g1, ave_g2
 
@@ -378,10 +456,10 @@ def run_scanpy_all_markers(
         result_pvals = np.array(res["pvals"][grp])
         result_padj  = np.array(res["pvals_adj"][grp])
         result_lfc   = np.array(res["logfoldchanges"][grp])
-    
+
         # Map result_genes (scanpy order) → original indices in one shot
         original_idx = np.array([gene_to_idx[g] for g in result_genes])
-        
+
         pvals = np.full(n_genes, np.nan)
         lfc   = np.full(n_genes, np.nan)
         padj  = np.full(n_genes, np.nan)
@@ -392,8 +470,8 @@ def run_scanpy_all_markers(
         # np.asarray + ravel guards against adata.X being sparse after preprocessing (sparse .mean() returns a matrix, not a 1-D array).
         mask_grp  = np.array(group_labels) == grp
         mask_rest = ~mask_grp
-        ave_g1 = np.asarray(adata.X[mask_grp, :].mean(axis=0)).ravel()   # shape (n_genes,)
-        ave_g2 = np.asarray(adata.X[mask_rest, :].mean(axis=0)).ravel()
+        ave_g1 = data_matrix[:, mask_grp].mean(axis=1)    # shape (n_genes,), original input-dataset values
+        ave_g2 = data_matrix[:, mask_rest].mean(axis=1)
 
         results[grp] = (pvals, padj, lfc, ave_g1, ave_g2)
 
@@ -425,7 +503,7 @@ def run_deseq2(
     counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_names)
     design_factors = (batch_names + ["group"]) if batch_names else ["group"]
     design = "~ " + " + ".join(design_factors)
-    
+
     dds = DeseqDataSet(counts=counts_df, metadata=meta, design=design, quiet=True, n_cpus = 1) # n_cpus intentionally set to 1: pydeseq2 multiprocessing triggers a Python 3.12 ResourceTracker bug (ChildProcessError on worker cleanup). Single-threaded is also typically faster for per-group DESeq2 runs due to joblib spawn overhead.
     with warnings.catch_warnings(): # UserWarning: Every gene contains at least one zero, cannot compute log geometric means. Switching to iterative mode.
         warnings.filterwarnings("ignore", category=UserWarning, message="Every gene contains at least one zero")
@@ -441,13 +519,11 @@ def run_deseq2(
     padj  = df_reindexed["padj"].to_numpy()
     lfc   = df_reindexed["log2FoldChange"].to_numpy()
 
-    # Use DESeq2's own size-factor-normalized counts (stored by pydeseq2 after dds.deseq2()).
-    # This is the natural scale for DESeq2 averages — comparable to its LFC.
-    normed = dds.layers["normed_counts"]  # (n_cells, n_genes), numpy array
+    # Averages computed on the original input count matrix (--input-dataset values).
     mask_1 = np.array(meta["group"] == "1")
     mask_2 = np.array(meta["group"] == "2")
-    ave_g1 = normed[mask_1, :].mean(axis=0)
-    ave_g2 = normed[mask_2, :].mean(axis=0)
+    ave_g1 = data_matrix[:, mask_1].mean(axis=1)   # shape (n_genes,)
+    ave_g2 = data_matrix[:, mask_2].mean(axis=1)
 
     return pvals, padj, lfc, ave_g1, ave_g2
 
@@ -469,7 +545,6 @@ def run_deseq2_all_markers(
     results: dict = {}
 
     for grp in unique_groups:
-        print(f"  DESeq2: running group {grp!r} vs. rest ...")
         binary_labels = np.where(group_labels == grp, 1, 2).astype(int)
         pvals, padj, lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, binary_labels, batch_data, batch_names, gene_names)
         results[grp] = (pvals, padj, lfc, ave_g1, ave_g2)
@@ -487,59 +562,148 @@ def run(args: argparse.Namespace) -> None:
     output_dir = str(output_dir)
 
     # Parse scalar arguments
-    method = args.method.strip()
+    method_arg = args.method.strip()
+    method = METHOD_NAME_MAP[method_arg]
 
-    is_count_raw = args.is_count.strip().lower()
-    if is_count_raw == "true":
-        is_count_table = True
-    elif is_count_raw == "false":
-        is_count_table = False
-    else:
-        ErrorJSON("--is-count should be 'true' or 'false'")
+    is_count_table = _parse_bool_string(args.is_count, "--is-count")
+    write_tsv_output      = args.write_tsv
+    write_volcano_output  = args.write_volcano
+    write_metadata_output = args.write_metadata is not None
+    split_files           = args.split_files
+
+    if (write_tsv_output or write_volcano_output) and not args.o:
+        ErrorJSON("--write-tsv and --write-volcano require -o to be set (output folder is needed to write the files).")
+
+    if split_files and not write_tsv_output:
+        ErrorJSON("--split-files requires --write-tsv to be set.")
+    if split_files and args.group_dataset_id is None:
+        ErrorJSON("--split-files requires --group-dataset-id to be set (the file index is the 1-based position of the group in annots.list_cat_json).")
 
     if method in COUNT_ONLY_METHODS and not is_count_table:
-        ErrorJSON(f"Data should be a count table in order to run {method}")
+        ErrorJSON(f"Data should be a count table in order to run {method_arg}")
 
-    # Determine the execution mode (3 modes) from the supplied group arguments
-    group1           = None if _null(args.group1)           else args.group1.strip()
-    group2           = None if _null(args.group2)           else args.group2.strip()
-    group_dataset_2  = None if _null(args.group_dataset_2)  else args.group_dataset_2.strip()
+    if write_metadata_output:
+        if not args.write_metadata.startswith("/attrs/"):
+            ErrorJSON("--write-metadata path should refer to the /attrs/ path (e.g. /attrs/_de_2_wilcoxon)")
 
-    # Optional annotation-id based resolution: numeric group ids -> group names from annots.list_cat_json
-    if args.id is not None:
-        if _null(args.dburl):
-            ErrorJSON("--dburl is required when using --id")
+    # Init warning list early — needed before DB resolution block below
+    data_warnings: list = []
+
+    if not is_count_table:
+        data_warnings.append("Data is assumed to be logged. If it's not the case, logFC could be wrong.")
+
+    # ── Determine dataset/id resolution style ───────────────────────────────────
+    # Two mutually exclusive styles:
+    #   DB-based:   --group-dataset-id / --group-dataset-id-2   (loom path + category names fetched from DB)
+    #   Path-based: --group-dataset    / --group-dataset-2      (loom paths provided directly)
+    # Mixing styles between group 1 and group 2 is not allowed.
+
+    use_db_g1 = args.group_dataset_id  is not None   # --group-dataset-id was supplied
+    use_db_g2 = args.group_dataset_id2 is not None   # --group-dataset-id-2 was supplied
+
+    # ── Consistency checks ───────────────────────────────────────────────────────
+    # Rule: cannot use --group-dataset-id-2 without --group-dataset-id
+    if use_db_g2 and not use_db_g1:
+        ErrorJSON("--group-dataset-id-2 requires --group-dataset-id to also be set.")
+
+    # Rule: if DB-based for group 1, the second group must also be DB-based (or absent),
+    #       i.e. --group-dataset-2 (path-based) is forbidden when --group-dataset-id is set.
+    if use_db_g1 and not _null(args.group_dataset_2):
+        ErrorJSON("Cannot mix --group-dataset-id with --group-dataset-2. When --group-dataset-id is used, specify the second group annotation via --group-dataset-id-2 instead.")
+
+    # Rule: if path-based for group 1, the second group must also be path-based,
+    #       i.e. --group-dataset-id-2 is forbidden when --group-dataset is set (and --group-dataset-id is absent).
+    if not use_db_g1 and use_db_g2:
+        # Already caught by "use_db_g2 and not use_db_g1" above, but kept for clarity.
+        ErrorJSON("--group-dataset-id-2 requires --group-dataset-id to also be set.")
+
+    # ── --dburl validation ───────────────────────────────────────────────────────
+    if (use_db_g1 or use_db_g2) and _null(args.dburl):
+        ErrorJSON("--dburl is required when --group-dataset-id or --group-dataset-id-2 are set.")
+
+    if not use_db_g1 and not use_db_g2 and not _null(args.dburl):
+        data_warnings.append("--dburl is set but not used (neither --group-dataset-id nor --group-dataset-id-2 are set).")
+
+    # ── Resolve group dataset paths and group labels ─────────────────────────────
+    group1_raw: str | None = None if _null(args.group1) else args.group1.strip()
+    group2_raw: str | None = None if _null(args.group2) else args.group2.strip()
+
+    group_dataset_path:   str       # resolved loom path for group 1's annotation column
+    group_dataset_2_path: str | None = None  # resolved loom path for group 2's annotation column (None → defaults to group_dataset_path in Mode C)
+    group1: str | None = group1_raw
+    group2: str | None = group2_raw
+    all_categories: list[str] | None = None  # full category list from DB, populated when --split-files is set
+
+    if use_db_g1:
+        # ── DB-based resolution ─────────────────────────────────────────────────
         user_env = get_env("POSTGRES_USER", required=True)
         pass_env = get_env("POSTGRES_PASSWORD", required=True)
         host, port, dbname = parse_host_string(args.dburl)
         db = DBManager(host=host, dbname=dbname, port=port, user=user_env, password=pass_env)
         db.connect()
         try:
-            group1 = _resolve_group_name_from_annotation_id(args.id, group1, db)
-            group2 = _resolve_group_name_from_annotation_id(args.id, group2, db)
+            # --- Group 1 dataset path ---
+            db_g1_path = db.get_annotation_col_attr(args.group_dataset_id)
+            if not _null(args.group_dataset):
+                provided = args.group_dataset.strip()
+                if provided != db_g1_path:
+                    ErrorJSON(f"--group-dataset {provided!r} does not match the loom path in the DB for annotation id {args.group_dataset_id} ({db_g1_path!r}). Remove --group-dataset or correct the value.")
+                data_warnings.append(f"--group-dataset is redundant when --group-dataset-id is set (DB resolved path: {db_g1_path!r}). It can be omitted.")
+            group_dataset_path = db_g1_path
+
+            # Fetch category list for --split-files (needed to map group names → 1-based DB index)
+            if split_files:
+                all_categories = db.get_list_cat_json(args.group_dataset_id)
+
+            # Resolve group1 numeric label → display name (if applicable)
+            group1 = _resolve_group_name_from_annotation_id(args.group_dataset_id, group1_raw, db)
+
+            # --- Group 2 dataset path ---
+            if use_db_g2:
+                db_g2_path = db.get_annotation_col_attr(args.group_dataset_id2)
+                if not _null(args.group_dataset_2):
+                    provided2 = args.group_dataset_2.strip()
+                    if provided2 != db_g2_path:
+                        ErrorJSON(f"--group-dataset-2 {provided2!r} does not match the loom path in the DB for annotation id {args.group_dataset_id2} ({db_g2_path!r}). Remove --group-dataset-2 or correct the value.")
+                    data_warnings.append(f"--group-dataset-2 is redundant when --group-dataset-id-2 is set (DB resolved path: {db_g2_path!r}). It can be omitted.")
+                group_dataset_2_path = db_g2_path
+                # Resolve group2 numeric label → display name using its own annotation id
+                group2 = _resolve_group_name_from_annotation_id(args.group_dataset_id2, group2_raw, db)
+            else:
+                # Both groups share the same annotation column — resolve group2 with group 1's id
+                group2 = _resolve_group_name_from_annotation_id(args.group_dataset_id, group2_raw, db)
+                # group_dataset_2_path stays None here; defaults to group_dataset_path in Mode C below
         finally:
             db.disconnect()
 
-    # Determine in which mode we run this script
+    else:
+        # ── Path-based resolution ───────────────────────────────────────────────
+        if _null(args.group_dataset):
+            ErrorJSON("--group-dataset is required when --group-dataset-id is not set.")
+        group_dataset_path   = args.group_dataset.strip()
+        group_dataset_2_path = None if _null(args.group_dataset_2) else args.group_dataset_2.strip()
+
+    # ── Determine execution mode ─────────────────────────────────────────────────
+    # Mode A — FindAllMarkers: --group omitted
+    # Mode B — Single marker:  --group set, --group-2 / second dataset absent
+    # Mode C — Two-group DE:   --group and --group-2 both set (second dataset optional)
+
     if group1 is None:
         # Mode A — FindAllMarkers
-        if group2 is not None or group_dataset_2 is not None:
-            ErrorJSON("When --group1 is omitted (FindAllMarkers mode), --group2 and --group-dataset-2 must also be omitted.")
+        if group2 is not None or group_dataset_2_path is not None:
+            ErrorJSON("When --group is omitted (FindAllMarkers mode), --group-2 and --group-dataset-2 / --group-dataset-id-2 must also be omitted.")
         mode = "all_markers"
-    elif group2 is None and group_dataset_2 is None:
+    elif group2 is None and group_dataset_2_path is None:
         # Mode B — Single-group marker
         mode = "single_marker"
     else:
-        # Mode C — Standard two-group DE: require both group2 and group_dataset_2
+        # Mode C — Standard two-group DE
         if group2 is None:
-            ErrorJSON("When --group-dataset-2 is provided, --group2 must also be provided.")
-        if group_dataset_2 is None:
-            # group_dataset_2 defaults to group_dataset when only group2 is given
-            group_dataset_2 = args.group_dataset.strip()
+            ErrorJSON("When a second group dataset is provided, --group-2 must also be provided.")
+        if group_dataset_2_path is None:
+            # Default: group 2 lives in the same annotation column as group 1
+            group_dataset_2_path = group_dataset_path
         mode = "two_group"
-
-    # Init warning list
-    data_warnings: list = []
 
     # Open the loom file for reading (close it afterwards to avoid locking during DE)
     with LoomHandler(str(input_path), mode="r") as loom:
@@ -556,17 +720,17 @@ def run(args: argparse.Namespace) -> None:
         gene_names = LoomHandler._decode_str_array(gene_raw).tolist()  if gene_raw is not None else [f"Gene_{i}" for i in range(n_genes)]
 
         # Read primary group metadata (always required)
-        groups_raw_1 = loom.read_vector(args.group_dataset)
+        groups_raw_1 = loom.read_vector(group_dataset_path)
         if groups_raw_1 is None:
-            ErrorJSON(f"Group dataset {args.group_dataset!r} does not exist in the Loom file")
+            ErrorJSON(f"Group dataset {group_dataset_path!r} does not exist in the Loom file")
         groups_1 = LoomHandler._decode_str_array(groups_raw_1)
 
         # Group 2 metadata (only for Mode C, may come from a different column)
         if mode == "two_group":
-            if group_dataset_2 != args.group_dataset:
-                groups_raw_2 = loom.read_vector(group_dataset_2)
+            if group_dataset_2_path != group_dataset_path:
+                groups_raw_2 = loom.read_vector(group_dataset_2_path)
                 if groups_raw_2 is None:
-                    ErrorJSON(f"Group dataset 2 {group_dataset_2!r} does not exist in the Loom file")
+                    ErrorJSON(f"Group dataset 2 {group_dataset_2_path!r} does not exist in the Loom file")
                 groups_2 = LoomHandler._decode_str_array(groups_raw_2)
             else:
                 groups_2 = groups_1  # same column
@@ -588,13 +752,17 @@ def run(args: argparse.Namespace) -> None:
                     leaf = bp.split("/")[-1].lstrip("_")
                     batch_names.append(leaf)
                 batch_data = np.column_stack(cols)  # (n_cells, n_batch_cols)
-                print(f"{len(batch_paths)} covariate(s) detected: {', '.join(batch_names)}")
         if batch_data is not None and method not in BATCH_SUPPORT: # Warn if batch was requested for a method that does not support it
-            data_warnings.append(f"Method '{method}' does not support covariates — batch column(s) ignored. Covariate-aware DE is currently only supported by: {', '.join(sorted(BATCH_SUPPORT))}.")
+            data_warnings.append(f"Method '{method_arg}' does not support covariates — batch column(s) ignored. Covariate-aware DE is currently only supported by: {', '.join(sorted(BATCH_SUPPORT))}.")
             batch_data  = None
             batch_names = []
 
     # Loom file is now closed
+    result: dict = {}
+    tsv_path: str | None = None
+    split_tsv_paths: list[str] = []
+    volcano_path: str | None = None
+    metadata_path: str | None = None
 
     # ------------------------------------------------------------------ #
     # Mode A — FindAllMarkers                                             #
@@ -605,13 +773,12 @@ def run(args: argparse.Namespace) -> None:
             ErrorJSON("FindAllMarkers mode requires at least 2 distinct groups in --group-dataset.")
 
         # Validate minimum cell count per group
+        group_sizes = {}
         for grp in unique_groups:
-            cnt = (groups_1 == grp).sum()
+            cnt = int((groups_1 == grp).sum())
+            group_sizes[grp] = cnt
             if cnt < 3:
                 ErrorJSON(f"Group {grp!r} contains only {cnt} cell(s); at least 3 are required.")
-
-        print(f"FindAllMarkers mode: {len(unique_groups)} groups detected — {', '.join(unique_groups)}")
-        print(f"Running DE method: {method} on {n_genes} genes ...")
 
         if method == "deseq2":
             all_results = run_deseq2_all_markers(data_matrix, groups_1, batch_data, batch_names, gene_names)
@@ -620,28 +787,53 @@ def run(args: argparse.Namespace) -> None:
 
         # Stack results as (5 * n_groups, n_genes) in DE_HEADERS order [lfc, pvals, fdr, ave_g1, ave_g2] per group.
         blocks = []
+        n_genes_tested = 0
+        n_genes_fdr_le_5pct = 0
         for grp in unique_groups:
             pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
             blocks.append(np.vstack([lfc, pvals, padj, ave_g1, ave_g2]))
+            n_genes_tested += _count_tested(pvals)
+            n_genes_fdr_le_5pct += _count_significant(padj)
         data_out = np.vstack(blocks)  # shape: (5 * n_groups, n_genes)
 
-        # Loom output
-        with LoomHandler(str(input_path), mode="r+") as loom:
-            loom.write_dataset(args.output_dataset, data_out)
-            print(f"DE results written to: {args.output_dataset}")
-
         # TSV output — Extra leading column "group" to identify which group each row belongs to.
-        tsv_rows = [(grp, *all_results[grp][2:3], *all_results[grp][0:2], *all_results[grp][3:5]) for grp in unique_groups]  # (grp, lfc, pvals, fdr, ave_g1, ave_g2)
-        out_tsv = os.path.join(output_dir, "output.tsv")
-        write_tsv(out_tsv, ens_ids, gene_names, tsv_rows)
-        print(f"TSV written to: {out_tsv}")
+        if write_tsv_output:
+            if split_files:
+                # One file per group; file name is cat_{1-based DB index}.tsv
+                if all_categories is None:
+                    # Should not happen (validated earlier), but guard defensively
+                    ErrorJSON("--split-files requires --group-dataset-id so that group order in the DB is known.")
+                cat_index_map = {cat: i + 1 for i, cat in enumerate(all_categories)}
+                for grp in unique_groups:
+                    pvals_g, padj_g, lfc_g, ave_g1_g, ave_g2_g = all_results[grp]
+                    grp_idx = cat_index_map.get(grp)
+                    if grp_idx is None:
+                        ErrorJSON(f"Group {grp!r} was not found in list_cat_json for annotation id {args.group_dataset_id}. Cannot determine output file index for --split-files.")
+                    out_tsv = os.path.join(output_dir, f"cat_{grp_idx}.tsv")
+                    write_tsv(out_tsv, ens_ids, gene_names, [(None, lfc_g, pvals_g, padj_g, ave_g1_g, ave_g2_g)])
+                    split_tsv_paths.append(out_tsv)
+            else:
+                tsv_rows = [(grp, all_results[grp][2], all_results[grp][0], all_results[grp][1], all_results[grp][3], all_results[grp][4]) for grp in unique_groups]  # (grp, lfc, pvals, fdr, ave_g1, ave_g2)
+                out_tsv = os.path.join(output_dir, "output.tsv")
+                tsv_path = write_tsv(out_tsv, ens_ids, gene_names, tsv_rows)
 
-        # Volcano plot — use the first group as a representative
-        first_grp = unique_groups[0]
-        write_volcano_json(all_results[first_grp][2], all_results[first_grp][0], gene_names, ens_ids, output_dir)
+        # Volcano plot — not supported in FindAllMarkers mode (no single pairwise comparison to plot)
+        if write_volcano_output:
+            data_warnings.append("--write-volcano is not supported in FindAllMarkers mode and was skipped.")
+
+        # Metadata output
+        if write_metadata_output:
+            metadata_data, metadata_headers = build_metadata_matrix_all_markers(ens_ids, gene_names, unique_groups, all_results)
+            metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
         # JSON metadata
-        result = build_result_json(args.output_dataset, n_genes, unique_groups=unique_groups)
+        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes * len(unique_groups))
+        result["mode"] = "FindAllMarkers"
+        result["number_of_groups"] = len(unique_groups)
+        result["group_sizes"] = group_sizes
+        result["number_of_genes_tested"] = n_genes_tested
+        result["number_of_genes_with_fdr_le_5pct"] = n_genes_fdr_le_5pct
+        result["overlapping_cells"] = 0
 
     # ------------------------------------------------------------------ #
     # Mode B — Single-group marker (group1 vs. all other cells)           #
@@ -649,20 +841,19 @@ def run(args: argparse.Namespace) -> None:
     elif mode == "single_marker":
         candidates_1 = np.where(groups_1 == group1)[0]
         if len(candidates_1) == 0:
-            ErrorJSON(f"Group 1 label {group1!r} was not found in {args.group_dataset!r}.")
+            ErrorJSON(f"Group 1 label {group1!r} was not found in {group_dataset_path!r}.")
 
         cell_group = np.zeros(n_cells, dtype=int)
         cell_group[candidates_1] = 1
         cell_group[cell_group == 0] = 2  # all other cells become group 2
 
-        if (cell_group == 1).sum() < 3:
-            ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
-        if (cell_group == 2).sum() < 3:
-            ErrorJSON("Group 2 (all other cells) contains fewer than 3 cells.")
+        group1_size = int((cell_group == 1).sum())
+        group2_size = int((cell_group == 2).sum())
 
-        print(f"Marker gene mode: {group1!r} vs. all other cells.")
-        print(f"Group 1: {(cell_group == 1).sum()} cells | Group 2: {(cell_group == 2).sum()} cells")
-        print(f"Running DE method: {method} on {n_genes} genes ...")
+        if group1_size < 3:
+            ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
+        if group2_size < 3:
+            ErrorJSON("Group 2 (all other cells) contains fewer than 3 cells.")
 
         if method == "deseq2":
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, cell_group, batch_data, batch_names, gene_names)
@@ -671,21 +862,30 @@ def run(args: argparse.Namespace) -> None:
 
         data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
 
-        # LOOM - write dataset in Loom
-        with LoomHandler(str(input_path), mode="r+") as loom:
-            loom.write_dataset(args.output_dataset, data_out)
-            print(f"DE results written to: {args.output_dataset}")
-
         # TSV — no extra "group" column
-        out_tsv = os.path.join(output_dir, "output.tsv")
-        write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
-        print(f"TSV written to: {out_tsv}")
+        if write_tsv_output:
+            out_tsv = os.path.join(output_dir, "output.tsv")
+            tsv_path = write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
 
         # VOLCANO plot - write as JSON
-        write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+        if write_volcano_output:
+            volcano_path = write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+
+        # Metadata output
+        if write_metadata_output:
+            metadata_data, metadata_headers = build_metadata_matrix_single(ens_ids, gene_names, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)
+            metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
         # JSON for output JSON file
-        result = build_result_json(args.output_dataset, n_genes)
+        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes)
+        result["mode"] = "Single marker"
+        result["group_name"] = group1
+        result["group2_name"] = None
+        result["group_size"] = group1_size
+        result["group2_size"] = group2_size
+        result["number_of_genes_tested"] = _count_tested(out_pvals)
+        result["number_of_genes_with_fdr_le_5pct"] = _count_significant(out_fdr)
+        result["overlapping_cells"] = 0
 
     # ------------------------------------------------------------------ #
     # Mode C — Standard two-group DE                                      #
@@ -695,9 +895,9 @@ def run(args: argparse.Namespace) -> None:
         candidates_2 = np.where(groups_2 == group2)[0]
 
         if len(candidates_1) == 0:
-            ErrorJSON(f"Group 1 label {group1!r} was not found in {args.group_dataset!r}.")
+            ErrorJSON(f"Group 1 label {group1!r} was not found in {group_dataset_path!r}.")
         if len(candidates_2) == 0:
-            ErrorJSON(f"Group 2 label {group2!r} was not found in {group_dataset_2!r}.")
+            ErrorJSON(f"Group 2 label {group2!r} was not found in {group_dataset_2_path!r}.")
 
         # Remove cells that appear in both groups from group 2
         overlap = np.intersect1d(candidates_1, candidates_2)
@@ -715,14 +915,13 @@ def run(args: argparse.Namespace) -> None:
         cell_group_sub  = cell_group[keep_idx]
         batch_data_sub  = batch_data[keep_idx] if batch_data is not None else None
 
-        if (cell_group_sub == 1).sum() < 3:
-            ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
-        if (cell_group_sub == 2).sum() < 3:
-            ErrorJSON(f"Group 2 ({group2!r}) contains fewer than 3 cells after removing overlapping cells.")
+        group1_size = int((cell_group_sub == 1).sum())
+        group2_size = int((cell_group_sub == 2).sum())
 
-        print(f"Two-group DE: {group1!r} vs {group2!r} — discarding unassigned cells.")
-        print(f"Group 1: {(cell_group_sub == 1).sum()} cells | Group 2: {(cell_group_sub == 2).sum()} cells")
-        print(f"Running DE method: {method} on {n_genes} genes ...")
+        if group1_size < 3:
+            ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
+        if group2_size < 3:
+            ErrorJSON(f"Group 2 ({group2!r}) contains fewer than 3 cells after removing overlapping cells.")
 
         if method == "deseq2":
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix_sub, cell_group_sub, batch_data_sub, batch_names, gene_names)
@@ -731,32 +930,49 @@ def run(args: argparse.Namespace) -> None:
 
         data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
 
-        with LoomHandler(str(input_path), mode="r+") as loom:
-            loom.write_dataset(args.output_dataset, data_out)
-            print(f"DE results written to: {args.output_dataset}")
+        if write_tsv_output:
+            out_tsv = os.path.join(output_dir, "output.tsv")
+            tsv_path = write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
 
-        out_tsv = os.path.join(output_dir, "output.tsv")
-        write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
-        print(f"TSV written to: {out_tsv}")
+        if write_volcano_output:
+            volcano_path = write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
 
-        write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
+        if write_metadata_output:
+            metadata_data, metadata_headers = build_metadata_matrix_single(ens_ids, gene_names, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)
+            metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
-        result = build_result_json(args.output_dataset, n_genes)
+        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes)
+        result["mode"] = "Two-group DE"
+        result["group_name"] = group1
+        result["group2_name"] = group2
+        result["group_size"] = group1_size
+        result["group2_size"] = group2_size
+        result["number_of_genes_tested"] = _count_tested(out_pvals)
+        result["number_of_genes_with_fdr_le_5pct"] = _count_significant(out_fdr)
+        result["overlapping_cells"] = len(overlap)
 
     # JSON output
+    if tsv_path is not None:
+        result["tsv_path"] = tsv_path
+    if split_tsv_paths:
+        result["tsv_paths"] = split_tsv_paths
+    if volcano_path is not None:
+        result["volcano_path"] = volcano_path
     if data_warnings:
         result["warnings"] = data_warnings
 
-    out_json = os.path.join(output_dir, "output.json")
-    with open(out_json, "w", encoding="utf-8") as fh:
-        json.dump(result, fh, ensure_ascii=False, allow_nan=True)
-    print(f"JSON written to: {out_json}")
+    if args.o:
+        out_json = os.path.join(output_dir, "output.json")
+        with open(out_json, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False, allow_nan=True)
+    else:
+        print(json.dumps(result, ensure_ascii=False, allow_nan=True))
 
 ## Helpers
 def _null(s: str | None) -> bool:
     """Returns True if a string argument represents an absent/null value."""
     return s is None or s.strip().lower() in ("", "null", "na", "none")
-    
+
 def _parse_positive_int(value: str) -> int:
     """argparse type: positive integer (> 0)."""
     try:
@@ -766,6 +982,15 @@ def _parse_positive_int(value: str) -> int:
     if parsed <= 0:
         ErrorJSON(f"Expected a positive integer, got {value!r}")
     return parsed
+
+def _parse_bool_string(value: str, parameter_name: str) -> bool:
+    """Parses a string boolean argument."""
+    raw_value = value.strip().lower()
+    if raw_value == "true":
+        return True
+    if raw_value == "false":
+        return False
+    ErrorJSON(f"{parameter_name} should be 'true' or 'false'")
 
 def get_env(name: str, required: bool = False, default: str | None = None) -> str | None:
     value = os.getenv(name, default)
@@ -848,6 +1073,30 @@ class DBManager:
         finally:
             cur.close()
 
+    def get_annotation_col_attr(self, annotation_id: int) -> str:
+        """
+        Fetch the loom dataset path for a given annotation id.
+
+        NOTE: This query assumes a column named 'name' in the 'annots' table
+        that stores the full HDF5 path to the annotation column in the loom file
+        (e.g. '/col_attrs/CellType'). Adjust the column name to match your DB schema.
+        """
+        sql = "SELECT name FROM annots WHERE id = %s"
+        with self._cursor() as cur:
+            cur.execute(sql, (annotation_id,))
+            rows = cur.fetchall()
+
+        if not rows:
+            ErrorJSON(f"No annotation found in annots table with id = {annotation_id}")
+        if len(rows) > 1:
+            ErrorJSON(f"Multiple rows found in annots table with id = {annotation_id}")
+
+        path = rows[0].get("name")
+        if path is None or str(path).strip() == "":
+            ErrorJSON(f"name is empty or NULL for annotation id = {annotation_id}")
+
+        return str(path).strip()
+
     def get_list_cat_json(self, annotation_id: int) -> list[str]:
         sql = "SELECT list_cat_json FROM annots WHERE id = %s"
         with self._cursor() as cur:
@@ -884,15 +1133,15 @@ def _resolve_group_name_from_annotation_id(annotation_id: int, group_value: str 
 
     group_id = int(raw_group)
     if group_id <= 0:
-        ErrorJSON(f"--group value should be a positive integer when used with --id. You entered {group_value!r}")
+        ErrorJSON(f"--group value should be a positive integer when used with --group-dataset-id. You entered {group_value!r}")
 
     categories = db.get_list_cat_json(annotation_id)
     if group_id > len(categories):
-        ErrorJSON(f"Group id {group_id} is out of range for annots.id = {annotation_id}. Available ids: 1..{len(categories)}")
+        ErrorJSON(f"Group id {group_id} is out of range for annotation id = {annotation_id}. Available ids: 1..{len(categories)}")
 
     group_name = categories[group_id - 1]
     if str(group_name).strip() == "":
-        ErrorJSON(f"Group id {group_id} resolved to an empty group name for annots.id = {annotation_id}")
+        ErrorJSON(f"Group id {group_id} resolved to an empty group name for annotation id = {annotation_id}")
     return str(group_name)
 
 ## Help text
@@ -901,43 +1150,80 @@ Differential Expression (Python / Scanpy)
 
 Execution modes
 ───────────────
-  FindAllMarkers  Omit --group1 (and --group2 / --group-dataset-2).
-                  Every group in --group-dataset is tested vs. all other cells.
+  FindAllMarkers  Omit --group (and --group-2 / --group-dataset-id-2 / --group-dataset-2).
+                  Every group in the annotation column is tested vs. all other cells.
                   Output TSV contains an extra leading "group" column.
 
-  Single marker   Provide --group1 only (omit --group2 / --group-dataset-2).
-                  Runs group1 vs. all other cells.
+  Single marker   Provide --group only (omit --group-2 and second-dataset arguments).
+                  Runs group vs. all other cells.
 
-  Two-group DE    Provide all four group arguments.
+  Two-group DE    Provide --group and --group-2.
                   Standard pairwise DE; overlapping cells are removed from group 2.
 
+Dataset / annotation resolution (two mutually exclusive styles — do not mix):
+───────────────────────────────────────────────────────────────────────────────
+  DB-based (--group-dataset-id / --group-dataset-id-2):
+    The loom column path and category list are fetched from the database.
+    Requires --dburl. Group labels can be provided as numeric category ids.
+    If --group-dataset or --group-dataset-2 are also set, they must match
+    the DB-resolved path or an error is raised (a warning is emitted if they match).
+
+  Path-based (--group-dataset / --group-dataset-2):
+    Loom column paths are provided directly. No DB connection needed.
+
 Options:
-  -f %s                  Path to the input .loom file.
-  -o %s                  Output folder (default: same directory as -f).
-  --method %s            DE method to use. One of:
-                           wilcoxon | t-test | t-test_overestim_var | deseq2
-  --input-dataset %s     Loom path to the expression matrix to use (e.g. /layers/norm_data).
-  --output-dataset %s    Loom path where DE results will be written (e.g. /row_attrs/_de_1_wilcoxon).
-  --batch %s             Comma-separated loom paths for batch/covariate columns, or "null".
-                           Only used by deseq2.
-  --group-dataset %s     Loom path to the obs-level metadata column (always required).
-  --group-dataset-2 %s   Loom path to the obs-level metadata defining group 2 cells (two-group DE only).
-                           If omitted, defaults to --group-dataset.
-  --group1 %s            Value in --group-dataset that labels group-1 cells.
-                           If omitted, runs FindAllMarkers across all groups.
-                           When --id is provided, a positive integer group id is resolved
-                           to its group name via annots.list_cat_json.
-  --group2 %s            Value in --group-dataset-2 (or --group-dataset) for group-2 cells.
-                           Required when --group-dataset-2 is provided.
-                           When --id is provided, a positive integer group id is resolved
-                           to its group name via annots.list_cat_json.
-  --id %s                Annotation id in DB table annots. Used to resolve numeric
-                           --group1 / --group2 ids to group names via list_cat_json.
-  --dburl %s             PostgreSQL DB URL (format HOST:PORT/DB). Required with --id.
-                           Credentials are read from POSTGRES_USER / POSTGRES_PASSWORD.
-  --is-count %s          Whether the matrix contains raw counts: true | false (default: false).
-                           Required true for deseq2.
-  --help                 Show this help message and exit.
+  -f %s                      Path to the input .loom file.
+  -o %s                      Output folder (default: same directory as -f).
+  --method %s                DE method to use. One of:
+                               wilcoxon | t_test | t_test_overestim_var | deseq2
+  --input-dataset %s         Loom path to the expression matrix (e.g. /layers/norm_data).
+  --batch %s                 Comma-separated loom paths for batch/covariate columns, or "null".
+                               Only used by deseq2.
+
+  -- DB-based dataset resolution --
+  --group-dataset-id %s      Annotation id in the DB annots table for group 1.
+                               Fetches the loom column path and category names from DB.
+                               Requires --dburl. Group labels may be numeric category ids.
+  --group-dataset-id-2 %s    Annotation id in the DB annots table for group 2.
+                               Required when group 2 uses a different annotation than group 1.
+                               Requires --group-dataset-id to also be set.
+  --dburl %s                 PostgreSQL DB URL (format HOST:PORT/DB). Required when
+                               --group-dataset-id or --group-dataset-id-2 are set.
+                               Credentials read from POSTGRES_USER / POSTGRES_PASSWORD env vars.
+
+  -- Path-based dataset resolution --
+  --group-dataset %s         Loom path to the obs-level annotation column for group 1.
+                               Required when --group-dataset-id is not set.
+                               If set together with --group-dataset-id, must match the DB path
+                               (a warning is emitted; the DB path takes precedence).
+  --group-dataset-2 %s       Loom path to the obs-level annotation column for group 2.
+                               Defaults to --group-dataset when omitted.
+                               Cannot be combined with --group-dataset-id.
+
+  -- Group labels --
+  --group %s                 Value in the group-1 annotation that labels group-1 cells.
+                               If omitted, runs FindAllMarkers across all groups.
+                               When --group-dataset-id is set, a positive integer is resolved
+                               to its category name via annots.list_cat_json.
+  --group-2 %s               Value in the group-2 annotation that labels group-2 cells.
+                               Required for two-group DE.
+                               When --group-dataset-id-2 (or --group-dataset-id) is set,
+                               a positive integer is resolved via annots.list_cat_json.
+
+  -- Flags --
+  --is-count %s              Whether the matrix contains raw counts: true | false (default: false).
+                               Required true for deseq2.
+  --write-tsv                Write output.tsv (requires -o).
+  --write-volcano            Write output.plot.json volcano plot (requires -o).
+  --write-metadata %s        Write the TSV-like metadata dataset in the loom at the given /attrs/ path
+                               (e.g. --write-metadata /attrs/_de_2_wilcoxon). Default: disabled.
+  --split-files              FindAllMarkers + --write-tsv only: write one TSV per group
+                               (cat_1.tsv, cat_2.tsv, ...) instead of a single output.tsv.
+                               Requires --group-dataset-id (the file index is the 1-based
+                               position of the group in annots.list_cat_json).
+                               Does not affect --write-metadata (the single metadata dataset
+                               with its extra "group" column is always written as usual).
+  --help                     Show this help message and exit.
 """
 
 ## Entry point
@@ -947,19 +1233,31 @@ def main() -> None:
         sys.exit(0)
 
     parser = argparse.ArgumentParser(description="Differential Expression Script", add_help=False)
-    parser.add_argument("-f",                metavar="Input loom file",                                                  required=True)
-    parser.add_argument("-o",                metavar="Output folder",                                                    required=False)
-    parser.add_argument("--method",          metavar="DE method",                       choices=AVAILABLE_METHODS,       required=True)
-    parser.add_argument("--input-dataset",   metavar="Input matrix dataset",                                             required=True,  dest="input_dataset")
-    parser.add_argument("--output-dataset",  metavar="Output DE dataset",                                                required=True,  dest="output_dataset")
-    parser.add_argument("--batch",           metavar="Batch/covariate datasets",        default="null",                  required=False)
-    parser.add_argument("--group-dataset",   metavar="Group metadata path",                                              required=True,  dest="group_dataset")
-    parser.add_argument("--group-dataset-2", metavar="Group 2 metadata path",           default=None,                    required=False, dest="group_dataset_2")
-    parser.add_argument("--group1",          metavar="Group 1 label (null = all)",      default="null",                  required=False)
-    parser.add_argument("--group2",          metavar="Group 2 label",                   default="null",                  required=False)
-    parser.add_argument("--dburl",           metavar="PostgreSQL DB URL",              default=None,                    required=False)
-    parser.add_argument("--id",              metavar="Annotation id",                   type=_parse_positive_int,         required=False)
-    parser.add_argument("--is-count",        metavar="Is count table [true|false]",     default="false",                 required=False, dest="is_count")
+    parser.add_argument("-f",                    metavar="Input loom file",                                              required=True)
+    parser.add_argument("-o",                    metavar="Output folder",                                                required=False)
+    parser.add_argument("--method",              metavar="DE method",                       choices=AVAILABLE_METHODS,   required=True)
+    parser.add_argument("--input-dataset",       metavar="Input matrix dataset",                                         required=True,  dest="input_dataset")
+    parser.add_argument("--batch",               metavar="Batch/covariate datasets",        default="null",              required=False)
+
+    # DB-based dataset resolution
+    parser.add_argument("--group-dataset-id",    metavar="Annotation id (group 1)",         type=_parse_positive_int,    required=False, dest="group_dataset_id",  default=None)
+    parser.add_argument("--group-dataset-id-2",  metavar="Annotation id (group 2)",         type=_parse_positive_int,    required=False, dest="group_dataset_id2", default=None)
+    parser.add_argument("--dburl",               metavar="PostgreSQL DB URL",               default=None,                required=False)
+
+    # Path-based dataset resolution
+    parser.add_argument("--group-dataset",       metavar="Group 1 annotation path",                                      required=False, dest="group_dataset",   default=None)
+    parser.add_argument("--group-dataset-2",     metavar="Group 2 annotation path",         default=None,                required=False, dest="group_dataset_2")
+
+    # Group labels
+    parser.add_argument("--group",             metavar="Group 1 label (null = all)",      default="null",              required=False, dest="group1")
+    parser.add_argument("--group-2",           metavar="Group 2 label",                   default="null",              required=False, dest="group2")
+
+    # Flags
+    parser.add_argument("--is-count",          metavar="Is count table [true|false]",     default="false",             required=False, dest="is_count")
+    parser.add_argument("--write-tsv",         action="store_true",                       required=False,              dest="write_tsv")
+    parser.add_argument("--write-volcano",     action="store_true",                       required=False,              dest="write_volcano")
+    parser.add_argument("--write-metadata",    metavar="Output metadata dataset path",    required=False,              dest="write_metadata", default=None)
+    parser.add_argument("--split-files",       action="store_true",                       required=False,              dest="split_files")
 
     args = parser.parse_args()
 
