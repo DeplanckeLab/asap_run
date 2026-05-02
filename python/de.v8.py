@@ -279,9 +279,8 @@ def _load_expression_matrix_with_optional_npy_cache(
     return data_matrix
 
 
-def _preview_parse_args(args: argparse.Namespace) -> tuple[bool, int | None, float | None, int, int, int]:
-    """Returns (active, max_genes_or_none, cell_fraction_or_none, seed, min_cells, max_cells). Inactive if both limits unset."""
-    mg = getattr(args, "preview_max_genes", None)
+def _preview_parse_args(args: argparse.Namespace) -> tuple[bool, float | None, int, int, int]:
+    """Returns (active, cell_fraction_or_none, seed, min_cells, max_cells). Preview is on only when --preview-cell-fraction is set."""
     fr = getattr(args, "preview_cell_fraction", None)
     seed = int(getattr(args, "preview_seed", 42))
     min_cells = int(getattr(args, "preview_min_cells", 1000))
@@ -292,17 +291,15 @@ def _preview_parse_args(args: argparse.Namespace) -> tuple[bool, int | None, flo
         ErrorJSON("--preview-max-cells must be >= 1")
     if max_cells < min_cells:
         ErrorJSON("--preview-max-cells must be >= --preview-min-cells")
-    if mg is None and fr is None:
-        return False, None, None, seed, min_cells, max_cells
-    if mg is not None and mg < 1:
-        ErrorJSON("--preview-max-genes must be >= 1 when set")
-    if fr is not None and (fr <= 0.0 or fr > 1.0):
+    if fr is None:
+        return False, None, seed, min_cells, max_cells
+    if fr <= 0.0 or fr > 1.0:
         ErrorJSON("--preview-cell-fraction must be in (0, 1] when set")
-    return True, mg, fr, seed, min_cells, max_cells
+    return True, fr, seed, min_cells, max_cells
 
 
 def _preview_cap_total_cells(cell_idx: np.ndarray, max_cells: int, rng: np.random.Generator) -> np.ndarray:
-    """Used when preview has no cell fraction (or fraction >= 1): cap total cell count uniformly at random."""
+    """Uniformly subsample cell_idx without replacement when len(cell_idx) exceeds max_cells."""
     cell_idx = np.asarray(cell_idx, dtype=np.intp)
     n = int(cell_idx.size)
     if n <= max_cells:
@@ -328,7 +325,7 @@ def _preview_stratified_cell_indices(
       Random sample without replacement when k < ng.
 
     If fraction is None or >= 1, returns arange(n) (no per-stratum subsampling); caller may apply
-    a global cap with _preview_cap_total_cells when no fraction is in use.
+    a global cap with _preview_cap_total_cells (e.g. when fraction is 1.0).
     """
     labels = np.asarray(labels)
     n = int(labels.shape[0])
@@ -350,72 +347,82 @@ def _preview_stratified_cell_indices(
     return np.sort(np.concatenate(picked))
 
 
-def _preview_gene_row_indices(n_genes: int, max_genes: int | None, rng: np.random.Generator) -> np.ndarray:
-    """Random subset of row indices; all genes if max_genes is None or >= n_genes."""
-    if max_genes is None or max_genes >= n_genes:
-        return np.arange(n_genes, dtype=np.intp)
-    k = max(1, min(int(max_genes), n_genes))
-    return np.sort(rng.choice(n_genes, size=k, replace=False))
+def _de_table_gene_order_pairwise(
+    lfc: np.ndarray,
+    pvals: np.ndarray,
+    pool: np.ndarray,
+    n_top_per_direction: int | None,
+) -> np.ndarray:
+    """
+    Row order for pairwise DE tables: gene indices into full vectors.
+
+    If n_top_per_direction is None: all genes in pool, sorted by ascending p-value then descending LFC.
+
+    If set: up to n_top genes with LFC > 0 ranked by ascending p then descending LFC, then up to n_top genes
+    with LFC < 0 ranked by ascending p then ascending LFC (strongest down first). Genes need finite p-values.
+    """
+    pool = np.asarray(pool, dtype=np.intp).ravel()
+    pool = pool[(pool >= 0) & (pool < int(lfc.shape[0]))]
+    if pool.size == 0:
+        return np.empty(0, dtype=np.intp)
+    if n_top_per_direction is None:
+        pv = pvals[pool]
+        lf = lfc[pool]
+        return pool[np.lexsort((-lf, np.where(np.isnan(pv), np.inf, pv)))]
+    n_top = int(n_top_per_direction)
+    up = pool[(lfc[pool] > 0.0) & np.isfinite(pvals[pool])]
+    down = pool[(lfc[pool] < 0.0) & np.isfinite(pvals[pool])]
+    parts: list[np.ndarray] = []
+    if int(up.size) > 0:
+        pv = pvals[up]
+        lf = lfc[up]
+        ord_up = up[np.lexsort((-lf, np.where(np.isnan(pv), np.inf, pv)))]
+        parts.append(ord_up[:n_top])
+    if int(down.size) > 0:
+        pv = pvals[down]
+        lf = lfc[down]
+        ord_dn = down[np.lexsort((lf, np.where(np.isnan(pv), np.inf, pv)))]
+        parts.append(ord_dn[:n_top])
+    if not parts:
+        return np.empty(0, dtype=np.intp)
+    return np.concatenate(parts)
 
 
-def _preview_scatter_1d(n_full: int, gene_idx: np.ndarray, arr_sub: np.ndarray, fill: float = np.nan) -> np.ndarray:
-    out = np.full(n_full, fill, dtype=np.float64)
-    out[gene_idx] = np.asarray(arr_sub, dtype=np.float64)
-    return out
-
-
-def _preview_scatter_all_markers_results(
+def _fam_table_row_count(
+    unique_groups: list[str],
     all_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
-    gene_idx: np.ndarray,
-    n_genes_full: int,
-) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    if int(gene_idx.size) == n_genes_full and bool(np.all(gene_idx == np.arange(n_genes_full))):
-        return all_results
-    out: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-    for grp, tup in all_results.items():
-        pvals, padj, lfc, ave_g1, ave_g2 = tup
-        out[grp] = (
-            _preview_scatter_1d(n_genes_full, gene_idx, pvals),
-            _preview_scatter_1d(n_genes_full, gene_idx, padj),
-            _preview_scatter_1d(n_genes_full, gene_idx, lfc),
-            _preview_scatter_1d(n_genes_full, gene_idx, ave_g1),
-            _preview_scatter_1d(n_genes_full, gene_idx, ave_g2),
-        )
-    return out
-
-
-def _preview_scatter_pairwise_tuple(
-    tup: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    gene_idx: np.ndarray,
-    n_genes_full: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    pvals, padj, lfc, ave_g1, ave_g2 = tup
-    if int(gene_idx.size) == n_genes_full and bool(np.all(gene_idx == np.arange(n_genes_full))):
-        return tup
-    return (
-        _preview_scatter_1d(n_genes_full, gene_idx, pvals),
-        _preview_scatter_1d(n_genes_full, gene_idx, padj),
-        _preview_scatter_1d(n_genes_full, gene_idx, lfc),
-        _preview_scatter_1d(n_genes_full, gene_idx, ave_g1),
-        _preview_scatter_1d(n_genes_full, gene_idx, ave_g2),
-    )
+    pool: np.ndarray,
+    n_top_per_direction: int | None,
+) -> int:
+    n = 0
+    for grp in unique_groups:
+        pvals, _padj, lfc, _a1, _a2 = all_results[grp]
+        n += int(_de_table_gene_order_pairwise(lfc, pvals, pool, n_top_per_direction).size)
+    return n
 
 
 ## Output helpers
-def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: list[tuple]) -> str:
+def write_tsv(
+    out_path: str,
+    ens_ids: list[str],
+    gene_names: list[str],
+    rows: list[tuple],
+    table_top_de_per_direction: int | None = None,
+) -> str:
     """
     Write DE results to a TSV file.
     rows is a list of (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2).
     If group_label is not None for the first entry, a leading 'group' column is included.
+    table_top_de_per_direction: if set, only top N up- and top N down-regulated genes by p-value (see _de_table_gene_order_pairwise).
     """
     has_group = rows[0][0] is not None
     headers   = list(DE_METADATA_HEADERS_ALL_MARKERS) if has_group else list(DE_METADATA_HEADERS_PAIRWISE)
     n_genes   = len(gene_names)
+    sub = np.arange(n_genes, dtype=np.intp)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\t".join(headers) + "\n")
         for grp, lfc, pvals, fdr, ave_g1, ave_g2 in rows:
-            pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)  # NaN → inf so they sort last
-            sort_idx = np.lexsort((-lfc, pvals_for_sort))  # primary: ascending p-value; secondary: descending lfc
+            sort_idx = _de_table_gene_order_pairwise(lfc, pvals, sub, table_top_de_per_direction)
             for i in sort_idx:
                 row = []
                 if has_group:
@@ -463,6 +470,16 @@ def _unique_categories_sorted(groups: np.ndarray) -> list[str]:
     labels = [str(x) for x in groups.tolist()]
     return sorted(set(labels))
 
+def _de_table_for_json(metadata_data: np.ndarray, headers: list[str]) -> dict[str, object]:
+    """Same row order and string formatting as TSV / metadata matrix; JSON-serializable (no numpy scalars)."""
+    n_rows, n_cols = int(metadata_data.shape[0]), int(metadata_data.shape[1])
+    hdr = list(headers)
+    rows: list[list[str]] = []
+    for i in range(n_rows):
+        rows.append([str(metadata_data[i, j]) for j in range(n_cols)])
+    return {"headers": hdr, "rows": rows}
+
+
 def build_result_json(
     output_dataset: str | None,
     nber_rows: int,
@@ -502,11 +519,20 @@ def build_result_json(
         ]
     }
 
-def build_metadata_matrix_single(ens_ids: list[str], gene_names: list[str], lfc: np.ndarray, pvals: np.ndarray, fdr: np.ndarray, ave_g1: np.ndarray, ave_g2: np.ndarray) -> tuple[np.ndarray, list[str]]:
+def build_metadata_matrix_single(
+    ens_ids: list[str],
+    gene_names: list[str],
+    lfc: np.ndarray,
+    pvals: np.ndarray,
+    fdr: np.ndarray,
+    ave_g1: np.ndarray,
+    ave_g2: np.ndarray,
+    table_top_de_per_direction: int | None = None,
+) -> tuple[np.ndarray, list[str]]:
     headers = list(DE_METADATA_HEADERS_PAIRWISE)
-    # Sort: ascending p-value (NaN last), secondary: descending lfc
-    pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)
-    sort_idx = np.lexsort((-lfc, pvals_for_sort))
+    n_genes = len(ens_ids)
+    sub = np.arange(n_genes, dtype=np.intp)
+    sort_idx = _de_table_gene_order_pairwise(lfc, pvals, sub, table_top_de_per_direction)
     ens_ids_s   = [ens_ids[i]   for i in sort_idx]
     gene_names_s = [gene_names[i] for i in sort_idx]
     lfc_s   = lfc[sort_idx];   pvals_s = pvals[sort_idx]
@@ -522,18 +548,25 @@ def build_metadata_matrix_single(ens_ids: list[str], gene_names: list[str], lfc:
     ])
     return data, headers
 
-def build_metadata_matrix_all_markers(ens_ids: list[str], gene_names: list[str], unique_groups: list[str], all_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]) -> tuple[np.ndarray, list[str]]:
+def build_metadata_matrix_all_markers(
+    ens_ids: list[str],
+    gene_names: list[str],
+    unique_groups: list[str],
+    all_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    table_top_de_per_direction: int | None = None,
+) -> tuple[np.ndarray, list[str]]:
     """
     Builds the metadata matrix for FindAllMarkers in the same tall format as the TSV:
     one row per gene per group, sorted by ascending p-value then descending lfc,
     with a leading 'group' column. Matches write_tsv() output exactly.
     """
     headers = list(DE_METADATA_HEADERS_ALL_MARKERS)
+    n_genes = len(gene_names)
+    sub = np.arange(n_genes, dtype=np.intp)
     rows = []
     for grp in unique_groups:
         pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
-        pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)
-        sort_idx = np.lexsort((-lfc, pvals_for_sort))
+        sort_idx = _de_table_gene_order_pairwise(lfc, pvals, sub, table_top_de_per_direction)
         for i in sort_idx:
             rows.append([
                 str(grp),
@@ -1151,11 +1184,13 @@ def run_deseq2_all_markers(
 def run(args: argparse.Namespace) -> None:
     """Core DE logic, called after argument validation."""
 
-    # Resolve output directory
+    # Resolve output directory (only create when -o is set; TSV/volcano/JSON file output require it).
     input_path = Path(args.f).resolve()
-    output_dir = Path(args.o).resolve() if args.o else input_path.parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_dir = str(output_dir)
+    if args.o:
+        output_dir = str(Path(args.o).resolve())
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    else:
+        output_dir = str(input_path.parent)
 
     # Parse scalar arguments
     method_arg = args.method.strip()
@@ -1165,17 +1200,10 @@ def run(args: argparse.Namespace) -> None:
     write_tsv_output      = args.write_tsv
     write_volcano_output  = args.write_volcano
     write_metadata_output = args.write_metadata is not None
-    split_files           = args.split_files
+    split_files = args.split_files
 
     if (write_tsv_output or write_volcano_output) and not args.o:
         ErrorJSON("--write-tsv and --write-volcano require -o to be set (output folder is needed to write the files).")
-
-    if split_files and not write_tsv_output:
-        ErrorJSON("--split-files requires --write-tsv to be set.")
-    if split_files and _null(args.group_dataset):
-        ErrorJSON("--split-files requires --group-dataset (loom path to the primary annotation column).")
-    if split_files and not _null(args.group1):
-        ErrorJSON("--split-files is only valid in FindAllMarkers mode (omit --group).")
 
     if method in COUNT_ONLY_METHODS and not is_count_table:
         ErrorJSON(f"Data should be a count table in order to run {method_arg}")
@@ -1184,12 +1212,30 @@ def run(args: argparse.Namespace) -> None:
         if not args.write_metadata.startswith("/attrs/"):
             ErrorJSON("--write-metadata path should refer to the /attrs/ path (e.g. /attrs/_de_2_wilcoxon)")
 
+    tt_raw = getattr(args, "table_top_de_per_direction", None)
+    if tt_raw is not None and int(tt_raw) < 1:
+        ErrorJSON("--table-top-de-per-direction must be >= 1 when set")
+    table_top_de_per_direction: int | None = None if tt_raw is None else int(tt_raw)
+
     data_warnings: list = []
 
     if not is_count_table:
         data_warnings.append("Data is assumed to be logged. If it's not the case, logFC could be wrong.")
 
-    preview_active, preview_mg, preview_fr, preview_seed, preview_min_cells, preview_max_cells = _preview_parse_args(args)
+    if split_files and not args.o:
+        data_warnings.append(
+            "--split-files was ignored because -o is not set; per-category cat_N.tsv files require an output folder."
+        )
+    split_files = bool(split_files and args.o)
+
+    if split_files and not write_tsv_output:
+        ErrorJSON("--split-files requires --write-tsv to be set.")
+    if split_files and _null(args.group_dataset):
+        ErrorJSON("--split-files requires --group-dataset (loom path to the primary annotation column).")
+    if split_files and not _null(args.group1):
+        ErrorJSON("--split-files is only valid in FindAllMarkers mode (omit --group).")
+
+    preview_active, preview_fr, preview_seed, preview_min_cells, preview_max_cells = _preview_parse_args(args)
     rng = np.random.default_rng(preview_seed)
 
     if _null(args.group_dataset):
@@ -1326,16 +1372,11 @@ def run(args: argparse.Namespace) -> None:
             if cnt < 3:
                 ErrorJSON(f"Group {grp!r} contains only {cnt} cell(s); at least 3 are required.")
 
-        preview_gene_idx: np.ndarray | None = None
-        preview_n_genes_full: int | None = None
-        gene_names_full_list = list(gene_names)
-        ens_ids_full_list = list(ens_ids)
         n_cells_full_am = int(n_cells)
         if preview_active:
             cell_idx = _preview_stratified_cell_indices(groups_1, preview_fr, rng, preview_min_cells, preview_max_cells)
             if preview_fr is None or preview_fr >= 1.0:
                 cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
-            gene_idx = _preview_gene_row_indices(n_genes, preview_mg, rng)
             g1_sub = groups_1[cell_idx]
             for grp in unique_groups:
                 if int((g1_sub == grp).sum()) < 3:
@@ -1343,21 +1384,16 @@ def run(args: argparse.Namespace) -> None:
                         f"After preview subsampling, group {grp!r} has fewer than 3 cells; "
                         "increase --preview-cell-fraction or disable preview."
                     )
-            preview_gene_idx = gene_idx
-            preview_n_genes_full = int(n_genes)
-            data_matrix = data_matrix[np.ix_(gene_idx, cell_idx)]
+            data_matrix = data_matrix[:, cell_idx]
             groups_1 = groups_1[cell_idx]
             if groups_2 is not None:
                 groups_2 = groups_2[cell_idx]
             if batch_data is not None:
                 batch_data = batch_data[cell_idx]
-            gene_names = [gene_names_full_list[int(i)] for i in gene_idx]
-            ens_ids = [ens_ids_full_list[int(i)] for i in gene_idx]
             n_genes, n_cells = data_matrix.shape
             data_warnings.append(
-                f"Preview DE: genes {n_genes}/{preview_n_genes_full}, cells {n_cells}/{n_cells_full_am} "
-                f"(stratified). max_genes={preview_mg!s} cell_fraction={preview_fr!s} min_cells={preview_min_cells} "
-                f"max_cells={preview_max_cells} seed={preview_seed}"
+                f"Preview DE: cells {n_cells}/{n_cells_full_am} (stratified). cell_fraction={preview_fr!s} "
+                f"min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
             )
             group_sizes = {grp: int((groups_1 == grp).sum()) for grp in unique_groups}
 
@@ -1369,12 +1405,6 @@ def run(args: argparse.Namespace) -> None:
                 all_results = run_t_test_approx_all_markers(data_matrix, groups_1, is_count=is_count_table)
         else:
             all_results = run_scanpy_all_markers(data_matrix, groups_1, gene_names, method, is_count=is_count_table)
-
-        if preview_active and preview_n_genes_full is not None:
-            all_results = _preview_scatter_all_markers_results(all_results, preview_gene_idx, preview_n_genes_full)
-            gene_names = gene_names_full_list
-            ens_ids = ens_ids_full_list
-            n_genes = preview_n_genes_full
 
         # Stack results as (5 * n_groups, n_genes) in DE_HEADERS order [lfc, pvals, fdr, ave_g1, ave_g2] per group.
         blocks = []
@@ -1403,12 +1433,24 @@ def run(args: argparse.Namespace) -> None:
                             "Cannot determine output file index for --split-files."
                         )
                     out_tsv = os.path.join(output_dir, f"cat_{grp_idx}.tsv")
-                    write_tsv(out_tsv, ens_ids, gene_names, [(None, lfc_g, pvals_g, padj_g, ave_g1_g, ave_g2_g)])
+                    write_tsv(
+                        out_tsv,
+                        ens_ids,
+                        gene_names,
+                        [(None, lfc_g, pvals_g, padj_g, ave_g1_g, ave_g2_g)],
+                        table_top_de_per_direction=table_top_de_per_direction,
+                    )
                     split_tsv_paths.append(out_tsv)
             else:
                 tsv_rows = [(grp, all_results[grp][2], all_results[grp][0], all_results[grp][1], all_results[grp][3], all_results[grp][4]) for grp in unique_groups]  # (grp, lfc, pvals, fdr, ave_g1, ave_g2)
                 out_tsv = os.path.join(output_dir, "output.tsv")
-                tsv_path = write_tsv(out_tsv, ens_ids, gene_names, tsv_rows)
+                tsv_path = write_tsv(
+                    out_tsv,
+                    ens_ids,
+                    gene_names,
+                    tsv_rows,
+                    table_top_de_per_direction=table_top_de_per_direction,
+                )
 
         # Volcano plot — not supported in FindAllMarkers mode (no single pairwise comparison to plot)
         if write_volcano_output:
@@ -1416,13 +1458,21 @@ def run(args: argparse.Namespace) -> None:
 
         # Metadata output
         if write_metadata_output:
-            metadata_data, metadata_headers = build_metadata_matrix_all_markers(ens_ids, gene_names, unique_groups, all_results)
+            metadata_data, metadata_headers = build_metadata_matrix_all_markers(
+                ens_ids,
+                gene_names,
+                unique_groups,
+                all_results,
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
-        # JSON metadata
+        # JSON metadata (row count matches TSV / de_table)
+        pool_m = np.arange(n_genes, dtype=np.intp)
+        nber_rows_meta = _fam_table_row_count(unique_groups, all_results, pool_m, table_top_de_per_direction)
         result = build_result_json(
             args.write_metadata if write_metadata_output else None,
-            n_genes * len(unique_groups),
+            nber_rows_meta,
             unique_groups,
         )
         result["mode"] = "FindAllMarkers"
@@ -1434,12 +1484,10 @@ def run(args: argparse.Namespace) -> None:
         if preview_active:
             result["preview"] = {
                 "applied": True,
-                "max_genes": preview_mg,
                 "cell_fraction": preview_fr,
                 "seed": preview_seed,
                 "min_cells": preview_min_cells,
                 "max_cells": preview_max_cells,
-                "n_genes_full": preview_n_genes_full,
                 "n_cells_full": n_cells_full_am,
             }
 
@@ -1463,16 +1511,11 @@ def run(args: argparse.Namespace) -> None:
         if group2_size < 3:
             ErrorJSON("Group 2 (all other cells) contains fewer than 3 cells.")
 
-        preview_gene_idx_sm: np.ndarray | None = None
-        preview_n_genes_full_sm: int | None = None
-        gene_names_full_sm = list(gene_names)
-        ens_ids_full_sm = list(ens_ids)
         n_cells_full_sm = int(n_cells)
         if preview_active:
             cell_idx = _preview_stratified_cell_indices(cell_group, preview_fr, rng, preview_min_cells, preview_max_cells)
             if preview_fr is None or preview_fr >= 1.0:
                 cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
-            gene_idx = _preview_gene_row_indices(n_genes, preview_mg, rng)
             cg_sub = cell_group[cell_idx]
             for lab in (1, 2):
                 if int((cg_sub == lab).sum()) < 3:
@@ -1480,21 +1523,16 @@ def run(args: argparse.Namespace) -> None:
                         "After preview subsampling, one of the cell groups has fewer than 3 cells; "
                         "increase --preview-cell-fraction or disable preview."
                     )
-            preview_gene_idx_sm = gene_idx
-            preview_n_genes_full_sm = int(n_genes)
-            data_matrix = data_matrix[np.ix_(gene_idx, cell_idx)]
+            data_matrix = data_matrix[:, cell_idx]
             cell_group = cg_sub
             if batch_data is not None:
                 batch_data = batch_data[cell_idx]
-            gene_names = [gene_names_full_sm[int(i)] for i in gene_idx]
-            ens_ids = [ens_ids_full_sm[int(i)] for i in gene_idx]
             n_genes, n_cells = data_matrix.shape
             group1_size = int((cell_group == 1).sum())
             group2_size = int((cell_group == 2).sum())
             data_warnings.append(
-                f"Preview DE: genes {n_genes}/{preview_n_genes_full_sm}, cells {n_cells}/{n_cells_full_sm} "
-                f"(stratified by marker vs rest). max_genes={preview_mg!s} cell_fraction={preview_fr!s} min_cells={preview_min_cells} "
-                f"max_cells={preview_max_cells} seed={preview_seed}"
+                f"Preview DE: cells {n_cells}/{n_cells_full_sm} (stratified by marker vs rest). "
+                f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
             )
 
         if method == "deseq2":
@@ -1510,20 +1548,18 @@ def run(args: argparse.Namespace) -> None:
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix, cell_group, gene_names, method, is_count=is_count_table)
 
-        if preview_active and preview_n_genes_full_sm is not None:
-            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = _preview_scatter_pairwise_tuple(
-                (out_pvals, out_fdr, out_lfc, ave_g1, ave_g2), preview_gene_idx_sm, preview_n_genes_full_sm
-            )
-            gene_names = gene_names_full_sm
-            ens_ids = ens_ids_full_sm
-            n_genes = preview_n_genes_full_sm
-
         data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
 
         # TSV — no extra "group" column
         if write_tsv_output:
             out_tsv = os.path.join(output_dir, "output.tsv")
-            tsv_path = write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
+            tsv_path = write_tsv(
+                out_tsv,
+                ens_ids,
+                gene_names,
+                [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)],
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
 
         # VOLCANO plot - write as JSON
         if write_volcano_output:
@@ -1531,11 +1567,22 @@ def run(args: argparse.Namespace) -> None:
 
         # Metadata output
         if write_metadata_output:
-            metadata_data, metadata_headers = build_metadata_matrix_single(ens_ids, gene_names, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)
+            metadata_data, metadata_headers = build_metadata_matrix_single(
+                ens_ids,
+                gene_names,
+                out_lfc,
+                out_pvals,
+                out_fdr,
+                ave_g1,
+                ave_g2,
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
         # JSON for output JSON file
-        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes)
+        pool_sm = np.arange(n_genes, dtype=np.intp)
+        nber_rows_sm = int(_de_table_gene_order_pairwise(out_lfc, out_pvals, pool_sm, table_top_de_per_direction).size)
+        result = build_result_json(args.write_metadata if write_metadata_output else None, nber_rows_sm)
         result["mode"] = "Single marker"
         result["group_name"] = group1
         result["group2_name"] = None
@@ -1547,10 +1594,8 @@ def run(args: argparse.Namespace) -> None:
         if preview_active:
             result["preview"] = {
                 "applied": True,
-                "max_genes": preview_mg,
                 "cell_fraction": preview_fr,
                 "seed": preview_seed,
-                "n_genes_full": preview_n_genes_full_sm,
                 "n_cells_full": n_cells_full_sm,
                 "min_cells": preview_min_cells,
                 "max_cells": preview_max_cells,
@@ -1592,17 +1637,11 @@ def run(args: argparse.Namespace) -> None:
         if group2_size < 3:
             ErrorJSON(f"Group 2 ({group2!r}) contains fewer than 3 cells after removing overlapping cells.")
 
-        preview_gene_idx_tg: np.ndarray | None = None
-        preview_n_genes_full_tg: int | None = None
-        gene_names_full_tg = list(gene_names)
-        ens_ids_full_tg = list(ens_ids)
         n_cells_sub_full = int(data_matrix_sub.shape[1])
         if preview_active:
-            n_genes_full_before = int(data_matrix_sub.shape[0])
             cell_idx = _preview_stratified_cell_indices(cell_group_sub, preview_fr, rng, preview_min_cells, preview_max_cells)
             if preview_fr is None or preview_fr >= 1.0:
                 cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
-            gene_idx = _preview_gene_row_indices(n_genes_full_before, preview_mg, rng)
             cg2 = cell_group_sub[cell_idx]
             for lab in (1, 2):
                 if int((cg2 == lab).sum()) < 3:
@@ -1610,21 +1649,15 @@ def run(args: argparse.Namespace) -> None:
                         "After preview subsampling, one of the cell groups has fewer than 3 cells; "
                         "increase --preview-cell-fraction or disable preview."
                     )
-            preview_gene_idx_tg = gene_idx
-            preview_n_genes_full_tg = n_genes_full_before
-            data_matrix_sub = data_matrix_sub[np.ix_(gene_idx, cell_idx)]
+            data_matrix_sub = data_matrix_sub[:, cell_idx]
             cell_group_sub = cg2
             if batch_data_sub is not None:
                 batch_data_sub = batch_data_sub[cell_idx]
-            gene_names = [gene_names_full_tg[int(i)] for i in gene_idx]
-            ens_ids = [ens_ids_full_tg[int(i)] for i in gene_idx]
             group1_size = int((cell_group_sub == 1).sum())
             group2_size = int((cell_group_sub == 2).sum())
             data_warnings.append(
-                f"Preview DE: genes {data_matrix_sub.shape[0]}/{n_genes_full_before}, "
-                f"cells {data_matrix_sub.shape[1]}/{n_cells_sub_full} (stratified by two groups). "
-                f"max_genes={preview_mg!s} cell_fraction={preview_fr!s} min_cells={preview_min_cells} "
-                f"max_cells={preview_max_cells} seed={preview_seed}"
+                f"Preview DE: cells {data_matrix_sub.shape[1]}/{n_cells_sub_full} (stratified by two groups). "
+                f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
             )
 
         if method == "deseq2":
@@ -1640,28 +1673,37 @@ def run(args: argparse.Namespace) -> None:
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix_sub, cell_group_sub, gene_names, method, is_count=is_count_table)
 
-        if preview_active and preview_n_genes_full_tg is not None:
-            out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = _preview_scatter_pairwise_tuple(
-                (out_pvals, out_fdr, out_lfc, ave_g1, ave_g2), preview_gene_idx_tg, preview_n_genes_full_tg
-            )
-            gene_names = gene_names_full_tg
-            ens_ids = ens_ids_full_tg
-            n_genes = preview_n_genes_full_tg
-
         data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
 
         if write_tsv_output:
             out_tsv = os.path.join(output_dir, "output.tsv")
-            tsv_path = write_tsv(out_tsv, ens_ids, gene_names, [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)])
+            tsv_path = write_tsv(
+                out_tsv,
+                ens_ids,
+                gene_names,
+                [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)],
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
 
         if write_volcano_output:
             volcano_path = write_volcano_json(out_lfc, out_pvals, gene_names, ens_ids, output_dir)
 
         if write_metadata_output:
-            metadata_data, metadata_headers = build_metadata_matrix_single(ens_ids, gene_names, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)
+            metadata_data, metadata_headers = build_metadata_matrix_single(
+                ens_ids,
+                gene_names,
+                out_lfc,
+                out_pvals,
+                out_fdr,
+                ave_g1,
+                ave_g2,
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
-        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes)
+        pool_tg = np.arange(n_genes, dtype=np.intp)
+        nber_rows_tg = int(_de_table_gene_order_pairwise(out_lfc, out_pvals, pool_tg, table_top_de_per_direction).size)
+        result = build_result_json(args.write_metadata if write_metadata_output else None, nber_rows_tg)
         result["mode"] = "Two-group DE"
         result["group_name"] = group1
         result["group2_name"] = group2
@@ -1673,10 +1715,8 @@ def run(args: argparse.Namespace) -> None:
         if preview_active:
             result["preview"] = {
                 "applied": True,
-                "max_genes": preview_mg,
                 "cell_fraction": preview_fr,
                 "seed": preview_seed,
-                "n_genes_full": preview_n_genes_full_tg,
                 "n_cells_in_two_group_subset": n_cells_sub_full,
                 "min_cells": preview_min_cells,
                 "max_cells": preview_max_cells,
@@ -1694,12 +1734,37 @@ def run(args: argparse.Namespace) -> None:
     if data_warnings:
         result["warnings"] = data_warnings
 
+    if not args.o:
+        if mode == "all_markers":
+            md, mh = build_metadata_matrix_all_markers(
+                ens_ids,
+                gene_names,
+                unique_groups,
+                all_results,
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
+        else:
+            md, mh = build_metadata_matrix_single(
+                ens_ids,
+                gene_names,
+                out_lfc,
+                out_pvals,
+                out_fdr,
+                ave_g1,
+                ave_g2,
+                table_top_de_per_direction=table_top_de_per_direction,
+            )
+        result["de_table"] = _de_table_for_json(md, mh)
+
+    if table_top_de_per_direction is not None:
+        result["table_top_de_per_direction"] = table_top_de_per_direction
+
     if args.o:
         out_json = os.path.join(output_dir, "output.json")
         with open(out_json, "w", encoding="utf-8") as fh:
             json.dump(result, fh, ensure_ascii=False, allow_nan=True)
     else:
-        print(json.dumps(result, ensure_ascii=False, allow_nan=True))
+        print(json.dumps(result, ensure_ascii=False, allow_nan=True), flush=True)
 
 ## Helpers
 def _null(s: str | None) -> bool:
@@ -1740,7 +1805,9 @@ Annotation columns (loom HDF5 paths only, no database):
 
 Options:
   -f                         Path to the input .loom file.
-  -o                         Output folder (default: same directory as -f).
+  -o                         Output folder. When omitted, no output.json is written; the full JSON (including
+                             a de_table with the same columns and row order as output.tsv) is printed to stdout.
+                             --write-tsv and --write-volcano require -o.
   --method                   DE method: wilcoxon | t_test | t_test_overestim_var | t_test_approx | deseq2
                              t_test_approx: per-gene Welch two-sample t-test on working expression (GEMV sums
                              of X and X^2 over cells), Benjamini-Hochberg across genes per contrast. Counts:
@@ -1765,22 +1832,24 @@ Options:
   --write-tsv                Write output.tsv (requires -o).
   --write-volcano            Write output.plot.json volcano plot (requires -o).
   --write-metadata           Write metadata dataset in the loom at the given /attrs/ path.
-  --split-files              FindAllMarkers + --write-tsv: one cat_N.tsv per category order
-                             (N is 1-based index in sorted unique categories from the loom).
+  --split-files              FindAllMarkers + -o + --write-tsv: one cat_N.tsv per category order
+                             (N is 1-based index in sorted unique categories from the loom). Ignored without -o
+                             (a warning is added to the JSON warnings list).
 
-  --preview-max-genes        With preview mode: max number of genes (random subset). Results are written on
-                             the full gene axis; genes outside the subset are NaN. Omit to use all genes.
-  --preview-cell-fraction    (0, 1]: per category, keep about this fraction of cells (stratified random sample).
+  --table-top-de-per-direction  Optional. Limits TSV, stdout de_table, and --write-metadata rows to at most N
+                             genes with log FC > 0 and N with log FC < 0, each side ranked by ascending p-value
+                             (then by LFC). FindAllMarkers applies this per group vs rest. Does not change which
+                             genes are tested.
+
+  --preview-cell-fraction    (0, 1]: enables preview mode: per category, keep about this fraction of cells
+                             (stratified random sample). All genes are still tested on the cell subset.
                              Categories with fewer than --preview-min-cells cells keep all of them. Otherwise at
-                             least preview-min-cells are kept when subsampling. Omit for all cells.
-                             Preview is active if either --preview-max-genes or --preview-cell-fraction is set.
+                             least preview-min-cells are kept when subsampling. Omit to disable preview.
   --preview-min-cells        Minimum cells per stratum when subsampling (default 1000). Strata smaller than this
                              use every cell in that stratum.
-  --preview-max-cells        With --preview-cell-fraction in (0, 1): per stratum, target is round(fraction * n)
-                             then raised to at least --preview-min-cells and lowered to at most this value
-                             (default 10000), then capped by n. No separate global subsample. Without a cell
-                             fraction (preview genes only or fraction >= 1): hard cap on total cells after taking
-                             all cells, via uniform subsample to at most this many.
+  --preview-max-cells        Per-stratum cap when fraction is in (0, 1): target count is clamped to at most this
+                             value (default 10000). With --preview-cell-fraction 1, all cells are kept per stratum
+                             then total cells are capped to this many by a uniform subsample.
   --preview-seed             RNG seed for preview subsampling (default 42).
 
 Environment:
@@ -1817,7 +1886,14 @@ def main() -> None:
     parser.add_argument("--write-volcano",     action="store_true",                       required=False,              dest="write_volcano")
     parser.add_argument("--write-metadata",    metavar="Output metadata dataset path",    required=False,              dest="write_metadata", default=None)
     parser.add_argument("--split-files",       action="store_true",                       required=False,              dest="split_files")
-    parser.add_argument("--preview-max-genes", type=int,   default=None, required=False, dest="preview_max_genes", metavar="N")
+    parser.add_argument(
+        "--table-top-de-per-direction",
+        type=int,
+        default=None,
+        required=False,
+        dest="table_top_de_per_direction",
+        metavar="N",
+    )
     parser.add_argument("--preview-cell-fraction", type=float, default=None, required=False, dest="preview_cell_fraction", metavar="F")
     parser.add_argument("--preview-min-cells", type=int, default=1000, required=False, dest="preview_min_cells", metavar="M")
     parser.add_argument("--preview-max-cells", type=int, default=10000, required=False, dest="preview_max_cells", metavar="C")
