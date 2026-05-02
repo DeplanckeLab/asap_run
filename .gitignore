@@ -5,6 +5,7 @@ build.log
 .env
 
 R/normalization.asap.3.R.bkp
+python/de.v8.*.py
 
 # Ignore temporary notebooks
 .ipynb_checkpoints

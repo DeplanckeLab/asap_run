@@ -10,14 +10,6 @@ import warnings        # For non-fatal warnings
 from pathlib import Path  # For path manipulation
 from typing import Final
 
-## Database
-from contextlib import contextmanager
-from typing import Any, Optional
-from urllib.parse import urlparse
-import psycopg2
-from psycopg2.extensions import connection as PGConnection
-from psycopg2.extras import RealDictCursor
-
 ## Scientific stack
 import h5py            # For reading/writing loom (HDF5) files
 import numpy as np     # For array calculations
@@ -44,9 +36,25 @@ METHOD_NAME_MAP: Final[dict[str, str]] = {
 COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
 BATCH_SUPPORT:      Final[set] = {"deseq2"}
 DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2"]
-DE_NB_COLS: Final[int] = len(DE_HEADERS)  # Number of DE output columns stored per gene
-DEFAULT_DB_PORT: Final[int] = 5432
-DEFAULT_CONNECT_TIMEOUT: Final[int] = 10
+DE_NB_COLS: Final[int] = len(DE_HEADERS)  # Number of DE statistic columns per comparison
+
+# FindAllMarkers (each group vs. rest): 8 columns — tested group label, ids, gene name, then five stats
+FIND_ALL_MARKERS_GROUP_HEADER: Final[str] = "Compared group"
+DE_HEADERS_FIND_ALL: Final[list[str]] = [
+    "log Fold-Change",
+    "p-value",
+    "FDR",
+    "Avg. exp. (tested group)",
+    "Avg. exp. (other cells)",
+]
+
+# Column layout written to /attrs (must match nber_cols / headers in output.json)
+DE_METADATA_HEADERS_PAIRWISE: Final[list[str]] = ["ensembl_id", "gene_name"] + DE_HEADERS
+DE_METADATA_HEADERS_ALL_MARKERS: Final[list[str]] = [
+    FIND_ALL_MARKERS_GROUP_HEADER,
+    "ensembl_id",
+    "gene_name",
+] + DE_HEADERS_FIND_ALL
 
 ## Error handling
 class ErrorJSON(Exception):
@@ -205,7 +213,7 @@ def write_tsv(out_path: str, ens_ids: list[str], gene_names: list[str], rows: li
     If group_label is not None for the first entry, a leading 'group' column is included.
     """
     has_group = rows[0][0] is not None
-    headers   = (["group", "ensembl_id", "gene_name"] if has_group else ["ensembl_id", "gene_name"]) + DE_HEADERS
+    headers   = list(DE_METADATA_HEADERS_ALL_MARKERS) if has_group else list(DE_METADATA_HEADERS_PAIRWISE)
     n_genes   = len(gene_names)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\t".join(headers) + "\n")
@@ -251,42 +259,55 @@ def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[st
         warnings.warn(f"Could not generate volcano plot: {exc}")
         return None
 
-def build_result_json(output_dataset: str | None, n_genes: int, unique_groups:  list[str] | None = None) -> dict:
+def _unique_categories_sorted(groups: np.ndarray) -> list[str]:
     """
-    Build the output.json metadata dict.
-    If unique_groups is provided (Mode A), produces multi-group metadata with flat headers labelled by group name.
-    Otherwise (Modes B/C), produces single-comparison metadata.
+    Unique category labels from a 1-D loom metadata vector, sorted alphanumerically
+    (same ordering as Ruby Array#sort on strings).
+    """
+    labels = [str(x) for x in groups.tolist()]
+    return sorted(set(labels))
+
+def build_result_json(
+    output_dataset: str | None,
+    nber_rows: int,
+    unique_groups: list[str] | None = None,
+) -> dict:
+    """
+    Build the output.json metadata dict for the /attrs dataset.
+    nber_cols and headers match the matrix from build_metadata_matrix_* (same order as
+    column_names on the HDF5 node). Uses key "headers" (plural) for Rails finish_run.
     """
     if unique_groups is not None:
-        all_headers_flat = [f"{h} ({grp})" for grp in unique_groups for h in DE_HEADERS]
+        # FindAllMarkers: 8 columns — compared group, ids, gene name, then five vs-rest statistics
         return {
             "metadata": [
                 {
                     "name":      output_dataset,
                     "on":        "GLOBAL",
                     "type":      "NUMERIC",
-                    "nber_cols": len(all_headers_flat),
-                    "nber_rows": n_genes,
-                    "header":   all_headers_flat,
-                    "groups":    unique_groups,
+                    "nber_cols": len(DE_METADATA_HEADERS_ALL_MARKERS),
+                    "nber_rows": nber_rows,
+                    "headers":  list(DE_METADATA_HEADERS_ALL_MARKERS),
+                    "groups":   unique_groups,
                 }
             ]
         }
+    # Single-marker or two-group: one row per gene after sorting — ensembl_id, gene_name, then DE_HEADERS
     return {
         "metadata": [
             {
                 "name":      output_dataset,
                 "on":        "GLOBAL",
                 "type":      "NUMERIC",
-                "nber_cols": DE_NB_COLS,
-                "nber_rows": n_genes,
-                "header":   DE_HEADERS,
+                "nber_cols": len(DE_METADATA_HEADERS_PAIRWISE),
+                "nber_rows": nber_rows,
+                "headers":  list(DE_METADATA_HEADERS_PAIRWISE),
             }
         ]
     }
 
 def build_metadata_matrix_single(ens_ids: list[str], gene_names: list[str], lfc: np.ndarray, pvals: np.ndarray, fdr: np.ndarray, ave_g1: np.ndarray, ave_g2: np.ndarray) -> tuple[np.ndarray, list[str]]:
-    headers = ["ensembl_id", "gene_name"] + DE_HEADERS
+    headers = list(DE_METADATA_HEADERS_PAIRWISE)
     # Sort: ascending p-value (NaN last), secondary: descending lfc
     pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)
     sort_idx = np.lexsort((-lfc, pvals_for_sort))
@@ -311,7 +332,7 @@ def build_metadata_matrix_all_markers(ens_ids: list[str], gene_names: list[str],
     one row per gene per group, sorted by ascending p-value then descending lfc,
     with a leading 'group' column. Matches write_tsv() output exactly.
     """
-    headers = ["group", "ensembl_id", "gene_name"] + DE_HEADERS
+    headers = list(DE_METADATA_HEADERS_ALL_MARKERS)
     rows = []
     for grp in unique_groups:
         pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
@@ -319,9 +340,9 @@ def build_metadata_matrix_all_markers(ens_ids: list[str], gene_names: list[str],
         sort_idx = np.lexsort((-lfc, pvals_for_sort))
         for i in sort_idx:
             rows.append([
-                grp,
-                ens_ids[i],
-                gene_names[i],
+                str(grp),
+                str(ens_ids[i]),
+                str(gene_names[i]),
                 f"{lfc[i]}"   if not np.isnan(lfc[i])   else "NA",
                 f"{pvals[i]}" if not np.isnan(pvals[i]) else "NA",
                 f"{padj[i]}"  if not np.isnan(padj[i])  else "NA",
@@ -334,6 +355,23 @@ def write_metadata_dataset(loom_path: str, dataset_path: str, data: np.ndarray, 
     """Writes metadata dataset under /attrs and stores the column names as an attribute."""
     if not dataset_path.startswith("/attrs/"):
         ErrorJSON("--write-metadata path should refer to the /attrs/ path (e.g. /attrs/_de_2_wilcoxon)")
+    if data.ndim != 2:
+        ErrorJSON(f"Metadata matrix must be 2-D, got shape {data.shape!r}")
+    if data.shape[1] != len(headers):
+        ErrorJSON(
+            f"Metadata column mismatch: dataset has {data.shape[1]} columns but {len(headers)} headers {headers!r}"
+        )
+    # Object tables (FindAllMarkers + pairwise): force plain str per cell so HDF5 vlen UTF-8 write
+    # does not coerce or drop the leading category column.
+    if data.dtype == object and data.ndim == 2:
+        r, c = data.shape
+        norm = np.empty((r, c), dtype=object)
+        for i in range(r):
+            for j in range(c):
+                v = data[i, j]
+                norm[i, j] = "" if v is None else str(v)
+        data = norm
+
     with LoomHandler(loom_path, mode="r+") as loom:
         loom.write_dataset(dataset_path, data)
         node = loom._require_open()[dataset_path]
@@ -576,8 +614,10 @@ def run(args: argparse.Namespace) -> None:
 
     if split_files and not write_tsv_output:
         ErrorJSON("--split-files requires --write-tsv to be set.")
-    if split_files and args.group_dataset_id is None:
-        ErrorJSON("--split-files requires --group-dataset-id to be set (the file index is the 1-based position of the group in annots.list_cat_json).")
+    if split_files and _null(args.group_dataset):
+        ErrorJSON("--split-files requires --group-dataset (loom path to the primary annotation column).")
+    if split_files and not _null(args.group1):
+        ErrorJSON("--split-files is only valid in FindAllMarkers mode (omit --group).")
 
     if method in COUNT_ONLY_METHODS and not is_count_table:
         ErrorJSON(f"Data should be a count table in order to run {method_arg}")
@@ -586,107 +626,24 @@ def run(args: argparse.Namespace) -> None:
         if not args.write_metadata.startswith("/attrs/"):
             ErrorJSON("--write-metadata path should refer to the /attrs/ path (e.g. /attrs/_de_2_wilcoxon)")
 
-    # Init warning list early — needed before DB resolution block below
     data_warnings: list = []
 
     if not is_count_table:
         data_warnings.append("Data is assumed to be logged. If it's not the case, logFC could be wrong.")
 
-    # ── Determine dataset/id resolution style ───────────────────────────────────
-    # Two mutually exclusive styles:
-    #   DB-based:   --group-dataset-id / --group-dataset-id-2   (loom path + category names fetched from DB)
-    #   Path-based: --group-dataset    / --group-dataset-2      (loom paths provided directly)
-    # Mixing styles between group 1 and group 2 is not allowed.
+    if _null(args.group_dataset):
+        ErrorJSON("--group-dataset is required (loom HDF5 path to the cell metadata column, e.g. /col_attrs/cell_type).")
 
-    use_db_g1 = args.group_dataset_id  is not None   # --group-dataset-id was supplied
-    use_db_g2 = args.group_dataset_id2 is not None   # --group-dataset-id-2 was supplied
-
-    # ── Consistency checks ───────────────────────────────────────────────────────
-    # Rule: cannot use --group-dataset-id-2 without --group-dataset-id
-    if use_db_g2 and not use_db_g1:
-        ErrorJSON("--group-dataset-id-2 requires --group-dataset-id to also be set.")
-
-    # Rule: if DB-based for group 1, the second group must also be DB-based (or absent),
-    #       i.e. --group-dataset-2 (path-based) is forbidden when --group-dataset-id is set.
-    if use_db_g1 and not _null(args.group_dataset_2):
-        ErrorJSON("Cannot mix --group-dataset-id with --group-dataset-2. When --group-dataset-id is used, specify the second group annotation via --group-dataset-id-2 instead.")
-
-    # Rule: if path-based for group 1, the second group must also be path-based,
-    #       i.e. --group-dataset-id-2 is forbidden when --group-dataset is set (and --group-dataset-id is absent).
-    if not use_db_g1 and use_db_g2:
-        # Already caught by "use_db_g2 and not use_db_g1" above, but kept for clarity.
-        ErrorJSON("--group-dataset-id-2 requires --group-dataset-id to also be set.")
-
-    # ── --dburl validation ───────────────────────────────────────────────────────
-    if (use_db_g1 or use_db_g2) and _null(args.dburl):
-        ErrorJSON("--dburl is required when --group-dataset-id or --group-dataset-id-2 are set.")
-
-    if not use_db_g1 and not use_db_g2 and not _null(args.dburl):
-        data_warnings.append("--dburl is set but not used (neither --group-dataset-id nor --group-dataset-id-2 are set).")
-
-    # ── Resolve group dataset paths and group labels ─────────────────────────────
+    # ── Resolve group dataset paths (loom only; category lists come from the vectors) ──
     group1_raw: str | None = None if _null(args.group1) else args.group1.strip()
     group2_raw: str | None = None if _null(args.group2) else args.group2.strip()
 
-    group_dataset_path:   str       # resolved loom path for group 1's annotation column
-    group_dataset_2_path: str | None = None  # resolved loom path for group 2's annotation column (None → defaults to group_dataset_path in Mode C)
+    group_dataset_path:   str = args.group_dataset.strip()
+    group_dataset_2_path: str | None = None if _null(args.group_dataset_2) else args.group_dataset_2.strip()
     group1: str | None = group1_raw
     group2: str | None = group2_raw
-    all_categories:   list[str] | None = None  # full category list from DB, populated when --split-files is set
-    list_cats_json_1: list[str] | None = None  # ordered category list for annotation 1 (for output JSON)
-    list_cats_json_2: list[str] | None = None  # ordered category list for annotation 2 (for output JSON, only when different from annotation 1)
-
-    if use_db_g1:
-        # ── DB-based resolution ─────────────────────────────────────────────────
-        user_env = get_env("POSTGRES_USER", required=True)
-        pass_env = get_env("POSTGRES_PASSWORD", required=True)
-        host, port, dbname = parse_host_string(args.dburl)
-        db = DBManager(host=host, dbname=dbname, port=port, user=user_env, password=pass_env)
-        db.connect()
-        try:
-            # --- Group 1 dataset path ---
-            db_g1_path = db.get_annotation_col_attr(args.group_dataset_id)
-            if not _null(args.group_dataset):
-                provided = args.group_dataset.strip()
-                if provided != db_g1_path:
-                    ErrorJSON(f"--group-dataset {provided!r} does not match the loom path in the DB for annotation id {args.group_dataset_id} ({db_g1_path!r}). Remove --group-dataset or correct the value.")
-                data_warnings.append(f"--group-dataset is redundant when --group-dataset-id is set (DB resolved path: {db_g1_path!r}). It can be omitted.")
-            group_dataset_path = db_g1_path
-
-            # Always fetch the category list for annotation 1 (used for output JSON and --split-files)
-            list_cats_json_1 = db.get_list_cat_json(args.group_dataset_id)
-            if split_files:
-                all_categories = list_cats_json_1
-
-            # Resolve group1 numeric label → display name (if applicable)
-            group1 = _resolve_group_name_from_annotation_id(args.group_dataset_id, group1_raw, db)
-
-            # --- Group 2 dataset path ---
-            if use_db_g2:
-                db_g2_path = db.get_annotation_col_attr(args.group_dataset_id2)
-                if not _null(args.group_dataset_2):
-                    provided2 = args.group_dataset_2.strip()
-                    if provided2 != db_g2_path:
-                        ErrorJSON(f"--group-dataset-2 {provided2!r} does not match the loom path in the DB for annotation id {args.group_dataset_id2} ({db_g2_path!r}). Remove --group-dataset-2 or correct the value.")
-                    data_warnings.append(f"--group-dataset-2 is redundant when --group-dataset-id-2 is set (DB resolved path: {db_g2_path!r}). It can be omitted.")
-                group_dataset_2_path = db_g2_path
-                # Resolve group2 numeric label → display name using its own annotation id
-                group2 = _resolve_group_name_from_annotation_id(args.group_dataset_id2, group2_raw, db)
-                # Fetch category list for annotation 2 (different from annotation 1)
-                list_cats_json_2 = db.get_list_cat_json(args.group_dataset_id2)
-            else:
-                # Both groups share the same annotation column — resolve group2 with group 1's id
-                group2 = _resolve_group_name_from_annotation_id(args.group_dataset_id, group2_raw, db)
-                # group_dataset_2_path stays None here; defaults to group_dataset_path in Mode C below
-        finally:
-            db.disconnect()
-
-    else:
-        # ── Path-based resolution ───────────────────────────────────────────────
-        if _null(args.group_dataset):
-            ErrorJSON("--group-dataset is required when --group-dataset-id is not set.")
-        group_dataset_path   = args.group_dataset.strip()
-        group_dataset_2_path = None if _null(args.group_dataset_2) else args.group_dataset_2.strip()
+    all_categories:   list[str] | None = None  # sorted unique categories for --split-files (FindAllMarkers)
+    list_cats_json_1: list[str] | None = None  # filled after reading loom; exposed in output JSON only in FindAllMarkers
 
     # ── Determine execution mode ─────────────────────────────────────────────────
     # Mode A — FindAllMarkers: --group omitted
@@ -695,8 +652,8 @@ def run(args: argparse.Namespace) -> None:
 
     if group1 is None:
         # Mode A — FindAllMarkers
-        if group2 is not None or group_dataset_2_path is not None:
-            ErrorJSON("When --group is omitted (FindAllMarkers mode), --group-2 and --group-dataset-2 / --group-dataset-id-2 must also be omitted.")
+        if group2 is not None:
+            ErrorJSON("When --group is omitted (FindAllMarkers mode), --group-2 must also be omitted.")
         mode = "all_markers"
     elif group2 is None and group_dataset_2_path is None:
         # Mode B — Single-group marker
@@ -730,15 +687,25 @@ def run(args: argparse.Namespace) -> None:
             ErrorJSON(f"Group dataset {group_dataset_path!r} does not exist in the Loom file")
         groups_1 = LoomHandler._decode_str_array(groups_raw_1)
 
-        # Group 2 metadata (only for Mode C, may come from a different column)
-        if mode == "two_group":
-            if group_dataset_2_path != group_dataset_path:
+        # Second metadata column: two-group DE, or FindAllMarkers with optional --group-dataset-2 (union category list)
+        need_groups_2 = mode == "two_group" or (
+            mode == "all_markers"
+            and group_dataset_2_path is not None
+            and group_dataset_2_path.strip() != group_dataset_path.strip()
+        )
+        if need_groups_2:
+            if group_dataset_2_path.strip() == group_dataset_path.strip():
+                groups_2 = groups_1
+            else:
                 groups_raw_2 = loom.read_vector(group_dataset_2_path)
                 if groups_raw_2 is None:
                     ErrorJSON(f"Group dataset 2 {group_dataset_2_path!r} does not exist in the Loom file")
                 groups_2 = LoomHandler._decode_str_array(groups_raw_2)
-            else:
-                groups_2 = groups_1  # same column
+                if int(groups_2.shape[0]) != n_cells:
+                    ErrorJSON(
+                        f"Group dataset 2 {group_dataset_2_path!r} length {int(groups_2.shape[0])} does not match "
+                        f"number of cells ({n_cells}) in the loom."
+                    )
         else:
             groups_2 = None
 
@@ -764,11 +731,12 @@ def run(args: argparse.Namespace) -> None:
 
     # Loom file is now closed
 
-    # Derive category lists from loom data when DB was not used (path-based resolution)
-    if list_cats_json_1 is None:
-        list_cats_json_1 = sorted(set(groups_1.tolist()))
-    if list_cats_json_2 is None and groups_2 is not None and group_dataset_2_path != group_dataset_path:
-        list_cats_json_2 = sorted(set(groups_2.tolist()))
+    list_cats_json_1 = _unique_categories_sorted(groups_1)
+    if mode == "all_markers" and groups_2 is not None:
+        list_cats_json_1 = sorted(set(list_cats_json_1) | set(_unique_categories_sorted(groups_2)))
+
+    if split_files:
+        all_categories = list_cats_json_1
 
     result: dict = {}
     tsv_path: str | None = None
@@ -780,7 +748,8 @@ def run(args: argparse.Namespace) -> None:
     # Mode A — FindAllMarkers                                             #
     # ------------------------------------------------------------------ #
     if mode == "all_markers":
-        unique_groups = sorted(set(groups_1))
+        present_primary = {str(x) for x in groups_1.tolist()}
+        unique_groups = [c for c in list_cats_json_1 if c in present_primary]
         if len(unique_groups) < 2:
             ErrorJSON("FindAllMarkers mode requires at least 2 distinct groups in --group-dataset.")
 
@@ -811,16 +780,18 @@ def run(args: argparse.Namespace) -> None:
         # TSV output — Extra leading column "group" to identify which group each row belongs to.
         if write_tsv_output:
             if split_files:
-                # One file per group; file name is cat_{1-based DB index}.tsv
+                # One file per group; file name is cat_{1-based index in sorted unique categories}.tsv
                 if all_categories is None:
-                    # Should not happen (validated earlier), but guard defensively
-                    ErrorJSON("--split-files requires --group-dataset-id so that group order in the DB is known.")
+                    ErrorJSON("--split-files requires a category list; internal error (all_categories unset).")
                 cat_index_map = {cat: i + 1 for i, cat in enumerate(all_categories)}
                 for grp in unique_groups:
                     pvals_g, padj_g, lfc_g, ave_g1_g, ave_g2_g = all_results[grp]
                     grp_idx = cat_index_map.get(grp)
                     if grp_idx is None:
-                        ErrorJSON(f"Group {grp!r} was not found in list_cat_json for annotation id {args.group_dataset_id}. Cannot determine output file index for --split-files.")
+                        ErrorJSON(
+                            f"Group {grp!r} was not found in the sorted unique category list for --group-dataset. "
+                            "Cannot determine output file index for --split-files."
+                        )
                     out_tsv = os.path.join(output_dir, f"cat_{grp_idx}.tsv")
                     write_tsv(out_tsv, ens_ids, gene_names, [(None, lfc_g, pvals_g, padj_g, ave_g1_g, ave_g2_g)])
                     split_tsv_paths.append(out_tsv)
@@ -839,7 +810,11 @@ def run(args: argparse.Namespace) -> None:
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
         # JSON metadata
-        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes * len(unique_groups))
+        result = build_result_json(
+            args.write_metadata if write_metadata_output else None,
+            n_genes * len(unique_groups),
+            unique_groups,
+        )
         result["mode"] = "FindAllMarkers"
         result["number_of_groups"] = len(unique_groups)
         result["group_sizes"] = group_sizes
@@ -963,10 +938,9 @@ def run(args: argparse.Namespace) -> None:
         result["number_of_genes_with_fdr_le_5pct"] = _count_significant(out_fdr)
         result["overlapping_cells"] = len(overlap)
 
-    # JSON output
-    result["list_cats_json"] = list_cats_json_1
-    if list_cats_json_2 is not None:
-        result["list_cats_json_2"] = list_cats_json_2
+    # JSON output (ordered category lists are only attached for FindAllMarkers / all-vs-rest)
+    if mode == "all_markers":
+        result["list_cats_json"] = list_cats_json_1
     if tsv_path is not None:
         result["tsv_path"] = tsv_path
     if split_tsv_paths:
@@ -988,16 +962,6 @@ def _null(s: str | None) -> bool:
     """Returns True if a string argument represents an absent/null value."""
     return s is None or s.strip().lower() in ("", "null", "na", "none")
 
-def _parse_positive_int(value: str) -> int:
-    """argparse type: positive integer (> 0)."""
-    try:
-        parsed = int(value)
-    except ValueError:
-        ErrorJSON(f"Expected a positive integer, got {value!r}")
-    if parsed <= 0:
-        ErrorJSON(f"Expected a positive integer, got {value!r}")
-    return parsed
-
 def _parse_bool_string(value: str, parameter_name: str) -> bool:
     """Parses a string boolean argument."""
     raw_value = value.strip().lower()
@@ -1007,237 +971,49 @@ def _parse_bool_string(value: str, parameter_name: str) -> bool:
         return False
     ErrorJSON(f"{parameter_name} should be 'true' or 'false'")
 
-def get_env(name: str, required: bool = False, default: str | None = None) -> str | None:
-    value = os.getenv(name, default)
-    if required and not value:
-        ErrorJSON(f"Missing required environment variable: {name}")
-    return value
-
-def parse_host_string(s: str):
-    if not s:
-        ErrorJSON("Missing dburl")
-    if "://" not in s:
-        s = "postgresql://" + s
-    u = urlparse(s)
-
-    if not u.hostname:
-        ErrorJSON("Missing host")
-    host = u.hostname
-
-    port = None
-    if u.netloc:
-        hostport = u.netloc.rsplit("@", 1)[-1]
-        parts = hostport.split(":")
-        if len(parts) == 2:
-            if parts[1].isdigit():
-                port = int(parts[1])
-            else:
-                ErrorJSON(f"Invalid port: {parts[1]!r}")
-    if port is None:
-        port = DEFAULT_DB_PORT
-
-    dbname = u.path.lstrip("/")
-    if not dbname:
-        ErrorJSON("Missing dbname")
-
-    return host, port, dbname
-
-## Database stuff
-class DBManager:
-    def __init__(self, *, dbname: str, user: str, password: str, host: str, port: int, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT, sslmode: Optional[str] = None) -> None:
-        self._base_conn_kwargs: dict[str, Any] = {
-            "dbname": dbname,
-            "user": user,
-            "password": password,
-            "port": port,
-            "connect_timeout": connect_timeout,
-            "host": host,
-        }
-        if sslmode is not None:
-            self._base_conn_kwargs["sslmode"] = sslmode
-        self._conn: PGConnection | None = None
-
-    def connect(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.cursor().execute("SELECT 1")
-                return
-            except (psycopg2.OperationalError, psycopg2.InterfaceError):
-                self._conn = None
-
-        try:
-            self._conn = psycopg2.connect(**self._base_conn_kwargs)
-        except Exception as e:
-            ErrorJSON(f"Failed to connect to PostgreSQL: {e}")
-
-    def disconnect(self) -> None:
-        if self._conn is None:
-            return
-        try:
-            self._conn.close()
-        finally:
-            self._conn = None
-
-    @contextmanager
-    def _cursor(self):
-        if self._conn is None or self._conn.closed:
-            ErrorJSON("Not connected. Call connect() first.")
-        cur = self._conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            yield cur
-        finally:
-            cur.close()
-
-    def get_annotation_col_attr(self, annotation_id: int) -> str:
-        """
-        Fetch the loom dataset path for a given annotation id.
-
-        NOTE: This query assumes a column named 'name' in the 'annots' table
-        that stores the full HDF5 path to the annotation column in the loom file
-        (e.g. '/col_attrs/CellType'). Adjust the column name to match your DB schema.
-        """
-        sql = "SELECT name FROM annots WHERE id = %s"
-        with self._cursor() as cur:
-            cur.execute(sql, (annotation_id,))
-            rows = cur.fetchall()
-
-        if not rows:
-            ErrorJSON(f"No annotation found in annots table with id = {annotation_id}")
-        if len(rows) > 1:
-            ErrorJSON(f"Multiple rows found in annots table with id = {annotation_id}")
-
-        path = rows[0].get("name")
-        if path is None or str(path).strip() == "":
-            ErrorJSON(f"name is empty or NULL for annotation id = {annotation_id}")
-
-        return str(path).strip()
-
-    def get_list_cat_json(self, annotation_id: int) -> list[str]:
-        sql = "SELECT list_cat_json FROM annots WHERE id = %s"
-        with self._cursor() as cur:
-            cur.execute(sql, (annotation_id,))
-            rows = cur.fetchall()
-
-        if not rows:
-            ErrorJSON(f"No list_cat_json found in annots table with id = {annotation_id}")
-        if len(rows) > 1:
-            ErrorJSON(f"Too many list_cat_json rows found in annots table with id = {annotation_id}")
-
-        raw_json = rows[0].get("list_cat_json")
-        if raw_json is None:
-            ErrorJSON(f"No list_cat_json found in annots table with id = {annotation_id}")
-
-        try:
-            categories = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            ErrorJSON(f"Invalid JSON in annots.list_cat_json for id = {annotation_id}: {exc}")
-
-        if not isinstance(categories, list):
-            ErrorJSON(f"annots.list_cat_json should contain a JSON array for id = {annotation_id}")
-
-        return [str(cat) if cat is not None else "" for cat in categories]
-
-def _resolve_group_name_from_annotation_id(annotation_id: int, group_value: str | None, db: DBManager) -> str | None:
-    """Resolve a numeric group/category id to its display name using annots.list_cat_json."""
-    if _null(group_value):
-        return None
-
-    raw_group = group_value.strip()
-    if not raw_group.isdigit():
-        return raw_group
-
-    group_id = int(raw_group)
-    if group_id <= 0:
-        ErrorJSON(f"--group value should be a positive integer when used with --group-dataset-id. You entered {group_value!r}")
-
-    categories = db.get_list_cat_json(annotation_id)
-    if group_id > len(categories):
-        ErrorJSON(f"Group id {group_id} is out of range for annotation id = {annotation_id}. Available ids: 1..{len(categories)}")
-
-    group_name = categories[group_id - 1]
-    if str(group_name).strip() == "":
-        ErrorJSON(f"Group id {group_id} resolved to an empty group name for annotation id = {annotation_id}")
-    return str(group_name)
-
 ## Help text
 custom_help = """
 Differential Expression (Python / Scanpy)
 
 Execution modes
 ───────────────
-  FindAllMarkers  Omit --group (and --group-2 / --group-dataset-id-2 / --group-dataset-2).
-                  Every group in the annotation column is tested vs. all other cells.
-                  Output TSV contains an extra leading "group" column.
+  FindAllMarkers  Omit --group and --group-2. Every group in --group-dataset is tested vs. rest.
+                  Optional --group-dataset-2 merges unique values from both columns for
+                  list_cats_json (still DE on --group-dataset only). Categories are sorted
+                  alphanumerically (Ruby-like string order). list_cats_json is in output.json
+                  and drives --split-files cat_N.tsv indices.
 
-  Single marker   Provide --group only (omit --group-2 and second-dataset arguments).
+  Single marker   Provide --group only (omit --group-2 and --group-dataset-2).
                   Runs group vs. all other cells.
 
-  Two-group DE    Provide --group and --group-2.
+  Two-group DE    Provide --group and --group-2 with the exact category names in the loom columns.
                   Standard pairwise DE; overlapping cells are removed from group 2.
 
-Dataset / annotation resolution (two mutually exclusive styles — do not mix):
-───────────────────────────────────────────────────────────────────────────────
-  DB-based (--group-dataset-id / --group-dataset-id-2):
-    The loom column path and category list are fetched from the database.
-    Requires --dburl. Group labels can be provided as numeric category ids.
-    If --group-dataset or --group-dataset-2 are also set, they must match
-    the DB-resolved path or an error is raised (a warning is emitted if they match).
-
-  Path-based (--group-dataset / --group-dataset-2):
-    Loom column paths are provided directly. No DB connection needed.
+Annotation columns (loom HDF5 paths only, no database):
+  --group-dataset            Required. Path to the obs-level metadata column (e.g. /col_attrs/cell_type).
+  --group-dataset-2          Optional second column for two-group DE when group 1 and group 2
+                             use different metadata. Defaults to --group-dataset when omitted.
 
 Options:
-  -f %s                      Path to the input .loom file.
-  -o %s                      Output folder (default: same directory as -f).
-  --method %s                DE method to use. One of:
-                               wilcoxon | t_test | t_test_overestim_var | deseq2
-  --input-dataset %s         Loom path to the expression matrix (e.g. /layers/norm_data).
-  --batch %s                 Comma-separated loom paths for batch/covariate columns, or "null".
-                               Only used by deseq2.
+  -f                         Path to the input .loom file.
+  -o                         Output folder (default: same directory as -f).
+  --method                   DE method: wilcoxon | t_test | t_test_overestim_var | deseq2
+  --input-dataset            Loom path to the expression matrix (e.g. /layers/norm_data).
+  --batch                    Comma-separated loom paths for batch/covariate columns, or "null".
+                             Only used by deseq2.
 
-  -- DB-based dataset resolution --
-  --group-dataset-id %s      Annotation id in the DB annots table for group 1.
-                               Fetches the loom column path and category names from DB.
-                               Requires --dburl. Group labels may be numeric category ids.
-  --group-dataset-id-2 %s    Annotation id in the DB annots table for group 2.
-                               Required when group 2 uses a different annotation than group 1.
-                               Requires --group-dataset-id to also be set.
-  --dburl %s                 PostgreSQL DB URL (format HOST:PORT/DB). Required when
-                               --group-dataset-id or --group-dataset-id-2 are set.
-                               Credentials read from POSTGRES_USER / POSTGRES_PASSWORD env vars.
+  --group-dataset            Loom path to the primary cell annotation column (required).
+  --group-dataset-2          Loom path to the second annotation column when needed.
 
-  -- Path-based dataset resolution --
-  --group-dataset %s         Loom path to the obs-level annotation column for group 1.
-                               Required when --group-dataset-id is not set.
-                               If set together with --group-dataset-id, must match the DB path
-                               (a warning is emitted; the DB path takes precedence).
-  --group-dataset-2 %s       Loom path to the obs-level annotation column for group 2.
-                               Defaults to --group-dataset when omitted.
-                               Cannot be combined with --group-dataset-id.
+  --group                    Category name in the primary column, or null for FindAllMarkers.
+  --group-2                  Category name in the second column for two-group DE.
 
-  -- Group labels --
-  --group %s                 Value in the group-1 annotation that labels group-1 cells.
-                               If omitted, runs FindAllMarkers across all groups.
-                               When --group-dataset-id is set, a positive integer is resolved
-                               to its category name via annots.list_cat_json.
-  --group-2 %s               Value in the group-2 annotation that labels group-2 cells.
-                               Required for two-group DE.
-                               When --group-dataset-id-2 (or --group-dataset-id) is set,
-                               a positive integer is resolved via annots.list_cat_json.
-
-  -- Flags --
-  --is-count %s              Whether the matrix contains raw counts: true | false (default: false).
-                               Required true for deseq2.
+  --is-count                 true | false (default false). Required true for deseq2.
   --write-tsv                Write output.tsv (requires -o).
   --write-volcano            Write output.plot.json volcano plot (requires -o).
-  --write-metadata %s        Write the TSV-like metadata dataset in the loom at the given /attrs/ path
-                               (e.g. --write-metadata /attrs/_de_2_wilcoxon). Default: disabled.
-  --split-files              FindAllMarkers + --write-tsv only: write one TSV per group
-                               (cat_1.tsv, cat_2.tsv, ...) instead of a single output.tsv.
-                               Requires --group-dataset-id (the file index is the 1-based
-                               position of the group in annots.list_cat_json).
-                               Does not affect --write-metadata (the single metadata dataset
-                               with its extra "group" column is always written as usual).
+  --write-metadata           Write metadata dataset in the loom at the given /attrs/ path.
+  --split-files              FindAllMarkers + --write-tsv: one cat_N.tsv per category order
+                             (N is 1-based index in sorted unique categories from the loom).
   --help                     Show this help message and exit.
 """
 
@@ -1254,12 +1030,6 @@ def main() -> None:
     parser.add_argument("--input-dataset",       metavar="Input matrix dataset",                                         required=True,  dest="input_dataset")
     parser.add_argument("--batch",               metavar="Batch/covariate datasets",        default="null",              required=False)
 
-    # DB-based dataset resolution
-    parser.add_argument("--group-dataset-id",    metavar="Annotation id (group 1)",         type=_parse_positive_int,    required=False, dest="group_dataset_id",  default=None)
-    parser.add_argument("--group-dataset-id-2",  metavar="Annotation id (group 2)",         type=_parse_positive_int,    required=False, dest="group_dataset_id2", default=None)
-    parser.add_argument("--dburl",               metavar="PostgreSQL DB URL",               default=None,                required=False)
-
-    # Path-based dataset resolution
     parser.add_argument("--group-dataset",       metavar="Group 1 annotation path",                                      required=False, dest="group_dataset",   default=None)
     parser.add_argument("--group-dataset-2",     metavar="Group 2 annotation path",         default=None,                required=False, dest="group_dataset_2")
 

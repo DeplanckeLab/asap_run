@@ -1,4 +1,11 @@
 ### need to change the tag of the image when the Dockerfile links to a new version of asap_run
+#
+# Python scripts (python/*.py) are copied to /srv/ at image build (see Dockerfile).
+# The asap2_test stack uses docker-compose.test.yml with build.context: /srv/asap_run_new — same rule:
+# rebuild asap_run there after editing python/de.v8.py, or uncomment the de.v8.py bind-mount
+# in asap2_test/docker-compose.test.yml for live edits without rebuild.
+#
+# From this repo only: docker compose build asap_run
 
 services:
   asap_run:
@@ -6,4 +13,3 @@ services:
     image: fabdavid/asap_run:v8
     env_file:
       - '.env'
-    
