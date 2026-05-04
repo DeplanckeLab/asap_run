@@ -1200,8 +1200,6 @@ def run(args: argparse.Namespace) -> None:
     write_tsv_output      = args.write_tsv
     write_volcano_output  = args.write_volcano
     write_metadata_output = args.write_metadata is not None
-    split_files = args.split_files
-
     if (write_tsv_output or write_volcano_output) and not args.o:
         ErrorJSON("--write-tsv and --write-volcano require -o to be set (output folder is needed to write the files).")
 
@@ -1222,19 +1220,6 @@ def run(args: argparse.Namespace) -> None:
     if not is_count_table:
         data_warnings.append("Data is assumed to be logged. If it's not the case, logFC could be wrong.")
 
-    if split_files and not args.o:
-        data_warnings.append(
-            "--split-files was ignored because -o is not set; per-category cat_N.tsv files require an output folder."
-        )
-    split_files = bool(split_files and args.o)
-
-    if split_files and not write_tsv_output:
-        ErrorJSON("--split-files requires --write-tsv to be set.")
-    if split_files and _null(args.group_dataset):
-        ErrorJSON("--split-files requires --group-dataset (loom path to the primary annotation column).")
-    if split_files and not _null(args.group1):
-        ErrorJSON("--split-files is only valid in FindAllMarkers mode (omit --group).")
-
     preview_active, preview_fr, preview_seed, preview_min_cells, preview_max_cells = _preview_parse_args(args)
     rng = np.random.default_rng(preview_seed)
 
@@ -1249,7 +1234,7 @@ def run(args: argparse.Namespace) -> None:
     group_dataset_2_path: str | None = None if _null(args.group_dataset_2) else args.group_dataset_2.strip()
     group1: str | None = group1_raw
     group2: str | None = group2_raw
-    all_categories:   list[str] | None = None  # sorted unique categories for --split-files (FindAllMarkers)
+    all_categories:   list[str] | None = None  # sorted unique categories for per-category cat_N.tsv (FindAllMarkers default)
     list_cats_json_1: list[str] | None = None  # filled after reading loom; exposed in output JSON only in FindAllMarkers
 
     # ── Determine execution mode ─────────────────────────────────────────────────
@@ -1273,6 +1258,18 @@ def run(args: argparse.Namespace) -> None:
             # Default: group 2 lives in the same annotation column as group 1
             group_dataset_2_path = group_dataset_path
         mode = "two_group"
+
+    merge_files = bool(getattr(args, "merge_files", False))
+    if merge_files:
+        if not write_tsv_output:
+            ErrorJSON("--merge-files requires --write-tsv to be set.")
+        if not args.o:
+            ErrorJSON("--merge-files requires -o (output folder for output.tsv).")
+        if mode != "all_markers":
+            ErrorJSON("--merge-files is only valid in FindAllMarkers mode (omit --group and --group-2).")
+
+    # FindAllMarkers: default one cat_N.tsv per category; --merge-files writes a single output.tsv with a group column.
+    write_fam_per_category_tsv = mode == "all_markers" and write_tsv_output and bool(args.o) and not merge_files
 
     # Open the loom file for reading (close it afterwards to avoid locking during DE)
     with LoomHandler(str(input_path), mode="r") as loom:
@@ -1346,7 +1343,7 @@ def run(args: argparse.Namespace) -> None:
     if mode == "all_markers" and groups_2 is not None:
         list_cats_json_1 = sorted(set(list_cats_json_1) | set(_unique_categories_sorted(groups_2)))
 
-    if split_files:
+    if write_fam_per_category_tsv:
         all_categories = list_cats_json_1
 
     result: dict = {}
@@ -1419,10 +1416,10 @@ def run(args: argparse.Namespace) -> None:
 
         # TSV output — Extra leading column "group" to identify which group each row belongs to.
         if write_tsv_output:
-            if split_files:
+            if write_fam_per_category_tsv:
                 # One file per group; file name is cat_{1-based index in sorted unique categories}.tsv
                 if all_categories is None:
-                    ErrorJSON("--split-files requires a category list; internal error (all_categories unset).")
+                    ErrorJSON("FindAllMarkers per-category TSV requires a category list; internal error (all_categories unset).")
                 cat_index_map = {cat: i + 1 for i, cat in enumerate(all_categories)}
                 for grp in unique_groups:
                     pvals_g, padj_g, lfc_g, ave_g1_g, ave_g2_g = all_results[grp]
@@ -1430,7 +1427,7 @@ def run(args: argparse.Namespace) -> None:
                     if grp_idx is None:
                         ErrorJSON(
                             f"Group {grp!r} was not found in the sorted unique category list for --group-dataset. "
-                            "Cannot determine output file index for --split-files."
+                            "Cannot determine output file index for cat_N.tsv."
                         )
                     out_tsv = os.path.join(output_dir, f"cat_{grp_idx}.tsv")
                     write_tsv(
@@ -1789,8 +1786,8 @@ Execution modes
   FindAllMarkers  Omit --group and --group-2. Every group in --group-dataset is tested vs. rest.
                   Optional --group-dataset-2 merges unique values from both columns for
                   list_cats_json (still DE on --group-dataset only). Categories are sorted
-                  alphanumerically (Ruby-like string order). list_cats_json is in output.json
-                  and drives --split-files cat_N.tsv indices.
+                  alphanumerically (Ruby-like string order).                   list_cats_json is in output.json and drives default cat_N.tsv indices
+                  (1-based N in sorted unique categories). Use --merge-files for one output.tsv with a group column.
 
   Single marker   Provide --group only (omit --group-2 and --group-dataset-2).
                   Runs group vs. all other cells.
@@ -1832,9 +1829,9 @@ Options:
   --write-tsv                Write output.tsv (requires -o).
   --write-volcano            Write output.plot.json volcano plot (requires -o).
   --write-metadata           Write metadata dataset in the loom at the given /attrs/ path.
-  --split-files              FindAllMarkers + -o + --write-tsv: one cat_N.tsv per category order
-                             (N is 1-based index in sorted unique categories from the loom). Ignored without -o
-                             (a warning is added to the JSON warnings list).
+  --merge-files              FindAllMarkers + -o + --write-tsv only: write a single output.tsv with a leading
+                             group column (all categories in one file). Default without this flag is one cat_N.tsv
+                             per category (N = 1-based index in sorted unique categories from the loom).
 
   --table-top-de-per-direction  Optional. Limits TSV, stdout de_table, and --write-metadata rows to at most N
                              genes with log FC > 0 and N with log FC < 0, each side ranked by ascending p-value
@@ -1885,7 +1882,7 @@ def main() -> None:
     parser.add_argument("--write-tsv",         action="store_true",                       required=False,              dest="write_tsv")
     parser.add_argument("--write-volcano",     action="store_true",                       required=False,              dest="write_volcano")
     parser.add_argument("--write-metadata",    metavar="Output metadata dataset path",    required=False,              dest="write_metadata", default=None)
-    parser.add_argument("--split-files",       action="store_true",                       required=False,              dest="split_files")
+    parser.add_argument("--merge-files",       action="store_true",                       required=False,              dest="merge_files")
     parser.add_argument(
         "--table-top-de-per-direction",
         type=int,
