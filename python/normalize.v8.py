@@ -9,13 +9,11 @@ from typing import Any, Optional
 
 ## Constants (matching parse_v8 conventions)
 DEFAULT_NP_DTYPE       = np.float64
-LOOM_CHUNK_GENES       = 1024
-LOOM_CHUNK_CELLS       = 1024
+LOOM_CHUNK_GENES       = 64
+LOOM_CHUNK_CELLS       = 64
 LOOM_COMPRESSION       = "gzip"
-LOOM_COMPRESSION_LEVEL = 4
+LOOM_COMPRESSION_LEVEL = 2
 LOOM_DTYPE             = "float32"
-NORMALIZED_LAYER       = "/layers/normalized"
-OUTPUT_LOOM_NAME       = "normalized.loom"
 OUTPUT_JSON_NAME       = "output.json"
 
 _CELL_ID_CANDIDATES = ["/col_attrs/CellID", "/col_attrs/cell_id", "/col_attrs/barcode", "/col_attrs/Barcode", "/col_attrs/barcodes", "/col_attrs/obs_names"]
@@ -72,16 +70,6 @@ def _write_dataset(f_out: h5py.File, path: str, data: np.ndarray, n_genes: int, 
     ds = f_out.create_dataset(path, data=data.astype(LOOM_DTYPE, copy=False), shape=(n_genes, n_cells), chunks=chunk, compression=LOOM_COMPRESSION, compression_opts=LOOM_COMPRESSION_LEVEL)
     return int(ds.id.get_storage_size())
 
-def _copy_metadata_from_loom(f_in: h5py.File, f_out: h5py.File, skip_top_keys: set[str], warnings: list[str]) -> None:
-    """Copy all top-level groups from f_in to f_out, skipping keys in skip_top_keys."""
-    for key in f_in.keys():
-        if key in skip_top_keys or key in f_out:
-            continue
-        try:
-            f_in.copy(key, f_out)
-        except Exception as e:
-            warnings.append(f"Could not copy '{key}' from input LOOM: {e}")
-
 ## Normalization implementations
 def _normalize_total_impl(mat_cxg: np.ndarray, target_sum: Optional[float], exclude_highly_expressed: bool, max_fraction: float) -> tuple[np.ndarray, float]:
     """
@@ -120,61 +108,66 @@ def normalize(args):
 
     out_dir = Path(args.o).resolve() if args.o else input_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_loom_path = str(out_dir / OUTPUT_LOOM_NAME)
     output_json_path = str(out_dir / OUTPUT_JSON_NAME)
 
-    meta_path = Path(args.input_meta).resolve()
-    if not meta_path.is_file():
-        ErrorJSON(f"Input metadata JSON not found: {args.input_meta}")
-    with open(meta_path, "r", encoding="utf-8") as fj:
-        input_meta_list = json.load(fj).get("metadata", [])
+    if not args.output_meta.startswith("/layers/"):
+        ErrorJSON(f"--output_meta must be a path under /layers/ (e.g. /layers/normalized_1_toto), got: {args.output_meta!r}")
 
     try:
         import scanpy as sc
-        tool_version = sc.__version__
+        from importlib.metadata import version as _pkg_version
+        tool_version = _pkg_version("scanpy")
     except ImportError:
         ErrorJSON("scanpy is not installed. Install it with: pip install scanpy")
 
     warnings: list[str] = []
 
     result: dict = {
-        "input_path":    str(input_path),
-        "output_path":   output_loom_path,
-        "tool":          "scanpy",
-        "tool_version":  tool_version,
-        "method":        args.method,
-        "nber_rows":     -1,
-        "nber_cols":     -1,
-        "layer_path":    NORMALIZED_LAYER,
-        "parameters":    {},
-        "normalization": {"is_log_transformed": False, "log_type": None, "log_base": None},
-        "statistics":    {},
-        "metadata":      input_meta_list,
-        "warnings":      [],
+        "parameters":       {},
+        "normalization":    {"tool": "scanpy", "tool_version": tool_version, "is_log_transformed": False, "log_type": None, "log_base": None},
+        "metadata":         [],
+        "warnings":         [],
     }
 
-    with h5py.File(str(input_path), "r") as f_in:
-        # "matrix" → /matrix; any other value → /layers/<layer>
-        src_path = "/matrix" if args.layer == "matrix" else f"/layers/{args.layer}"
+    try:
+        f_in = h5py.File(str(input_path), "r")
+    except Exception as e:
+        ErrorJSON(f"Could not open '{args.f}' as an HDF5/LOOM file. Is it a valid LOOM file?")
+    with f_in:
+        src_path = args.input_meta
         if src_path not in f_in:
             ErrorJSON(f"Source path {src_path!r} not found in LOOM file.")
         node = f_in[src_path]
         if not isinstance(node, h5py.Dataset) or len(node.shape) != 2:
             ErrorJSON(f"Expected a 2-D dataset at {src_path}, got shape {getattr(node, 'shape', '?')}")
 
-        n_genes, n_cells = int(node.shape[0]), int(node.shape[1])
-        result["nber_rows"] = n_genes
-        result["nber_cols"] = n_cells
-        matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE)   # (n_genes × n_cells)
+        # Determine orientation robustly from row_attrs / col_attrs lengths,
+        # since some writers store /matrix as cells×genes instead of genes×cells.
+        def _attr_len(grp_path: str) -> Optional[int]:
+            if grp_path not in f_in:
+                return None
+            sizes = [f_in[grp_path][k].shape[0] for k in f_in[grp_path] if isinstance(f_in[grp_path][k], h5py.Dataset)]
+            return max(sizes) if sizes else None
 
-        result["statistics"]["min_value_before"]    = float(matrix_gxc.min())
-        result["statistics"]["max_value_before"]    = float(matrix_gxc.max())
-        result["statistics"]["nber_zeros_before"]   = int(np.sum(matrix_gxc == 0))
-        result["statistics"]["median_depth_before"] = float(np.median(matrix_gxc.sum(axis=0)))
+        s0, s1   = int(node.shape[0]), int(node.shape[1])
+        ra_len   = _attr_len("/row_attrs")
+        ca_len   = _attr_len("/col_attrs")
+        if ra_len == s1 and ca_len == s0:
+            # Matrix stored cells×genes — transpose to canonical genes×cells
+            n_genes, n_cells = s1, s0
+            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE).T
+        else:
+            # Standard genes×cells
+            n_genes, n_cells = s0, s1
+            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE)
+
 
         if args.method == "normalize_total":
             result["parameters"] = {
-                "source_layer":             args.layer,
+                "loom_path":                str(input_path),
+                "input_loom_path":          args.input_meta,
+                "output_loom_path":         args.output_meta,
+                "method":                   args.method,
                 "target_sum":               args.target_sum,
                 "exclude_highly_expressed": args.exclude_highly_expressed,
                 "max_fraction":             args.max_fraction if args.exclude_highly_expressed else None,
@@ -192,26 +185,38 @@ def normalize(args):
             result["normalization"]["log_type"]           = log_label
             result["normalization"]["log_base"]           = log_base_used
 
-        result["statistics"]["min_value_after"]    = float(normalized_gxc.min())
-        result["statistics"]["max_value_after"]    = float(normalized_gxc.max())
-        result["statistics"]["nber_zeros_after"]   = int(np.sum(normalized_gxc == 0))
-        result["statistics"]["median_depth_after"] = float(np.median(normalized_gxc.sum(axis=0)))
 
-        with h5py.File(output_loom_path, "w") as f_out:
-            for grp in ["attrs", "col_attrs", "row_attrs", "layers", "row_graphs", "col_graphs"]:
-                f_out.require_group(grp)
-            f_out["attrs"].create_dataset("LOOM_SPEC_VERSION", data="3.0.0", dtype=h5py.string_dtype(encoding="utf-8"))
-            _write_dataset(f_out, "/matrix", matrix_gxc, n_genes, n_cells)
-            norm_size = _write_dataset(f_out, NORMALIZED_LAYER, normalized_gxc, n_genes, n_cells)
-            result["statistics"]["normalized_layer_disk_size_bytes"] = norm_size
-            _copy_metadata_from_loom(f_in, f_out, skip_top_keys={"matrix", "attrs"}, warnings=warnings)
+    # Append normalized layer directly into the input LOOM (no copy needed)
+    try:
+        f_rw = h5py.File(str(input_path), "r+")
+    except Exception as e:
+        ErrorJSON(f"Could not open '{args.f}' in append mode: {e}")
+    with f_rw:
+        if args.output_meta in f_rw:
+            warnings.append(f"Path '{args.output_meta}' already exists in the LOOM file and will be overwritten.")
+            del f_rw[args.output_meta]
+        f_rw.require_group("/layers")
+        norm_size = _write_dataset(f_rw, args.output_meta, normalized_gxc, n_genes, n_cells)
+
+    # Metadata entry — mirrors the Metadata dataclass from parse_v8.py
+    is_count_norm = int(np.all(normalized_gxc == np.floor(normalized_gxc)))
+    result["metadata"].append({
+        "name":            args.output_meta,
+        "on":              "EXPRESSION_MATRIX",
+        "type":            "NUMERIC",
+        "nber_cols":       n_cells,
+        "nber_rows":       n_genes,
+        "dataset_size":    norm_size,
+        "is_count_table":  is_count_norm,
+        "imported":        0,
+    })
 
     if warnings:
         result["warnings"] = warnings
     else:
         del result["warnings"]
 
-    json_str = json.dumps(result, default=_json_default, ensure_ascii=False, indent=2)
+    json_str = json.dumps(result, default=_json_default, ensure_ascii=False, separators=(",", ":"))
     if args.o:
         with open(output_json_path, "w", encoding="utf-8") as fj:
             fj.write(json_str)
@@ -222,15 +227,17 @@ def normalize(args):
 HELP_TEXT = """
 Normalization Script — scanpy backend
 
-Reads a LOOM file (from parse.py), normalizes the selected layer, writes a new LOOM
-(/layers/normalized = normalized data, /matrix = raw counts preserved) and output.json.
+Reads a LOOM file (from parse.py), normalizes the selected path, appends the
+normalized layer directly into the input LOOM file, and writes output.json.
 
 Options:
   -f             Input LOOM file (from parse.py).                           [required]
-  --input_meta   Input metadata JSON (output.json from parse.py).           [required]
+  --input_meta   Path to the matrix to normalize inside the LOOM file.     [required]
+                   Examples: /matrix   /layers/spliced   /layers/toto
+  --output_meta  Path where the normalized matrix is stored in the output   [required]
+                 LOOM file. Must be under /layers/.
+                   Examples: /layers/normalized   /layers/normalized_1_toto
   --method       Normalization method: normalize_total                      [required]
-  --layer        LOOM layer to normalize. Use "matrix" for /matrix.         [required]
-                   Examples: "matrix", "spliced", "unspliced"
   -o             Output folder.                      [optional, default: input dir]
 
   ── normalize_total parameters (defaults match sc.pp.normalize_total) ─────────────
@@ -256,6 +263,16 @@ Output JSON normalization block:
   is_log_transformed  bool   — whether log1p was applied
   log_type            str    — e.g. "ln (natural log, log1p)" or "log2 (log2(x+1))"
   log_base            float  — 2.0, 10.0, or null for natural log
+
+Output JSON metadata entry (mirrors parse_v8.py Metadata dataclass):
+  name            str  — LOOM-internal path of the normalized layer (= --output_meta)
+  on              str  — always "EXPRESSION_MATRIX"
+  type            str  — always "NUMERIC"
+  dataset_size    int  — on-disk compressed size in bytes
+  is_count_table  int  — 1 if all values are integers, 0 otherwise
+  imported        int  — always 0 (generated, not imported from source)
+
+Mandatory parameters: -f, --input_meta, --output_meta, --method
 """
 
 def main():
@@ -265,12 +282,12 @@ def main():
 
     parser = argparse.ArgumentParser(description="Normalization Script (scanpy)", add_help=False)
 
-    # Core I/O — -f, --input_meta, --method, --layer are all mandatory
-    parser.add_argument("-f",           required=True,  metavar="Input LOOM file")
-    parser.add_argument("-o",           required=False, metavar="Output folder", default=None)
-    parser.add_argument("--input_meta", required=True,  metavar="Input JSON (from parse.py)")
-    parser.add_argument("--method",     required=True,  choices=["normalize_total"], metavar="Normalization method")
-    parser.add_argument("--layer",      required=True,  metavar='LOOM layer ("matrix" or layer name)')
+    # Core I/O — -f, --input_meta, --output_meta, --method are all mandatory
+    parser.add_argument("-f",            required=True,  metavar="Input LOOM file")
+    parser.add_argument("-o",            required=False, metavar="Output folder", default=None)
+    parser.add_argument("--input_meta",  required=True,  metavar="LOOM-internal path to normalize (e.g. /matrix or /layers/toto)")
+    parser.add_argument("--output_meta", required=True,  metavar="LOOM-internal path for the normalized output (e.g. /layers/normalized_1_toto)")
+    parser.add_argument("--method",      required=True,  choices=["normalize_total"], metavar="Normalization method")
 
     # normalize_total parameters (defaults match sc.pp.normalize_total)
     parser.add_argument("--target_sum",               type=float, default=None,  help="[default: None = median]")
