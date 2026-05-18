@@ -16,8 +16,8 @@ LOOM_COMPRESSION_LEVEL = 2
 LOOM_DTYPE             = "float32"
 OUTPUT_JSON_NAME       = "output.json"
 
-_CELL_ID_CANDIDATES = ["/col_attrs/CellID", "/col_attrs/cell_id", "/col_attrs/barcode", "/col_attrs/Barcode", "/col_attrs/barcodes", "/col_attrs/obs_names"]
-_GENE_ID_CANDIDATES = ["/row_attrs/Gene", "/row_attrs/Accession", "/row_attrs/Original_Gene", "/row_attrs/gene_name", "/row_attrs/gene", "/row_attrs/var_names"]
+_CELL_ID_PATH = "/col_attrs/CellID"
+_GENE_ID_PATH = "/row_attrs/_StableID"
 
 ## Error handling (same pattern as parse_v8.py)
 class ErrorJSON(Exception):
@@ -46,22 +46,6 @@ def _read_string_dataset(f: h5py.File, path: str) -> list[str]:
         return [raw.decode("utf-8", errors="replace")]
     return [v.decode("utf-8", errors="replace") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in raw.ravel()]
 
-def _infer_cell_ids(f: h5py.File, n_cells: int) -> list[str]:
-    for p in _CELL_ID_CANDIDATES:
-        if p in f and isinstance(f[p], h5py.Dataset):
-            vals = _read_string_dataset(f, p)
-            if len(vals) == n_cells:
-                return vals
-    return [f"Cell_{i+1}" for i in range(n_cells)]
-
-def _infer_gene_ids(f: h5py.File, n_genes: int) -> list[str]:
-    for p in _GENE_ID_CANDIDATES:
-        if p in f and isinstance(f[p], h5py.Dataset):
-            vals = _read_string_dataset(f, p)
-            if len(vals) == n_genes:
-                return vals
-    return [f"Gene_{i+1}" for i in range(n_genes)]
-
 def _write_dataset(f_out: h5py.File, path: str, data: np.ndarray, n_genes: int, n_cells: int) -> int:
     """Write a genes×cells matrix with standard chunking/compression. Returns on-disk size in bytes."""
     chunk = (min(n_genes, LOOM_CHUNK_GENES), min(n_cells, LOOM_CHUNK_CELLS))
@@ -69,6 +53,21 @@ def _write_dataset(f_out: h5py.File, path: str, data: np.ndarray, n_genes: int, 
         del f_out[path]
     ds = f_out.create_dataset(path, data=data.astype(LOOM_DTYPE, copy=False), shape=(n_genes, n_cells), chunks=chunk, compression=LOOM_COMPRESSION, compression_opts=LOOM_COMPRESSION_LEVEL)
     return int(ds.id.get_storage_size())
+
+def _open_loom_with_retry(path: str, mode: str, max_wait: int = 600) -> tuple:
+    """Try to open a LOOM/HDF5 file, retrying every second if locked.
+    Returns (h5py.File, wait_time_seconds)."""
+    import time as _time
+    elapsed = 0
+    while True:
+        try:
+            return h5py.File(path, mode), elapsed
+        except OSError as e:
+            if elapsed >= max_wait:
+                ErrorJSON(f"Could not open {path!r} in mode {mode!r} after {max_wait}s: {e}")
+            _time.sleep(1)
+            elapsed += 1
+
 
 ## Normalization implementations
 def _normalize_total_impl(mat_cxg: np.ndarray, target_sum: Optional[float], exclude_highly_expressed: bool, max_fraction: float) -> tuple[np.ndarray, float]:
@@ -126,13 +125,12 @@ def normalize(args):
         "parameters":       {},
         "normalization":    {"tool": "scanpy", "tool_version": tool_version, "is_log_transformed": False, "log_type": None, "log_base": None},
         "metadata":         [],
+        "wait_time":        0,
         "warnings":         [],
     }
 
-    try:
-        f_in = h5py.File(str(input_path), "r")
-    except Exception as e:
-        ErrorJSON(f"Could not open '{args.f}' as an HDF5/LOOM file. Is it a valid LOOM file?")
+    f_in, wt = _open_loom_with_retry(str(input_path), "r")
+    result["wait_time"] += wt
     with f_in:
         src_path = args.input_meta
         if src_path not in f_in:
@@ -141,18 +139,10 @@ def normalize(args):
         if not isinstance(node, h5py.Dataset) or len(node.shape) != 2:
             ErrorJSON(f"Expected a 2-D dataset at {src_path}, got shape {getattr(node, 'shape', '?')}")
 
-        # Determine orientation robustly from row_attrs / col_attrs lengths,
-        # since some writers store /matrix as cells×genes instead of genes×cells.
-        def _attr_len(grp_path: str) -> Optional[int]:
-            if grp_path not in f_in:
-                return None
-            sizes = [f_in[grp_path][k].shape[0] for k in f_in[grp_path] if isinstance(f_in[grp_path][k], h5py.Dataset)]
-            return max(sizes) if sizes else None
-
-        s0, s1   = int(node.shape[0]), int(node.shape[1])
-        ra_len   = _attr_len("/row_attrs")
-        ca_len   = _attr_len("/col_attrs")
-        if ra_len == s1 and ca_len == s0:
+        s0, s1 = int(node.shape[0]), int(node.shape[1])
+        ra_len = f_in[_GENE_ID_PATH].shape[0]
+        ca_len = f_in[_CELL_ID_PATH].shape[0]
+        if s0 == ca_len and s1 == ra_len:
             # Matrix stored cells×genes — transpose to canonical genes×cells
             n_genes, n_cells = s1, s0
             matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE).T
@@ -187,10 +177,8 @@ def normalize(args):
 
 
     # Append normalized layer directly into the input LOOM (no copy needed)
-    try:
-        f_rw = h5py.File(str(input_path), "r+")
-    except Exception as e:
-        ErrorJSON(f"Could not open '{args.f}' in append mode: {e}")
+    f_rw, wt = _open_loom_with_retry(str(input_path), "r+")
+    result["wait_time"] += wt
     with f_rw:
         if args.output_meta in f_rw:
             warnings.append(f"Path '{args.output_meta}' already exists in the LOOM file and will be overwritten.")

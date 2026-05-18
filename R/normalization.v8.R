@@ -90,8 +90,8 @@ LOOM_CHUNK_CELLS <- 64L
 LOOM_GZIP_LEVEL  <- 2L
 OUTPUT_JSON_NAME <- "output.json"
 
-CELL_ID_CANDIDATES <- c("col_attrs/CellID", "col_attrs/cell_id", "col_attrs/barcode", "col_attrs/Barcode", "col_attrs/barcodes", "col_attrs/obs_names")
-GENE_ID_CANDIDATES <- c("row_attrs/Gene", "row_attrs/Accession", "row_attrs/Original_Gene", "row_attrs/gene_name", "row_attrs/gene", "row_attrs/var_names")
+CELL_ID_PATH <- "col_attrs/CellID"
+GENE_ID_PATH <- "row_attrs/_StableID"
 
 ## CLI option list
 option_list <- list(
@@ -157,19 +157,6 @@ if (numeric_version(seurat_version) < numeric_version("5.0.0")) ErrorJSON(paste0
 
 ## ── LOOM helpers (need hdf5r) ─────────────────────────────────────────────────
 
-read_string_dataset <- function(h5, candidates, expected_len) {
-  # Try each candidate path; return the first string vector of the right length.
-  for (path in candidates) {
-    tryCatch({
-      if (h5$exists(path)) {
-        vals <- h5[[path]][]
-        if (length(vals) == expected_len) return(as.character(vals))
-      }
-    }, error = function(e) NULL)
-  }
-  NULL
-}
-
 write_loom_dataset <- function(h5, path, mat_gxc, n_genes, n_cells) {
   # Write a (n_genes × n_cells) float32 matrix to h5[path] with chunked gzip compression.
   # Uses hdf5r's native chunk_dims + gzip_level parameters (no custom DCPL) to guarantee
@@ -185,14 +172,18 @@ write_loom_dataset <- function(h5, path, mat_gxc, n_genes, n_cells) {
     parent_grp <- if (length(parts) > 1) h5[[paste(parts[-length(parts)], collapse = "/")]] else h5
     parent_grp$link_delete(parts[length(parts)])
   }
+  # Transpose before writing: hdf5r stores R matrices in Fortran column-major order,
+  # so writing mat_gxc (n_genes × n_cells) would produce a transposed layout in HDF5.
+  # Writing t(mat_gxc) with dims = c(n_cells, n_genes) produces the same on-disk layout
+  # as Python/h5py, ensuring consistent orientation across both tools.
   ds <- h5$create_dataset(
     name       = path,
     dtype      = h5types$H5T_IEEE_F32LE,
-    dims       = c(n_genes, n_cells),
-    chunk_dims = c(chunk_g, chunk_c),
+    dims       = c(n_cells, n_genes),
+    chunk_dims = c(chunk_c, chunk_g),
     gzip_level = LOOM_GZIP_LEVEL
   )
-  ds[1:n_genes, 1:n_cells] <- matrix(as.numeric(mat_gxc), nrow = n_genes, ncol = n_cells)
+  ds[1:n_cells, 1:n_genes] <- matrix(as.numeric(t(mat_gxc)), nrow = n_cells, ncol = n_genes)
   invisible(ds$get_storage_size())
 }
 
@@ -214,39 +205,56 @@ seurat_log_info <- function(method) {
 warn_env <- new.env(parent = emptyenv())
 warn_env$w <- character(0)
 
+## ── LOOM file lock retry helper ─────────────────────────────────────────────
+
+open_loom_with_retry <- function(path, mode, max_wait = 600L) {
+  # Try to open the LOOM file in the requested mode.
+  # If the file is locked by another process, retry every second for up to max_wait seconds.
+  # Returns a list: h5 = H5File object, wait_time = seconds waited.
+  elapsed <- 0L
+  repeat {
+    h5 <- tryCatch(H5File$new(path, mode = mode), error = function(e) e)
+    if (!inherits(h5, "error")) return(list(h5 = h5, wait_time = elapsed))
+    if (elapsed >= max_wait) ErrorJSON(paste0("Could not open '", path, "' in mode '", mode, "' after ", max_wait, "s: ", conditionMessage(h5)))
+    Sys.sleep(1)
+    elapsed <- elapsed + 1L
+  }
+}
+
 ## ── Result skeleton ───────────────────────────────────────────────────────────
 
 result <- list(
   parameters       = list(),
   normalization    = list(tool = "Seurat", tool_version = seurat_version, is_log_transformed = FALSE, log_type = NULL, log_base = NULL),
-  metadata         = list()
+  metadata         = list(),
+  wait_time        = 0L
 )
 
 ## ── Read the LOOM file ────────────────────────────────────────────────────────
 
-h5_in <- tryCatch(
-  H5File$new(input_path, mode = "r"),
-  error = function(e) ErrorJSON(paste0("Could not open '", args$file, "' as an HDF5/LOOM file. Is it a valid LOOM file?"))
-)
+ret   <- open_loom_with_retry(input_path, mode = "r")
+h5_in <- ret$h5
+result$wait_time <- result$wait_time + ret$wait_time
 
 # --input_meta is the full LOOM-internal path; hdf5r does not use a leading slash
 src_path <- sub("^/", "", args$input_meta)
 if (!h5_in$exists(src_path)) ErrorJSON(paste0("Source path '", args$input_meta, "' not found in LOOM file."))
 
-matrix_gxc <- t(h5_in[[src_path]][,])  # hdf5r reverses HDF5 dims (C↔Fortran); transpose restores genes×cells
+# Determine orientation: hdf5r reverses dims on read for Python-written datasets only.
+# Use gene/cell ID lengths (single scalar reads) to detect which axis is which.
+raw_mat  <- h5_in[[src_path]][,]
+ra_len   <- h5_in[[GENE_ID_PATH]]$dims
+ca_len   <- h5_in[[CELL_ID_PATH]]$dims
+if (!is.na(ra_len) && !is.na(ca_len) && nrow(raw_mat) == ca_len && ncol(raw_mat) == ra_len) {
+  matrix_gxc <- t(raw_mat)   # Python-written: hdf5r reversed dims, transpose back
+} else {
+  matrix_gxc <- raw_mat      # R-written: double reversal already cancelled out
+}
 n_genes    <- nrow(matrix_gxc)
 n_cells    <- ncol(matrix_gxc)
 
-cell_ids <- read_string_dataset(h5_in, CELL_ID_CANDIDATES, n_cells)
-if (is.null(cell_ids)) cell_ids <- paste0("Cell_", seq_len(n_cells))
-
-gene_ids <- read_string_dataset(h5_in, GENE_ID_CANDIDATES, n_genes)
-if (is.null(gene_ids)) gene_ids <- paste0("Gene_", seq_len(n_genes))
-
-if (any(duplicated(gene_ids))) {
-  gene_ids   <- make.unique(gene_ids)
-  warn_env$w <- c(warn_env$w, "Duplicate gene names detected; made unique with make.unique().")
-}
+cell_ids <- as.character(h5_in[[CELL_ID_PATH]][])
+gene_ids <- as.character(h5_in[[GENE_ID_PATH]][])
 
 rownames(matrix_gxc) <- gene_ids
 colnames(matrix_gxc) <- cell_ids
@@ -337,10 +345,9 @@ result$normalization$log_base           <- log_info$log_base
 
 ## ── Append normalized layer directly into the input LOOM ─────────────────────
 
-h5_loom <- tryCatch(
-  H5File$new(input_path, mode = "a"),
-  error = function(e) ErrorJSON(paste0("Could not open '", args$file, "' in append mode: ", conditionMessage(e)))
-)
+ret     <- open_loom_with_retry(input_path, mode = "a")
+h5_loom <- ret$h5
+result$wait_time <- result$wait_time + ret$wait_time
 
 out_path_h5 <- sub("^/", "", args$output_meta)   # hdf5r does not use a leading slash
 if (h5_loom$exists(out_path_h5)) {
