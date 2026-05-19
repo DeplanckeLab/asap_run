@@ -78,6 +78,7 @@ ErrorJSON <- function(message, output_path = NULL) {
 LOOM_CHUNK_GENES <- 64L
 LOOM_CHUNK_CELLS <- 64L
 LOOM_GZIP_LEVEL  <- 2L
+LOOM_DTYPE       <- "float64"  # on-disk precision: "float32" or "float64"
 OUTPUT_JSON_NAME <- "output.json"
 
 CELL_ID_PATH <- "col_attrs/CellID"
@@ -137,7 +138,7 @@ if (numeric_version(seurat_version) < numeric_version("5.0.0")) ErrorJSON(paste0
 ## ── LOOM helpers (need hdf5r) ─────────────────────────────────────────────────
 
 write_loom_dataset <- function(h5, path, mat_gxc, n_genes, n_cells) {
-  # Write a (n_genes × n_cells) float32 matrix to h5[path] with chunked gzip compression.
+  # Write a (n_genes × n_cells) matrix to h5[path] with chunked gzip compression (precision = LOOM_DTYPE).
   # Uses hdf5r's native chunk_dims + gzip_level parameters (no custom DCPL) to guarantee
   # exactly one GZIP filter is applied.  Returns on-disk size in bytes.
   chunk_g <- min(n_genes, LOOM_CHUNK_GENES)
@@ -157,7 +158,7 @@ write_loom_dataset <- function(h5, path, mat_gxc, n_genes, n_cells) {
   # as Python/h5py, ensuring consistent orientation across both tools.
   ds <- h5$create_dataset(
     name       = path,
-    dtype      = h5types$H5T_IEEE_F32LE,
+    dtype      = if (LOOM_DTYPE == "float64") h5types$H5T_IEEE_F64LE else h5types$H5T_IEEE_F32LE,
     dims       = c(n_cells, n_genes),
     chunk_dims = c(chunk_c, chunk_g),
     gzip_level = LOOM_GZIP_LEVEL

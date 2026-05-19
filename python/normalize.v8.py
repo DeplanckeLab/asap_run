@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 ## Constants (matching parse_v8 conventions)
-DEFAULT_NP_DTYPE       = np.float64
+DEFAULT_NP_DTYPE       = np.float64  # in-memory computation precision (always float64)
 LOOM_CHUNK_GENES       = 64
 LOOM_CHUNK_CELLS       = 64
 LOOM_COMPRESSION       = "gzip"
 LOOM_COMPRESSION_LEVEL = 2
-LOOM_DTYPE             = "float32"
+LOOM_DTYPE             = "float64"  # on-disk precision: "float32" or "float64"
 OUTPUT_JSON_NAME       = "output.json"
 
 _CELL_ID_PATH = "/col_attrs/CellID"
