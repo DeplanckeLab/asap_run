@@ -29,9 +29,11 @@ Options:
   --do_scale         Divide each gene by its standard deviation.            [default: TRUE]
   --do_center        Center each gene to mean zero.                         [default: TRUE]
   --scale_max        Max value after scaling (clips values above this).     [default: 10]
-  --vars_to_regress  Comma-separated variables to regress out before
-                       scaling (e.g. 'percent.mt,nCount_RNA').              [default: NULL]
-  --features         Comma-separated genes to scale (NULL = all genes).     [default: NULL]
+  --vars_to_regress  Comma-separated /col_attrs/ LOOM paths to regress out
+                       (e.g. '/col_attrs/percent_mt,/col_attrs/nCount_RNA'). [default: NULL]
+  --features         Path to a LOOM /row_attrs/ dataset with 0/1 flags
+                       identifying which genes to scale (NULL = all genes).  [default: NULL]
+                       Example: /row_attrs/hvg_norm_ln_vst
   --block_size       Number of genes processed per block (memory control).  [default: 1000]
 
   --help             Show this message and exit.
@@ -98,8 +100,8 @@ option_list <- list(
   make_option("--do_scale",        type = "logical",   default = TRUE,   help = "[ScaleData] Divide by standard deviation. [default: TRUE]"),
   make_option("--do_center",       type = "logical",   default = TRUE,   help = "[ScaleData] Center to mean zero. [default: TRUE]"),
   make_option("--scale_max",       type = "double",    default = 10.0,   help = "[ScaleData] Clip values above this threshold after scaling. [default: 10]"),
-  make_option("--vars_to_regress", type = "character", default = NULL,   help = "[ScaleData] Comma-separated variables to regress out. [default: NULL]"),
-  make_option("--features",        type = "character", default = NULL,   help = "[ScaleData] Comma-separated genes to scale (NULL = all). [default: NULL]"),
+  make_option("--vars_to_regress", type = "character", default = NULL,   help = "[ScaleData] Comma-separated /col_attrs/ LOOM paths to regress out. [default: NULL]"),
+  make_option("--features",        type = "character", default = NULL,   help = "[ScaleData] /row_attrs/ LOOM path with 0/1 flags (NULL = all genes). [default: NULL]"),
   make_option("--block_size",      type = "integer",   default = 1000L,  help = "[ScaleData] Genes processed per block. [default: 1000]")
 )
 
@@ -225,6 +227,31 @@ gene_ids <- as.character(h5_in[[GENE_ID_PATH]][])
 
 rownames(matrix_gxc) <- gene_ids
 colnames(matrix_gxc) <- cell_ids
+
+# Read vars_to_regress metadata from LOOM (comma-separated /col_attrs/ paths)
+vars_meta <- NULL
+if (!is.null(args$vars_to_regress)) {
+  vtr_paths <- trimws(strsplit(args$vars_to_regress, ",")[[1]])
+  vars_meta <- list()
+  for (vp in vtr_paths) {
+    vp_h5 <- sub("^/", "", vp)
+    if (!h5_in$exists(vp_h5)) ErrorJSON(paste0("--vars_to_regress path '", vp, "' not found in LOOM file."))
+    vname <- basename(vp_h5)
+    vars_meta[[vname]] <- as.numeric(h5_in[[vp_h5]][])
+  }
+}
+
+# Read features flags from LOOM (/row_attrs/ 0/1 path, same interface as PCA)
+features_from_loom <- NULL
+if (!is.null(args$features)) {
+  feat_h5 <- sub("^/", "", args$features)
+  if (!h5_in$exists(feat_h5)) ErrorJSON(paste0("--features path '", args$features, "' not found in LOOM file."))
+  feat_flags <- as.integer(h5_in[[feat_h5]][])
+  if (length(feat_flags) != n_genes) ErrorJSON(paste0("--features dataset length (", length(feat_flags), ") does not match number of genes (", n_genes, ")."))
+  features_from_loom <- gene_ids[feat_flags == 1L]
+  if (length(features_from_loom) == 0L) ErrorJSON("No genes selected by --features (all flags are 0).")
+}
+
 h5_in$close_all()
 
 ## ── Create Seurat object ──────────────────────────────────────────────────────
@@ -236,6 +263,13 @@ seurat_obj  <- suppressWarnings(CreateSeuratObject(counts = fake_counts, assay =
 # Set the data layer to the actual input matrix using the Seurat v5 assay-level API.
 seurat_obj[[args$assay]] <- SetAssayData(seurat_obj[[args$assay]], layer = "data", new.data = matrix_gxc)
 
+# Inject regression variables as cell metadata
+if (!is.null(vars_meta)) {
+  for (vname in names(vars_meta)) {
+    seurat_obj[[vname]] <- vars_meta[[vname]]
+  }
+}
+
 ## ── Apply scaling (capture Seurat warnings into warn_env) ────────────────────
 
 capture_warnings <- function(expr) {
@@ -245,8 +279,8 @@ capture_warnings <- function(expr) {
   })
 }
 
-vars_to_regress_vec <- if (!is.null(args$vars_to_regress)) trimws(strsplit(args$vars_to_regress, ",")[[1]]) else NULL
-features_vec        <- if (!is.null(args$features))        trimws(strsplit(args$features,        ",")[[1]]) else rownames(seurat_obj)
+vars_to_regress_vec <- if (!is.null(vars_meta)) names(vars_meta) else NULL
+features_vec        <- if (!is.null(features_from_loom)) features_from_loom else rownames(seurat_obj)
 
 result$parameters <- list(
   loom_path        = input_path,
@@ -256,8 +290,8 @@ result$parameters <- list(
   do_scale         = args$do_scale,
   do_center        = args$do_center,
   scale_max        = if (args$do_scale) args$scale_max else NULL,
-  vars_to_regress  = vars_to_regress_vec,
-  features         = if (!is.null(args$features)) features_vec else NULL,
+  vars_to_regress  = args$vars_to_regress,
+  features         = args$features,
   block_size       = args$block_size
 )
 

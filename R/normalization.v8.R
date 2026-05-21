@@ -110,11 +110,11 @@ option_list <- list(
 
   # ── SCTransform parameters (defaults match Seurat v5 SCTransform) ────────────────────
   make_option("--vst_flavor",               type = "character", default = "v2",      help = "[SCTransform] VST flavour: v1 | v2. [default: v2]"),
-  make_option("--vars_to_regress",          type = "character", default = NULL,      help = "[SCTransform] Comma-separated variables to regress (e.g. percent.mt). [default: NULL]"),
+  make_option("--vars_to_regress",          type = "character", default = NULL,      help = "[SCTransform] Comma-separated /col_attrs/ LOOM paths to regress out. [default: NULL]"),
   make_option("--n_cells",                  type = "integer",   default = NULL,      help = "[SCTransform] Cells used for parameter estimation (NULL = all). [default: NULL]"),
   make_option("--variable_features_n",      type = "integer",   default = 3000L,     help = "[SCTransform] Top variable features to select. [default: 3000]"),
   make_option("--variable_features_rv_th",  type = "double",    default = 1.3,       help = "[SCTransform] Residual-variance threshold for variable feature selection. [default: 1.3]"),
-  make_option("--residual_features",        type = "character", default = NULL,      help = "[SCTransform] Comma-separated genes to compute residuals for (NULL = all variable). [default: NULL]"),
+  make_option("--residual_features",        type = "character", default = NULL,      help = "[SCTransform] /row_attrs/ LOOM path with 0/1 flags (NULL = all variable). [default: NULL]"),
   make_option("--do_correct_umi",           type = "logical",   default = TRUE,      help = "[SCTransform] Correct UMI counts before modelling. [default: TRUE]"),
   make_option("--do_scale",                 type = "logical",   default = FALSE,     help = "[SCTransform] Scale Pearson residuals. [default: FALSE]"),
   make_option("--do_center",                type = "logical",   default = TRUE,      help = "[SCTransform] Center Pearson residuals. [default: TRUE]"),
@@ -259,6 +259,31 @@ gene_ids <- as.character(h5_in[[GENE_ID_PATH]][])
 
 rownames(matrix_gxc) <- gene_ids
 colnames(matrix_gxc) <- cell_ids
+
+# Read vars_to_regress from LOOM (SCTransform only, comma-separated /col_attrs/ paths)
+vars_meta <- NULL
+if (!is.null(args$vars_to_regress)) {
+  vtr_paths <- trimws(strsplit(args$vars_to_regress, ",")[[1]])
+  vars_meta <- list()
+  for (vp in vtr_paths) {
+    vp_h5 <- sub("^/", "", vp)
+    if (!h5_in$exists(vp_h5)) ErrorJSON(paste0("--vars_to_regress path '", vp, "' not found in LOOM file."))
+    vname <- basename(vp_h5)
+    vars_meta[[vname]] <- as.numeric(h5_in[[vp_h5]][])
+  }
+}
+
+# Read residual_features from LOOM (SCTransform only, /row_attrs/ 0/1 path)
+residual_from_loom <- NULL
+if (!is.null(args$residual_features)) {
+  rf_h5 <- sub("^/", "", args$residual_features)
+  if (!h5_in$exists(rf_h5)) ErrorJSON(paste0("--residual_features path '", args$residual_features, "' not found in LOOM file."))
+  rf_flags <- as.integer(h5_in[[rf_h5]][])
+  if (length(rf_flags) != n_genes) ErrorJSON(paste0("--residual_features dataset length (", length(rf_flags), ") does not match number of genes (", n_genes, ")."))
+  residual_from_loom <- gene_ids[rf_flags == 1L]
+  if (length(residual_from_loom) == 0L) ErrorJSON("No genes selected by --residual_features (all flags are 0).")
+}
+
 h5_in$close_all()
 
 
@@ -286,8 +311,8 @@ if (args$method %in% c("LogNormalize", "CLR", "RC")) {
   normalized_data <- GetAssayData(seurat_obj, assay = args$assay, layer = "data")
 
 } else if (args$method == "SCTransform") {
-  vars_to_regress_vec   <- if (!is.null(args$vars_to_regress))   trimws(strsplit(args$vars_to_regress,   ",")[[1]]) else NULL
-  residual_features_vec <- if (!is.null(args$residual_features)) trimws(strsplit(args$residual_features, ",")[[1]]) else NULL
+  vars_to_regress_vec   <- if (!is.null(vars_meta)) names(vars_meta) else NULL
+  residual_features_vec <- residual_from_loom   # NULL if not provided
 
   # SCTransform requires all cells to have at least 1 count (log_umi covariate = log(total) must be finite).
   # Drop zero-count cells before creating the Seurat object, fill them back with 0 afterwards.
@@ -301,7 +326,14 @@ if (args$method %in% c("LogNormalize", "CLR", "RC")) {
     sparse_counts_sct <- sparse_counts
   }
 
-  result$parameters <- list(loom_path = input_path, input_loom_path = args$input_meta, output_loom_path = args$output_meta, method = args$method, vst_flavor = args$vst_flavor, new_assay_name = args$new_assay_name, vars_to_regress = vars_to_regress_vec, n_cells = args$n_cells, variable_features_n = args$variable_features_n, variable_features_rv_th = args$variable_features_rv_th, residual_features = residual_features_vec, do_correct_umi = args$do_correct_umi, do_scale = args$do_scale, do_center = args$do_center, conserve_memory = args$conserve_memory, return_only_var_genes = args$return_only_var_genes, seed_use = args$seed_use)
+  # Inject regression variables as cell metadata (on the full seurat_obj, before zero-cell subset)
+  if (!is.null(vars_meta)) {
+    for (vname in names(vars_meta)) {
+      seurat_obj[[vname]] <- vars_meta[[vname]]
+    }
+  }
+
+  result$parameters <- list(loom_path = input_path, input_loom_path = args$input_meta, output_loom_path = args$output_meta, method = args$method, vst_flavor = args$vst_flavor, new_assay_name = args$new_assay_name, vars_to_regress = args$vars_to_regress, n_cells = args$n_cells, variable_features_n = args$variable_features_n, variable_features_rv_th = args$variable_features_rv_th, residual_features = args$residual_features, do_correct_umi = args$do_correct_umi, do_scale = args$do_scale, do_center = args$do_center, conserve_memory = args$conserve_memory, return_only_var_genes = args$return_only_var_genes, seed_use = args$seed_use)
   options(future.globals.maxSize = Inf)
   seurat_obj <- capture_warnings(suppressMessages(SCTransform(seurat_obj, assay = args$assay, new.assay.name = args$new_assay_name, vst.flavor = args$vst_flavor, vars.to.regress = vars_to_regress_vec, ncells = args$n_cells, variable.features.n = args$variable_features_n, variable.features.rv.th = args$variable_features_rv_th, residual.features = residual_features_vec, do.correct.umi = args$do_correct_umi, do.scale = args$do_scale, do.center = args$do_center, conserve.memory = args$conserve_memory, return.only.var.genes = args$return_only_var_genes, seed.use = args$seed_use, verbose = FALSE)))
   sct_assay <- args$new_assay_name
