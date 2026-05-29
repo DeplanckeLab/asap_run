@@ -1311,17 +1311,17 @@ class RdsHandler:
         
         return stats
 
-class MtxHandler:
+class MexHandler:
     """
-    Handler for Matrix Market (MTX) format files.
+    Handler for Matrix Market (MEX) format files.
     Expects either:
     - A single matrix.mtx file, OR
     - A triplet: matrix.mtx + barcodes.tsv + (features.tsv | genes.tsv)
     """
     @staticmethod
-    def _discover_mtx_files(matrix_path: str) -> tuple[str, str | None, str | None]:
+    def _discover_mex_files(matrix_path: str) -> tuple[str, str | None, str | None]:
         """
-        Discover the MTX triplet files (matrix, barcodes, features).
+        Discover the MEX triplet files (matrix, barcodes, features).
         """       
         matrix_dir = Path(matrix_path).parent
         
@@ -1511,10 +1511,10 @@ class MtxHandler:
     @staticmethod
     def parse(args, file_path: str, out_dir: Path, gene_db: MapGene, loom: LoomFile, result):
         """
-        Parse MTX format files.
+        Parse MEX format files.
         """
         # Discover the triplet files
-        matrix_path, barcodes_path, features_path = MtxHandler._discover_mtx_files(file_path)
+        matrix_path, barcodes_path, features_path = MexHandler._discover_mex_files(file_path)
         
         if matrix_path is None:
             ErrorJSON("No matrix.mtx file found in input")
@@ -1522,13 +1522,13 @@ class MtxHandler:
         result["input_group"] = Path(matrix_path).name
         
         # Parse MTX header
-        n_genes, n_cells, nnz, is_pattern = MtxHandler._parse_mtx_header(matrix_path)
+        n_genes, n_cells, nnz, is_pattern = MexHandler._parse_mtx_header(matrix_path)
         result["nber_rows"] = n_genes
         result["nber_cols"] = n_cells
         
         # Read cell barcodes
         if barcodes_path:
-            cells = MtxHandler._read_barcodes(barcodes_path)
+            cells = MexHandler._read_barcodes(barcodes_path)
             if len(cells) != n_cells:
                 ErrorJSON(f"Barcodes file has {len(cells)} entries but matrix has {n_cells} cells.")
         else:
@@ -1536,7 +1536,7 @@ class MtxHandler:
         
         # Read gene/feature information
         if features_path:
-            gene_ids, gene_names = MtxHandler._read_features(features_path)
+            gene_ids, gene_names = MexHandler._read_features(features_path)
             if len(gene_ids) != n_genes:
                 ErrorJSON(f"Features file has {len(gene_ids)} entries but matrix has {n_genes} genes.")
         else:
@@ -1553,7 +1553,7 @@ class MtxHandler:
         parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cells, original_gene_names=gene_ids, gene_db=gene_db, gene_db_queries=gene_ids, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
         
         # Write expression matrix
-        get_block = MtxHandler._create_mtx_block_reader(matrix_path, n_genes, n_cells, nnz, is_pattern)
+        get_block = MexHandler._create_mtx_block_reader(matrix_path, n_genes, n_cells, nnz, is_pattern)
         stats = loom.write_expression_matrix(get_block=get_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
         
         return stats
@@ -2403,7 +2403,7 @@ dispatch = {
     'H5AD': H5ADHandler.parse,
     'LOOM': LoomHandler.parse,
     'RDS': RdsHandler.parse,
-    'MTX': MtxHandler.parse,
+    'MEX': MexHandler.parse,
     'RAW_TEXT': TextHandler.parse,
 }
 
@@ -2516,7 +2516,7 @@ Parsing Mode
 Options:
   -f %s             File to parse.
   -o %s             Output folder.
-  --filetype %s     File type [RAW_TEXT, LOOM, H5_10x, H5AD, RDS, MTX]
+  --filetype %s     File type [RAW_TEXT, LOOM, H5_10x, H5AD, RDS, MEX]
   --header %s       The file has a header [true, false] (default: true).
   --col %s          Name Column [none, first, last] (default: first).
   --sel %s          Name of entry to load from archive or HDF5 (if multiple groups).
@@ -2534,7 +2534,7 @@ def main():
     parser = argparse.ArgumentParser(description='Parsing Mode Script', add_help=False)
     parser.add_argument('-f', metavar='File to parse', required=True)
     parser.add_argument('-o', metavar='Output folder', required=False)
-    parser.add_argument('--filetype', metavar='File type', choices=['H5_10x', 'H5AD', 'LOOM', 'RDS', 'MTX', 'RAW_TEXT'], required=True)
+    parser.add_argument('--filetype', metavar='File type', choices=['H5_10x', 'H5AD', 'LOOM', 'RDS', 'MEX', 'RAW_TEXT'], required=True)
     parser.add_argument('--header', metavar='[RAW_TEXT] Is there a header', choices=['true', 'false'], default='true', required=False)
     parser.add_argument('--col', metavar='[RAW_TEXT] Which column contains row names', choices=['none', 'first', 'last'], default='first', required=False)
     parser.add_argument('--sel', metavar='In case of multiple matrices, which one to use', default=None, required=False)

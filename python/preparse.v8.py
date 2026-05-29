@@ -28,7 +28,7 @@ class FileType:
     H5AD = 'H5AD'
     LOOM = 'LOOM'
     RDS = 'RDS'
-    MTX = 'MTX'
+    MEX = 'MEX'
     ARCHIVE = 'ARCHIVE'
     RAW_TEXT = 'RAW_TEXT'
     UNKNOWN = 'UNKNOWN'
@@ -46,9 +46,9 @@ def cleanup_empty_dirs(base_path):
             except:
                 pass
 
-def is_mtx_triplet(file_list):
+def is_mex_triplet(file_list):
     """
-    Check if file list contains exactly ONE MTX triplet.
+    Check if file list contains exactly ONE MEX triplet.
     Returns True only if there's a single complete triplet (3 files).
     Multiple triplets should be treated as a regular archive requiring --sel.
     
@@ -150,7 +150,7 @@ def is_mtx_triplet(file_list):
     # Only return True if there's exactly ONE complete triplet
     return len(complete_triplets) == 1 and len(file_list) == 3
 
-def find_mtx_triplet_for_file(selected_file, all_files):
+def find_mex_triplet_for_file(selected_file, all_files):
     """
     Given a selected file (e.g., matrix.mtx), find its companion triplet files.
     Returns list of [matrix, barcodes, features] if found, else None.
@@ -289,8 +289,8 @@ def find_mtx_triplet_for_file(selected_file, all_files):
     
     return None
 
-def extract_and_process_mtx_triplet(archive_obj, file_paths, extract_dir, original_input=None):
-    """Extract and process MTX triplet files."""
+def extract_and_process_mex_triplet(archive_obj, file_paths, extract_dir, original_input=None):
+    """Extract and process MEX triplet files."""
     canonical = {
         "matrix.mtx": "matrix.mtx", "matrix": "matrix.mtx",
         "barcodes.tsv": "barcodes.tsv", "barcodes": "barcodes.tsv",
@@ -306,7 +306,7 @@ def extract_and_process_mtx_triplet(archive_obj, file_paths, extract_dir, origin
         return p
     
     def get_canonical_name(fname):
-        """Determine canonical name for MTX triplet file."""
+        """Determine canonical name for MEX triplet file."""
         base = base_name(fname)
         base_lower = base.lower()
         
@@ -425,14 +425,14 @@ def decompress_if_needed(file_path, sel, original_input=None):
                 cleanup_empty_dirs(extract_dir)
                 return decompress_if_needed(str(final_path), sel, original_input)
             
-            # MTX triplet without --sel
-            if not sel and is_mtx_triplet(file_paths):
+            # MEX triplet without --sel
+            if not sel and is_mex_triplet(file_paths):
                 archive_stem = Path(file_path).stem
                 if archive_stem.endswith('.tar'):
                     archive_stem = archive_stem[:-4]
                 extract_dir = Path(file_path).parent / archive_stem
                 extract_dir.mkdir(exist_ok=True)
-                final_paths = extract_and_process_mtx_triplet(z, file_paths, extract_dir, original_input)
+                final_paths = extract_and_process_mex_triplet(z, file_paths, extract_dir, original_input)
                 return final_paths, None
             
             # Multiple files with --sel
@@ -440,8 +440,8 @@ def decompress_if_needed(file_path, sel, original_input=None):
                 if sel not in file_paths:
                     ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
                 
-                # Check if selected file is part of an MTX triplet
-                triplet_files = find_mtx_triplet_for_file(sel, file_paths)
+                # Check if selected file is part of an MEX triplet
+                triplet_files = find_mex_triplet_for_file(sel, file_paths)
                 
                 if triplet_files:
                     # Extract the entire triplet
@@ -450,7 +450,7 @@ def decompress_if_needed(file_path, sel, original_input=None):
                         archive_stem = archive_stem[:-4]
                     extract_dir = Path(file_path).parent / archive_stem
                     extract_dir.mkdir(exist_ok=True)
-                    final_paths = extract_and_process_mtx_triplet(z, triplet_files, extract_dir, original_input)
+                    final_paths = extract_and_process_mex_triplet(z, triplet_files, extract_dir, original_input)
                     return final_paths, None
                 else:
                     # Extract single file
@@ -494,14 +494,14 @@ def decompress_if_needed(file_path, sel, original_input=None):
                 cleanup_empty_dirs(extract_dir)
                 return decompress_if_needed(str(final_path), sel, original_input)
             
-            # MTX triplet without --sel
-            if not sel and is_mtx_triplet(file_paths):
+            # MEX triplet without --sel
+            if not sel and is_mex_triplet(file_paths):
                 archive_stem = Path(file_path).stem
                 if archive_stem.endswith('.tar'):
                     archive_stem = archive_stem[:-4]
                 extract_dir = Path(file_path).parent / archive_stem
                 extract_dir.mkdir(exist_ok=True)
-                final_paths = extract_and_process_mtx_triplet(t, file_paths, extract_dir, original_input)
+                final_paths = extract_and_process_mex_triplet(t, file_paths, extract_dir, original_input)
                 
                 # Delete the tar after MTX extraction ONLY if it's not the original input
                 tar_to_delete = Path(file_path)
@@ -522,8 +522,8 @@ def decompress_if_needed(file_path, sel, original_input=None):
                 if sel not in file_paths:
                     ErrorJSON(f"Your selected file '{sel}' is not in the list of files of the archive: {file_paths}")
                 
-                # Check if selected file is part of an MTX triplet
-                triplet_files = find_mtx_triplet_for_file(sel, file_paths)
+                # Check if selected file is part of an MEX triplet
+                triplet_files = find_mex_triplet_for_file(sel, file_paths)
                 
                 if triplet_files:
                     # Extract the entire triplet
@@ -532,7 +532,7 @@ def decompress_if_needed(file_path, sel, original_input=None):
                         archive_stem = archive_stem[:-4]
                     extract_dir = Path(file_path).parent / archive_stem
                     extract_dir.mkdir(exist_ok=True)
-                    final_paths = extract_and_process_mtx_triplet(t, triplet_files, extract_dir, original_input)
+                    final_paths = extract_and_process_mex_triplet(t, triplet_files, extract_dir, original_input)
                     
                     # Delete the tar after extraction ONLY if it's not the original input
                     tar_to_delete = Path(file_path)
@@ -667,8 +667,8 @@ def preparse(args):
         list_files, archive_path = decompress_if_needed(args.f, args.sel)
         if len(list_files) == 0: # Empty archive
             ErrorJSON(f"Archive is empty or corrupted: {archive_path}")        
-        elif len(list_files) == 3 and archive_path == None: # MTX (10x)
-            MtxHandler.preparse(args, list_files)
+        elif len(list_files) == 3 and archive_path == None: # MEX (10x)
+            MexHandler.preparse(args, list_files)
         elif len(list_files) > 1: # Archive with multiple files
             ArchiveHandler.write_listing_json(args, archive_path, list_files)
         else: # Unique file, decompressed if needed
@@ -683,7 +683,7 @@ def preparse(args):
             elif file_type == FileType.LOOM:
                 LoomHandler.preparse(args, file_path)
             elif file_type == FileType.RAW_TEXT:
-                # Check if MTX format
+                # Check if MEX format
                 first_line = None
                 try:
                     with open(file_path, 'r') as f:
@@ -691,7 +691,7 @@ def preparse(args):
                 except (Exception) as e:
                     ErrorJSON(str(e).strip() + '. Format is not handled?')
                 if first_line.startswith("%%MatrixMarket matrix"):
-                    MtxHandler.preparse(args, [file_path])
+                    MexHandler.preparse(args, [file_path])
                 else:
                     TextHandler.preparse(args, file_path)
             else: # Not detected
@@ -1052,11 +1052,11 @@ class ArchiveHandler:
         else:
             print(json_str)
 
-class MtxHandler:
+class MexHandler:
     @staticmethod
     def preparse(args, file_paths):
         result = {
-            "detected_format": FileType.MTX,
+            "detected_format": FileType.MEX,
             "file_path": file_paths, # Could have been unzipped/unarchived
             "list_groups": []
         }
