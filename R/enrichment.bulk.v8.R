@@ -151,11 +151,19 @@ if (args$method == "fgsea") {
   suppressPackageStartupMessages(library(fgsea))
   tool <- "fgsea"; tool_version <- tryCatch(as.character(packageVersion("fgsea")), error = function(e) "unknown")
 } else if (args$method == "clusterProfiler") {
-  if (!requireNamespace("clusterProfiler", quietly = TRUE)) ErrorJSON("clusterProfiler not installed. Use: BiocManager::install('clusterProfiler')")
+  # Suppress stdout + stderr during the ENTIRE loading block (requireNamespace AND
+  # library) — the blank line comes from .onLoad() hooks firing during
+  # requireNamespace(), which runs before any subsequent local sink can be set up.
+  null_msg <- file(nullfile(), "w")
+  sink(null_msg, type = "message")
+  cp_available <- FALSE
+  invisible(capture.output(cp_available <- requireNamespace("clusterProfiler", quietly = TRUE)))
+  if (!isTRUE(cp_available)) { sink(type="message"); close(null_msg); ErrorJSON("clusterProfiler not installed. Use: BiocManager::install('clusterProfiler')") }
   invisible(capture.output(suppressPackageStartupMessages(library(clusterProfiler))))
+  sink(type = "message"); close(null_msg)
   tool <- "clusterProfiler"; tool_version <- tryCatch(as.character(packageVersion("clusterProfiler")), error = function(e) "unknown")
 } else {
-  tool <- "fisher.test"; tool_version <- tryCatch(as.character(packageVersion("base")), error = function(e) "unknown")
+  tool <- "fisher.test"; tool_version <- tryCatch(as.character(packageVersion("base")),  error = function(e) "unknown")
 }
 
 ## ── Helpers ───────────────────────────────────────────────────────────────────
@@ -342,6 +350,8 @@ if (args$method %in% ORA_METHODS) {
       )
       if (is.null(term2gene) || nrow(term2gene) == 0) return(results)
       fg_ens_bg <- intersect(fg_ens_d, bg_ens)
+      null_msg <- file(nullfile(), "w")
+      sink(null_msg, type = "message")
       invisible(capture.output(
         cp_res <- capture_warnings(suppressMessages(clusterProfiler::enricher(
           gene=fg_ens_bg, universe=bg_ens, TERM2GENE=term2gene, TERM2NAME=term2name,
@@ -349,6 +359,7 @@ if (args$method %in% ORA_METHODS) {
           pAdjustMethod="BH", pvalueCutoff=1.0, qvalueCutoff=1.0
         )))
       ))
+      sink(type = "message"); close(null_msg)
       if (!is.null(cp_res) && nrow(cp_res@result) > 0) {
         df      <- cp_res@result
         parse_n <- function(r, side) as.integer(strsplit(r, "/")[[1]][side])
