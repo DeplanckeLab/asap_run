@@ -336,14 +336,47 @@ install.cran("otel", version="0.2.0")
 install.cran("S7", version="0.2.2")
 install.cran("maps", version="3.4.3")
 install.cran("fields", version="17.3")
+install.cran("timechange", version="0.4.0")
+install.cran("lubridate", version="1.9.5")
+install.cran("RPostgres", version="1.4.10")
+install.cran("coda", version="0.19-4.1")
+install.cran("emdbook", version="1.3.14")
+install.cran("RcppNumerical", version="0.7-0")
+install.cran("fastmatch", version="1.1-8") # Dependency of fgsea
+install.cran("aisdk", version="1.4.12") # Dependency of clusterProfiler
+install.cran("yulab.utils", version="0.2.4") # Dependency of clusterProfiler
+install.cran("enrichit", version="0.1.4") # Dependency of clusterProfiler
+install.cran("gson", version="0.1.0") # Dependency of clusterProfiler
+install.cran("gridGraphics", version="0.5-1") # Dependency of aplot
+install.cran("ggfun", version="0.2.0") # Dependency of aplot
+install.cran("ggplotify", version="0.1.3") # Dependency of aplot
+install.cran("aplot", version="0.2.9") # Dependency of enrichplot
+install.cran("ggnewscale", version="0.5.2") # Dependency of enrichplot
+install.cran("ggtangle", version="0.1.2") # Dependency of enrichplot
+install.cran("tweenr", version="2.0.3") # Dependency of scatterpie
+install.cran("ggforce", version="0.5.0") # Dependency of scatterpie
+install.cran("scatterpie", version="0.2.6") # Dependency of enrichplot..
+install.cran("R.oo", version="1.27.1") # Dependency of R.utils
+install.cran("R.methodsS3", version="1.8.2") # Dependency of R.utils
+install.cran("R.utils", version="2.13.0") # Dependency of GOSemSim
+install.cran("ape", version="5.8-1") # Dependency of ggtree
+install.cran("tidytree", version="0.4.7") # Dependency of ggtree
+install.cran("truncnorm", version="1.0-9") # Dependency of ashr
+install.cran("mixsqp", version="0.3-54") # Dependency of ashr
+install.cran("SQUAREM", version="2026.1") # Dependency of ashr
+install.cran("etrunct", version="0.1") # Dependency of ashr
+install.cran("invgamma", version="1.2") # Dependency of ashr
+install.cran("ashr", version="2.2-63") # ashr is an optional DESeq2 shrinkage alternative — de.v8.bulk.R
 
-#Bioconductor packages
+# Bioconductor packages
+# Note: Here using Bioconductor v3.20 but should be upgraded to 3.22 for the version of R we use
+# Here latest 3.20 version from https://mghp.osn.xsede.org/bir190004-bucket01/index.html#archive.bioconductor.org/packages/3.20/bioc/src/contrib/treeio
 install.bioconductor("limma", version="3.62.2", "3.20")
 install.bioconductor("edgeR", version="4.4.2", "3.20")
 install.bioconductor("BiocGenerics", version="0.52.0", "3.20")
 install.bioconductor("Biobase", version="2.66.0", "3.20")
 install.bioconductor("S4Vectors", version="0.44.0", "3.20")
-install.bioconductor("BiocParallel", version="1.40.0", "3.20")
+install.bioconductor("BiocParallel", version="1.40.2", "3.20")
 install.bioconductor("IRanges", version="2.40.1", "3.20")
 install.bioconductor("zlibbioc", version="1.52.0", "3.20") # deprecated in 3.22
 install.bioconductor("XVector", version="0.46.0", "3.20")
@@ -387,6 +420,16 @@ install.bioconductor("sparseMatrixStats", version="1.18.0", "3.20")
 install.bioconductor("DelayedMatrixStats", version="1.28.1", "3.20")
 install.bioconductor("ResidualMatrix", version="1.16.0", "3.20")
 install.bioconductor("batchelor", version="1.22.0", "3.20")
+install.bioconductor("apeglm", version="1.28.0", "3.20") #  LFC shrinkage (DESeq2 --shrinkage apeglm) — de.v8.bulk.R
+install.bioconductor("fgsea", version="1.32.4", "3.20") # GSEA — enrichment.v8.bulk.R
+install.bioconductor("GOSemSim", version="2.32.0", "3.20") # Dependency of clusterProfiler
+install.bioconductor("DOSE", version="4.0.1", "3.20") # Dependency of enrichplot
+install.bioconductor("treeio", version="1.30.0", "3.20") # Dependency of ggtree
+install.bioconductor("ggtree", version="3.14.0", "3.20") # Dependency of enrichplot
+install.bioconductor("enrichplot", version="1.26.6", "3.20") # Dependency of clusterProfiler
+install.bioconductor("GO.db", version="3.20.0", "3.20", "data/annotation") # Dependency of clusterProfiler
+install.bioconductor("qvalue", version="2.38.0", "3.20") # Dependency of clusterProfiler
+install.bioconductor("clusterProfiler", version="4.14.6", "3.20") # ClusterProfiler for ORA methods — enrichment.v8.bulk.R
 
 # Git packages (copied locally for ensuring long-term compatibility)
 install.github("sceasy", version="0.0.7")
