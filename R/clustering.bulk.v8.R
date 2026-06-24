@@ -25,9 +25,9 @@ Options:
   -o / --output_dir  Output folder for output.json. [optional, default: input dir]
 
   -- Common parameters -------------------------------------------------------------
-  --k               Number of clusters (required for both methods).           [required]
+  -k                Number of clusters (required for both methods).          [required]
   --top_var_genes   Number of most variable genes used (0 = all genes).      [default: 500]
-  --filter_attr     LOOM row_attr path of filter mask from filter_bulk.R.
+  --filter_meta     LOOM row_attr path of filter mask from filter_bulk.R.
                       Filtered-out genes are excluded before clustering.      [optional]
                       Example: /row_attrs/filter_pass
 
@@ -46,7 +46,7 @@ Options:
 Output LOOM col attr:
   <output_meta>   Integer cluster label (1-based) per sample
 
-Mandatory parameters: -f/--file, --input_meta, --output_meta, --method, --k
+Mandatory parameters: -f/--file, --input_meta, --output_meta, --method, -k
 "
 
 argv <- commandArgs(trailingOnly = TRUE)
@@ -71,9 +71,9 @@ option_list <- list(
   make_option("--input_meta",          type = "character", default = NULL,     help = "LOOM-internal path of the normalized matrix. [required]"),
   make_option("--output_meta",         type = "character", default = NULL,     help = "LOOM col_attr path for cluster labels (e.g. /col_attrs/cluster_vst). [required]"),
   make_option("--method",              type = "character", default = NULL,     help = "Clustering method: hierarchical | kmeans. [required]"),
-  make_option("--k",                   type = "integer",   default = NULL,     help = "Number of clusters. [required]"),
+  make_option(c("-k", "--k"),          type = "integer",   default = NULL,     help = "Number of clusters. [required]"),
   make_option("--top_var_genes",       type = "integer",   default = 500L,     help = "Top variable genes (0 = all). [default: 500]"),
-  make_option("--filter_attr",         type = "character", default = NULL,     help = "LOOM row_attr path of filter mask from filter_bulk.R (e.g. /row_attrs/filter_pass). [optional]"),
+  make_option("--filter_meta",         type = "character", default = NULL,     help = "LOOM row_attr path of filter mask from filter_bulk.R (e.g. /row_attrs/filter_pass). [optional]"),
   # hierarchical
   make_option("--distance",            type = "character", default = "euclidean", help = "[hierarchical] Distance: euclidean | pearson | spearman. [default: euclidean]"),
   make_option("--linkage",             type = "character", default = "ward.D2",   help = "[hierarchical] Linkage: ward.D2 | complete | average | single | mcquitty | median | centroid. [default: ward.D2]"),
@@ -90,10 +90,10 @@ if (is.null(args$file))        ErrorJSON("Missing required argument -f.")
 if (is.null(args$input_meta))  ErrorJSON("Missing required argument --input_meta.")
 if (is.null(args$output_meta)) ErrorJSON("Missing required argument --output_meta.")
 if (is.null(args$method))      ErrorJSON("Missing required argument --method.")
-if (is.null(args$k))           ErrorJSON("Missing required argument --k.")
+if (is.null(args$k))           ErrorJSON("Missing required argument -k.")
 if (!args$method %in% c("hierarchical", "kmeans")) ErrorJSON(paste0("Unknown method '", args$method, "'. Valid: hierarchical, kmeans."))
 if (!startsWith(args$output_meta, "/col_attrs/")) ErrorJSON(paste0("--output_meta must be under /col_attrs/ (e.g. /col_attrs/cluster_vst), got: '", args$output_meta, "'."))
-if (args$k < 2L) ErrorJSON(paste0("--k must be >= 2, got: ", args$k))
+if (args$k < 2L) ErrorJSON(paste0("-k must be >= 2, got: ", args$k))
 
 input_path <- normalizePath(args$file, mustWork = FALSE)
 if (!file.exists(input_path)) ErrorJSON(paste0("Input LOOM file not found: ", args$file))
@@ -126,15 +126,15 @@ matrix_gxc <- t(h5_in[[src_path]][,])   # [,] reads (n_samples × n_genes); t() 
 
 # Read optional filter mask
 filter_mask <- NULL
-if (!is.null(args$filter_attr)) {
-  fmask_path <- sub("^/", "", args$filter_attr)
-  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_attr, "' not found in LOOM."))
+if (!is.null(args$filter_meta)) {
+  fmask_path <- sub("^/", "", args$filter_meta)
+  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_meta, "' not found in LOOM."))
   filter_mask <- as.logical(h5_in[[fmask_path]][])
   if (length(filter_mask) != n_genes) ErrorJSON(paste0("Filter mask length (", length(filter_mask), ") does not match number of genes (", n_genes, ")."))
 }
 h5_in$close_all()
 
-if (args$k >= n_samples) ErrorJSON(paste0("--k (", args$k, ") must be less than the number of samples (", n_samples, ")."))
+if (args$k >= n_samples) ErrorJSON(paste0("-k (", args$k, ") must be less than the number of samples (", n_samples, ")."))
 
 # Apply filter mask before any gene selection
 if (!is.null(filter_mask)) {
@@ -222,7 +222,7 @@ result <- list(
   nber_cols        = n_samples,
   input_loom_path  = args$input_meta,
   output_loom_path = args$output_meta,
-  parameters       = c(list(input_loom_path = args$input_meta, output_loom_path = args$output_meta, k = args$k, top_var_genes = n_top, filter_attr = args$filter_attr), clust_params),
+  parameters       = c(list(input_loom_path = args$input_meta, output_loom_path = args$output_meta, k = args$k, top_var_genes = n_top, filter_meta = args$filter_meta), clust_params),
   cluster_sizes    = cluster_sizes
 )
 if (length(warn_env$w) > 0) result$warnings <- as.list(warn_env$w)

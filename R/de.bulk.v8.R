@@ -39,7 +39,7 @@ Options:
                        [optional, default: input dir]
 
   -- Optional filter mask ---------------------------------------------------------
-  --filter_attr      LOOM row_attr path of a boolean/integer mask from
+  --filter_meta      LOOM row_attr path of a boolean/integer mask from
                      filter_bulk.R. Genes with mask = 0 are excluded from DEA.
                      [default: NULL, all genes used]
 
@@ -116,7 +116,7 @@ option_list <- list(
   make_option("--condition",           type = "character", default = NULL,          help = "Name of the LOOM col_attr containing condition labels. [required]"),
   make_option("--reference",           type = "character", default = NULL,          help = "Reference group label (denominator). [required]"),
   make_option("--test_group",          type = "character", default = NULL,          help = "Test group label (numerator). [optional — omit for one-vs-rest mode]"),
-  make_option("--filter_attr",         type = "character", default = NULL,          help = "LOOM row_attr path of a filter mask from filter_bulk.R. [default: NULL]"),
+  make_option("--filter_meta",         type = "character", default = NULL,          help = "LOOM row_attr path of a filter mask from filter_bulk.R. [default: NULL]"),
 
   # DESeq2 parameters
   make_option("--fit_type",            type = "character", default = "parametric",  help = "[DESeq2] Dispersion fit: parametric | local | mean | glmGamPoi. [default: parametric]"),
@@ -240,9 +240,9 @@ if (is.null(args$test_group)) {
 
 # Read optional filter mask (length = n_genes = ncol)
 filter_mask <- NULL
-if (!is.null(args$filter_attr)) {
-  fmask_path <- sub("^/", "", args$filter_attr)
-  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_attr, "' not found in LOOM."))
+if (!is.null(args$filter_meta)) {
+  fmask_path <- sub("^/", "", args$filter_meta)
+  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_meta, "' not found in LOOM."))
   filter_mask <- as.logical(h5_in[[fmask_path]][])
   if (length(filter_mask) != n_genes) ErrorJSON(paste0("Filter mask length (", length(filter_mask), ") does not match number of genes (", n_genes, ")."))
 }

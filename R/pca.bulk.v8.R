@@ -27,7 +27,7 @@ Options:
   -- PCA parameters ----------------------------------------------------------------
   --top_var_genes  Number of most variable genes used for PCA (0 = all genes).
                      [default: 500]
-  --filter_attr    LOOM row_attr path of filter mask from filter_bulk.R.
+  --filter_meta    LOOM row_attr path of filter mask from filter_bulk.R.
                      Filtered-out genes are excluded before PCA.             [optional]
                      Example: /row_attrs/filter_pass
   --n_pcs          Number of PCs to compute and store.         [default: 10]
@@ -65,7 +65,7 @@ option_list <- list(
   make_option("--input_meta",          type = "character", default = NULL,   help = "LOOM-internal path of the normalized matrix. [required]"),
   make_option("--output_meta",         type = "character", default = NULL,   help = "LOOM col_attr prefix for PC coordinates (e.g. /col_attrs/PCA). [required]"),
   make_option("--top_var_genes",       type = "integer",   default = 500L,   help = "Top variable genes for PCA (0 = all). [default: 500]"),
-  make_option("--filter_attr",         type = "character", default = NULL,   help = "LOOM row_attr path of filter mask from filter_bulk.R (e.g. /row_attrs/filter_pass). [optional]"),
+  make_option("--filter_meta",         type = "character", default = NULL,   help = "LOOM row_attr path of filter mask from filter_bulk.R (e.g. /row_attrs/filter_pass). [optional]"),
   make_option("--n_pcs",               type = "integer",   default = 10L,    help = "Number of PCs to compute and store. [default: 10]"),
   make_option("--scale_data",          type = "logical",   default = TRUE,   help = "Scale genes to unit variance before PCA. [default: TRUE]")
 )
@@ -109,9 +109,9 @@ matrix_gxc <- t(h5_in[[src_path]][,])   # [,] reads (n_samples × n_genes); t() 
 
 # Read optional filter mask
 filter_mask <- NULL
-if (!is.null(args$filter_attr)) {
-  fmask_path <- sub("^/", "", args$filter_attr)
-  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_attr, "' not found in LOOM."))
+if (!is.null(args$filter_meta)) {
+  fmask_path <- sub("^/", "", args$filter_meta)
+  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_meta, "' not found in LOOM."))
   filter_mask <- as.logical(h5_in[[fmask_path]][])
   if (length(filter_mask) != n_genes) ErrorJSON(paste0("Filter mask length (", length(filter_mask), ") does not match number of genes (", n_genes, ")."))
 }
@@ -192,7 +192,7 @@ result <- list(
     input_loom_path = args$input_meta,
     output_loom_path = args$output_meta,
     top_var_genes   = n_top,
-    filter_attr     = args$filter_attr,
+    filter_meta     = args$filter_meta,
     n_pcs           = n_pcs_computed,
     scale_data      = args$scale_data
   ),

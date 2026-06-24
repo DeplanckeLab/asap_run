@@ -32,7 +32,7 @@ Options:
   -o / --output_dir      Output folder (default: input file directory).
 
   -- Background ----------------------------------------------------------------
-  --filter_attr          LOOM /row_attrs/ path of a boolean filter mask. [optional]
+  --filter_meta          LOOM /row_attrs/ path of a boolean filter mask. [optional]
                            If provided, background = filter-passing genes that
                            map to the DB.  If omitted, background = genes with
                            non-NA p-value in the DEA matrix (genes actually tested).
@@ -106,7 +106,7 @@ option_list <- list(
   make_option("--method",                type = "character", default = NULL,   help = paste0("Enrichment method: ", paste(VALID_METHODS, collapse = " | "), ". [required]")),
   make_option("--geneset_db_id",         type = "integer",   default = NULL,   help = "Gene_set id in ASAP DB. [required]"),
   make_option("--dburl",                 type = "character", default = NULL,   help = "DB connection HOST[:PORT]/DB. [required]"),
-  make_option("--filter_attr",           type = "character", default = NULL,   help = "LOOM /row_attrs/ path of boolean filter mask. [optional]"),
+  make_option("--filter_meta",           type = "character", default = NULL,   help = "LOOM /row_attrs/ path of boolean filter mask. [optional]"),
   make_option("--top_n",                 type = "integer",   default = NULL,   help = "Top N ranked genes per direction as foreground (ORA only). [optional]"),
   make_option("--fdr_threshold",         type = "double",    default = 0.05,   help = "FDR threshold for foreground (ORA, if --top_n unset). [default: 0.05]"),
   make_option("--lfc_threshold",         type = "double",    default = 1.0,    help = "Abs log FC threshold for foreground (ORA, if --top_n unset). [default: 1.0]"),
@@ -128,8 +128,8 @@ if (!args$method      %in% VALID_METHODS) ErrorJSON(paste0("Unknown --method '",
 if (!args$padj_method %in% VALID_PADJ)   ErrorJSON(paste0("Unknown --padj_method '",  args$padj_method, "'. Valid: ", paste(VALID_PADJ,   collapse = ", "), "."))
 if (!startsWith(args$input_meta,  "/attrs/"))     ErrorJSON(paste0("--input_meta must be under /attrs/, got: '",     args$input_meta,  "'."))
 if (!startsWith(args$output_meta, "/attrs/"))     ErrorJSON(paste0("--output_meta must be under /attrs/, got: '",    args$output_meta, "'."))
-if (!is.null(args$filter_attr) && !startsWith(args$filter_attr, "/row_attrs/"))
-  ErrorJSON(paste0("--filter_attr must be under /row_attrs/, got: '", args$filter_attr, "'."))
+if (!is.null(args$filter_meta) && !startsWith(args$filter_meta, "/row_attrs/"))
+  ErrorJSON(paste0("--filter_meta must be under /row_attrs/, got: '", args$filter_meta, "'."))
 
 input_path <- normalizePath(args$file, mustWork = FALSE)
 if (!file.exists(input_path)) ErrorJSON(paste0("Input LOOM file not found: ", args$file))
@@ -219,9 +219,9 @@ loom_dims <- if (h5_in$exists("matrix")) h5_in[["matrix"]]$dims else c(NA_intege
 
 # Optional filter mask (same hdf5r reversal: 1D row_attr, no transpose needed)
 filter_mask <- NULL
-if (!is.null(args$filter_attr)) {
-  fmask_path <- sub("^/", "", args$filter_attr)
-  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_attr, "' not found in LOOM."))
+if (!is.null(args$filter_meta)) {
+  fmask_path <- sub("^/", "", args$filter_meta)
+  if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_meta, "' not found in LOOM."))
   filter_mask <- as.logical(h5_in[[fmask_path]][])
 }
 
@@ -249,13 +249,13 @@ dbid_to_ens <- db_data$dbid_to_ens
 
 ## ── Background definition ─────────────────────────────────────────────────────
 # Background = genes that (a) map to the DB and (b) were testable.
-# Testable = passed --filter_attr mask if provided, else had non-NA p-value in DEA
+# Testable = passed --filter_meta mask if provided, else had non-NA p-value in DEA
 # (genes with NA p-value were filtered out during DEA and cannot be DE).
 
 if (!is.null(filter_mask)) {
   if (length(filter_mask) != n_genes_total) ErrorJSON(paste0("Filter mask length (", length(filter_mask), ") != number of genes in DEA matrix (", n_genes_total, ")."))
   bg_mask <- filter_mask & !is.na(ensembl_ids) & (ensembl_ids %in% names(ens_to_dbid))
-  warn_env$w <- c(warn_env$w, paste0("Background restricted to ", sum(filter_mask), " filter-passing genes (--filter_attr)."))
+  warn_env$w <- c(warn_env$w, paste0("Background restricted to ", sum(filter_mask), " filter-passing genes (--filter_meta)."))
 } else {
   # Default: genes that were actually tested in DEA (non-NA p-value)
   bg_mask <- !is.na(pval_dea) & !is.na(ensembl_ids) & (ensembl_ids %in% names(ens_to_dbid))
@@ -265,7 +265,7 @@ bg_ens   <- ensembl_ids[bg_mask]    # Ensembl IDs of background genes
 bg_dbids <- as.integer(ens_to_dbid[bg_ens])
 bg_set   <- unique(bg_dbids)
 n_background <- length(bg_set)
-if (n_background == 0) ErrorJSON("No background genes found. Check --filter_attr and that the correct organism's gene set is used.")
+if (n_background == 0) ErrorJSON("No background genes found. Check --filter_meta and that the correct organism's gene set is used.")
 
 ## ── Run enrichment ────────────────────────────────────────────────────────────
 
@@ -399,7 +399,7 @@ if (args$method %in% ORA_METHODS) {
   ranked_stats <- ranked_stats[!duplicated(names(ranked_stats))]  # deduplicate
   n_foreground <- length(ranked_stats)
 
-  if (n_foreground == 0) ErrorJSON("No valid ranked genes for fgsea. Check DEA input and --filter_attr.")
+  if (n_foreground == 0) ErrorJSON("No valid ranked genes for fgsea. Check DEA input and --filter_meta.")
 
   # Build pathway dict: identifier → [ensembl IDs present in ranked_stats]
   pathways   <- list(); path_names <- character(0)
@@ -532,7 +532,7 @@ result <- list(
   parameters             = list(
     method           = args$method,
     padj_method      = args$padj_method,
-    filter_attr      = args$filter_attr,
+    filter_meta      = args$filter_meta,
     top_n            = if (args$method %in% ORA_METHODS) args$top_n else NULL,
     fdr_threshold    = if (args$method %in% ORA_METHODS && is.null(args$top_n)) args$fdr_threshold else NULL,
     lfc_threshold    = if (args$method %in% ORA_METHODS && is.null(args$top_n)) args$lfc_threshold else NULL,

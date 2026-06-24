@@ -27,7 +27,7 @@ Options:
   -o / --output_dir  Output folder for output.json. [optional, default: stdout]
 
   -- Input handling -----------------------------------------------------------
-  --filter_attr      LOOM /row_attrs/ path of a boolean filter mask.        [optional]
+  --filter_meta      LOOM /row_attrs/ path of a boolean filter mask.        [optional]
                        Only applied when --input_meta is an expression matrix.
   --top_var_genes    Top variable genes used (0 = all).                     [default: 0]
                        Only applied when --input_meta is an expression matrix.
@@ -81,7 +81,7 @@ option_list <- list(
   make_option("--input_meta",          type = "character", default = NULL,   help = "LOOM path of input matrix (embedding or expression). [required]"),
   make_option("--output_meta",         type = "character", default = NULL,   help = "LOOM /col_attrs/ path for t-SNE embeddings. [required]"),
   make_option("--method",              type = "character", default = NULL,   help = "t-SNE method: Rtsne. [required]"),
-  make_option("--filter_attr",         type = "character", default = NULL,   help = "LOOM /row_attrs/ filter mask (expression input only). [optional]"),
+  make_option("--filter_meta",         type = "character", default = NULL,   help = "LOOM /row_attrs/ filter mask (expression input only). [optional]"),
   make_option("--top_var_genes",       type = "integer",   default = 0L,     help = "Top variable genes (0 = all; expression input only). [default: 0]"),
   make_option("--n_dims",              type = "integer",   default = NULL,   help = "Leading dims to use from an embedding (NULL = all). [default: NULL]"),
   make_option("--n_components",        type = "integer",   default = 2L,     help = "[Rtsne] t-SNE dimensions. [default: 2]"),
@@ -99,7 +99,7 @@ if (is.null(args$output_meta)) ErrorJSON("Missing required argument --output_met
 if (is.null(args$method))      ErrorJSON("Missing required argument --method.")
 if (!args$method %in% VALID_METHODS) ErrorJSON(paste0("Unknown method '", args$method, "'. Valid: ", paste(VALID_METHODS, collapse = ", "), "."))
 if (!startsWith(args$output_meta, "/col_attrs/")) ErrorJSON(paste0("--output_meta must be under /col_attrs/ (e.g. /col_attrs/TSNE), got: '", args$output_meta, "'."))
-if (!is.null(args$filter_attr) && !startsWith(args$filter_attr, "/row_attrs/")) ErrorJSON(paste0("--filter_attr must be under /row_attrs/, got: '", args$filter_attr, "'."))
+if (!is.null(args$filter_meta) && !startsWith(args$filter_meta, "/row_attrs/")) ErrorJSON(paste0("--filter_meta must be under /row_attrs/, got: '", args$filter_meta, "'."))
 
 input_path <- normalizePath(args$file, mustWork = FALSE)
 if (!file.exists(input_path)) ErrorJSON(paste0("Input LOOM file not found: ", args$file))
@@ -152,9 +152,9 @@ if (is_embedding_input) {
     ErrorJSON(paste0("Expression matrix dims (", nrow(matrix_gxs), " x ", ncol(matrix_gxs), ") do not match expected (", n_genes, " x ", n_samples, ")."))
 
   filter_mask <- NULL
-  if (!is.null(args$filter_attr)) {
-    fmask_path <- sub("^/", "", args$filter_attr)
-    if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_attr, "' not found in LOOM."))
+  if (!is.null(args$filter_meta)) {
+    fmask_path <- sub("^/", "", args$filter_meta)
+    if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_meta, "' not found in LOOM."))
     filter_mask <- as.logical(h5_in[[fmask_path]][])
     if (length(filter_mask) != n_genes) ErrorJSON(paste0("Filter mask length (", length(filter_mask), ") != n_genes (", n_genes, ")."))
     matrix_gxs <- matrix_gxs[filter_mask, , drop = FALSE]
@@ -252,7 +252,7 @@ result <- list(
     seed_use         = args$seed_use,
     n_dims           = if (is_embedding_input) (if (!is.null(args$n_dims)) args$n_dims else NULL) else NULL,
     top_var_genes    = if (!is_embedding_input) args$top_var_genes else NULL,
-    filter_attr      = if (!is_embedding_input) args$filter_attr else NULL
+    filter_meta      = if (!is_embedding_input) args$filter_meta else NULL
   ),
   tsne = list(
     tool         = "Rtsne",
