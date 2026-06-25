@@ -2101,17 +2101,18 @@ class LoomFile:
         # DB-derived vectors
         ens_ids = [g.ensembl_id for g in parsed_genes]
         gene_names = [g.name for g in parsed_genes]
-        biotypes = [g.biotype for g in parsed_genes]
 
         result["metadata"].append(self.write_metadata(ens_ids, "/row_attrs/Accession", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(gene_names, "/row_attrs/Gene", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(gene_names, "/row_attrs/Name", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
-        result["metadata"].append(self.write_metadata(biotypes, "/row_attrs/_Biotypes", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=True))
 
         # scFAIR v7.1.0 gene-level (var) fields. These are derived from the DB and
         # from spike-in detection on the original gene identifiers. Each one is
         # only written if the original file did not already provide an equivalent
         # column (file_feature_cols); otherwise we keep the file's version and warn.
+        # Note: feature_type is the scFAIR successor of the legacy _Biotypes field
+        # (gene biotype, "synthetic" for spike-ins), so _Biotypes is no longer
+        # written separately.
         self.write_scfair_gene_fields(
             parsed_genes=parsed_genes,
             original_gene_names=original_gene_names,
