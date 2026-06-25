@@ -230,10 +230,15 @@ class H5ADHandler:
             ErrorJSON(f"Unsupported sparse encoding: {enc}")
 
     @staticmethod
-    def _transfer_metadata(f, group_path, loom, result, n_cells, n_genes, orientation, existing_paths):
+    def _transfer_metadata(f, group_path, loom, result, n_cells, n_genes, orientation, existing_paths, silent_skip=False):
         """
         Transfer obs (CELL) or var (GENE) metadata from H5AD to Loom.
         Handles categorical decoding (codes→categories).
+
+        silent_skip: when True, paths that already exist in the loom are skipped
+        without adding a warning. Used by the fallback sweep that re-reads /obs
+        or /var after /raw/obs or /raw/var has already been transferred — there,
+        "already exists" is the normal, expected outcome and shouldn't be noise.
         """
         if group_path not in f:
             return
@@ -259,7 +264,8 @@ class H5ADHandler:
             
             loom_path = f"/{'col' if orientation == 'CELL' else 'row'}_attrs/{col}"
             if loom_path in existing_paths:
-                result.setdefault("warnings", []).append(f"Skipping {group_path}/{col} -> {loom_path} transfer: already exists.")
+                if not silent_skip:
+                    result.setdefault("warnings", []).append(f"Skipping {group_path}/{col} -> {loom_path} transfer: already exists.")
                 continue
             
             values = None
@@ -348,10 +354,14 @@ class H5ADHandler:
             existing_paths.add(loom_path)
 
     @staticmethod
-    def _transfer_multidimensional_metadata(f, group_path, loom, result, n_cells, n_genes, orientation, existing_paths):
+    def _transfer_multidimensional_metadata(f, group_path, loom, result, n_cells, n_genes, orientation, existing_paths, silent_skip=False):
         """
         Transfer obsm (CELL) or varm (GENE) multidimensional matrices.
         Examples: PCA, UMAP, tSNE embeddings.
+
+        silent_skip: when True, paths that already exist in the loom are skipped
+        without adding a warning. Used by the fallback sweep that re-reads /obsm
+        or /varm after /raw/obsm or /raw/varm has been transferred.
         """
         if group_path not in f:
             return
@@ -366,7 +376,8 @@ class H5ADHandler:
             loom_path = f"/{prefix}_attrs/{key}"
             
             if loom_path in existing_paths:
-                result.setdefault("warnings", []).append(f"Skipping {group_path}/{key} -> {loom_path} transfer: already exists.")
+                if not silent_skip:
+                    result.setdefault("warnings", []).append(f"Skipping {group_path}/{key} -> {loom_path} transfer: already exists.")
                 continue
             
             try:
@@ -471,6 +482,10 @@ class H5ADHandler:
         """
         Transfer uns (unstructured global metadata) from H5AD to Loom /attrs.
         Skips categorical lookup tables (*_categories, *_levels, *_codes).
+        Skips uns/spatial: that is handled separately by _transfer_spatial_metadata
+        so that the scFAIR v7.1.0 spatial hierarchy is preserved (rather than being
+        flattened with '_' separators, which is ambiguous when library_id contains
+        underscores).
         """
         if "uns" not in f:
             return
@@ -482,6 +497,11 @@ class H5ADHandler:
         
         def walk(group, prefix=""):
             for key in group.keys():
+                # Spatial metadata gets its own dedicated transfer that preserves
+                # nested structure. Only skip at the top level of uns.
+                if prefix == "" and key == "spatial":
+                    continue
+
                 item = group[key]
                 attr_name = f"{prefix}{key}"
                 
@@ -525,6 +545,112 @@ class H5ADHandler:
                     result.setdefault("warnings", []).append(f"Skipping uns item {attr_name}: {str(e)}")
         
         walk(f["uns"])
+
+    @staticmethod
+    def _transfer_spatial_metadata(f, loom, result, n_cells, n_genes, existing_paths):
+        """
+        Transfer uns['spatial'] from an H5AD to the Loom file, preserving the
+        scFAIR v7.1.0 hierarchical structure for spatial transcriptomics
+        (Visium / Slide-seqV2).
+
+        Mapping (relative to the Loom root):
+            uns['spatial']['is_single']
+                -> /attrs/spatial/is_single
+            uns['spatial'][library_id]['images']['fullres' | 'hires']
+                -> /attrs/spatial/<library_id>/images/{fullres,hires}   (uint8, 3D)
+            uns['spatial'][library_id]['scalefactors']['spot_diameter_fullres' | 'tissue_hires_scalef']
+                -> /attrs/spatial/<library_id>/scalefactors/{spot_diameter_fullres,tissue_hires_scalef}   (float scalars)
+
+        Also marks ``result['is_spatial'] = True`` so downstream consumers can
+        recognise that the Loom carries Space Ranger outputs.
+        """
+        if "uns" not in f or "spatial" not in f["uns"]:
+            return
+
+        spatial_grp = f["uns/spatial"]
+        if not isinstance(spatial_grp, h5py.Group):
+            return
+
+        result["is_spatial"] = 1
+
+        # Identify the library_id (any group child of uns/spatial that isn't is_single)
+        library_id = None
+        for k in spatial_grp.keys():
+            if k == "is_single":
+                continue
+            if isinstance(spatial_grp[k], h5py.Group):
+                library_id = k
+                break
+        if library_id is not None:
+            result["spatial_library_id"] = library_id
+
+        def write_dataset_at(loom_path, item):
+            """Write a single dataset (image, scalar, ...) into the Loom at loom_path."""
+            if loom_path in existing_paths:
+                result.setdefault("warnings", []).append(
+                    f"Skipping {item.name} -> {loom_path}: path already exists.")
+                return
+            try:
+                # Decode enum (e.g. booleans encoded as H5T_ENUM)
+                decoded = H5ADHandler._decode_enum_if_needed(item)
+                if decoded is not None:
+                    val = decoded
+                else:
+                    val = item[()]
+                if isinstance(val, (bytes, np.bytes_)):
+                    val = val.decode("utf-8")
+                elif isinstance(val, np.ndarray) and val.dtype.kind in ("S", "U"):
+                    val = np.array(
+                        [v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                         for v in val.flatten()]
+                    ).reshape(val.shape)
+
+                # is_single is mandated as a bool by scFAIR v7.1.0. AnnData often
+                # stores it as an H5T_ENUM with labels "TRUE"/"FALSE", which the
+                # decode step above turns into a scalar string. Convert back to a
+                # native bool so downstream consumers (and the metadata JSON's
+                # type field) see it correctly.
+                if loom_path.endswith("/is_single"):
+                    if isinstance(val, np.ndarray):
+                        scalar = val.item() if val.shape == () else (val.flatten()[0] if val.size else None)
+                    else:
+                        scalar = val
+                    if isinstance(scalar, (bytes, np.bytes_)):
+                        scalar = scalar.decode("utf-8")
+                    if isinstance(scalar, str):
+                        val = scalar.strip().lower() in ("true", "1", "yes", "t")
+                    elif isinstance(scalar, (int, np.integer)):
+                        val = bool(int(scalar))
+                    elif isinstance(scalar, (bool, np.bool_)):
+                        val = bool(scalar)
+
+                meta = loom.write_metadata(val, loom_path, n_cells=n_cells,
+                                           n_genes=n_genes, imported=1)
+                result["metadata"].append(meta)
+                existing_paths.add(loom_path)
+            except Exception as e:
+                result.setdefault("warnings", []).append(
+                    f"Skipping uns/spatial item {loom_path}: {str(e)}")
+
+        def walk_spatial(grp, dest_prefix):
+            """Recursively walk a spatial group, preserving hierarchy under dest_prefix."""
+            for key in grp.keys():
+                item = grp[key]
+                dest_path = f"{dest_prefix}/{key}"
+
+                if isinstance(item, h5py.Group):
+                    walk_spatial(item, dest_path)
+                    continue
+
+                if isinstance(item, h5py.Dataset):
+                    if _is_compound_dataset(item):
+                        H5ADHandler._write_compound_and_register(
+                            item, loom, result, n_cells, n_genes, "GLOBAL",
+                            dest_path, existing_paths)
+                    else:
+                        write_dataset_at(dest_path, item)
+
+        walk_spatial(spatial_grp, "/attrs/spatial")
 
     @staticmethod
     def _write_compound_and_register(src_obj: h5py.Dataset, loom, result: dict, n_cells: int, n_genes: int, orientation: str, loom_path: str, existing_paths: set[str]) -> None:
@@ -631,25 +757,33 @@ class H5ADHandler:
             # Transfer OBS (Cells)
             H5ADHandler._transfer_metadata(f, obs_path, loom, result, n_cells, n_genes, "CELL", existing_paths)
             if obs_path != "/obs":
-                H5ADHandler._transfer_metadata(f, "/obs", loom, result, n_cells, n_genes, "CELL", existing_paths) # Because I still want to copy everything from there if correct size.
+                # Fallback sweep: pick up any /obs columns not present in /raw/obs.
+                # Columns shared with /raw/obs hit "already exists" by design — that's
+                # the normal case, so suppress the warning for this pass.
+                H5ADHandler._transfer_metadata(f, "/obs", loom, result, n_cells, n_genes, "CELL", existing_paths, silent_skip=True)
             
             # Transfer VAR (Genes)
             H5ADHandler._transfer_metadata(f, var_path, loom, result, n_cells, n_genes, "GENE", existing_paths)
             if var_path != "/var":
-                H5ADHandler._transfer_metadata(f, "/var", loom, result, n_cells, n_genes, "GENE", existing_paths) # Because I still want to copy everything from there if correct size.
+                # Fallback sweep: pick up any /var columns not present in /raw/var.
+                H5ADHandler._transfer_metadata(f, "/var", loom, result, n_cells, n_genes, "GENE", existing_paths, silent_skip=True)
             
             # Transfer OBSM (Cell Embeddings)
             H5ADHandler._transfer_multidimensional_metadata(f, obsm_path, loom, result, n_cells, n_genes, "CELL", existing_paths)
             if obsm_path != "/obsm": 
-                H5ADHandler._transfer_multidimensional_metadata(f, "/obsm", loom, result, n_cells, n_genes, "CELL", existing_paths) # Because I still want to copy everything from there if correct size.
+                H5ADHandler._transfer_multidimensional_metadata(f, "/obsm", loom, result, n_cells, n_genes, "CELL", existing_paths, silent_skip=True)
             
             # Transfer VARM (Gene Embeddings)
             H5ADHandler._transfer_multidimensional_metadata(f, varm_path, loom, result, n_cells, n_genes, "GENE", existing_paths)
             if varm_path != "/varm": 
-                H5ADHandler._transfer_multidimensional_metadata(f, "/varm", loom, result, n_cells, n_genes, "GENE", existing_paths) # Because I still want to copy everything from there if correct size.
+                H5ADHandler._transfer_multidimensional_metadata(f, "/varm", loom, result, n_cells, n_genes, "GENE", existing_paths, silent_skip=True)
 
-            # Transfer uns (unstructured global metadata)
+            # Transfer uns (unstructured global metadata) — skips uns/spatial
             H5ADHandler._transfer_unstructured_metadata(f, loom, result, n_cells, n_genes, existing_paths)
+
+            # Transfer uns/spatial separately (scFAIR v7.1.0 spatial schema:
+            # is_single + library_id with nested images and scalefactors)
+            H5ADHandler._transfer_spatial_metadata(f, loom, result, n_cells, n_genes, existing_paths)
 
             # Transfer Layers + Alternative matrices like 'spliced'/'unspliced' or 'transformed'
             H5ADHandler._transfer_layers(f, loom, result, n_cells, n_genes, existing_paths, input_group)
@@ -2017,7 +2151,18 @@ class LoomFile:
                 if compute:
                     # Sums on sparse matrices are much faster
                     cell_depth[start:end] = np.ravel(block.sum(axis=1))
-                    cell_detected[start:end] = np.add.reduceat((block.data != 0), block.indptr[:-1]).astype(np.int64)
+
+                    # Number of detected genes per cell. np.add.reduceat requires
+                    # every index to be < len(arr); empty trailing rows in a CSR
+                    # block produce indptr values equal to len(block.data), which
+                    # would raise IndexError. Pad block.data's non-zero mask with
+                    # one False so the boundary index is valid (the padding never
+                    # affects any non-empty row's reduction).
+                    if block.nnz > 0:
+                        data_mask = np.concatenate([(block.data != 0), np.zeros(1, dtype=bool)])
+                        cell_detected[start:end] = np.add.reduceat(data_mask, block.indptr[:-1]).astype(np.int64)
+                    else:
+                        cell_detected[start:end] = 0
 
                     gene_sum += np.ravel(block.sum(axis=0))
 
@@ -2179,9 +2324,15 @@ class DBManager:
             WHERE organism_id = %s
         """
 
-        with self._cursor() as cur:
-            cur.execute(sql, (organism_id,))
-            rows = cur.fetchall()
+        try:
+            with self._cursor() as cur:
+                cur.execute(sql, (organism_id,))
+                rows = cur.fetchall()
+        except psycopg2.Error as e:
+            # Surface DB problems (missing table, bad credentials, ...) as a clean
+            # JSON error rather than a Python traceback.
+            msg = str(e).strip() or e.__class__.__name__
+            ErrorJSON(f"Database error while reading genes: {msg}")
 
         for r in rows:
             g = Gene(
@@ -2250,9 +2401,13 @@ class DBManager:
         JOIN genes g ON g.id = (gene_id_text)::integer;
         """
     
-        with self._cursor() as cur:
-            cur.execute(sql, (go_term, organism_id))
-            row = cur.fetchone() or {}
+        try:
+            with self._cursor() as cur:
+                cur.execute(sql, (go_term, organism_id))
+                row = cur.fetchone() or {}
+        except psycopg2.Error as e:
+            msg = str(e).strip() or e.__class__.__name__
+            ErrorJSON(f"Database error while reading ribosomal gene set: {msg}")
     
         names_csv = row.get("gene_names") or ""
         names = {n.strip() for n in names_csv.split(",") if n and n.strip()}
@@ -2460,7 +2615,7 @@ def parse(args):
     ribo_set = db.get_ribo_protein_gene_names_once(args.organism, go_term=DEFAULT_RIBO_GO_TERM)
 
     # Create result dict
-    result = {"detected_format": args.filetype, "input_path": args.f, "input_group": "", "output_path": args.output_path, "nber_rows": -1, "nber_cols": -1, "nber_not_found_genes": -1, "nber_zeros": -1, "is_count_table": -1, "empty_cols": -1, "empty_rows": -1, "dataset_size": -1, "metadata": [], "warnings": []}
+    result = {"detected_format": args.filetype, "input_path": args.f, "input_group": "", "output_path": args.output_path, "nber_rows": -1, "nber_cols": -1, "nber_not_found_genes": -1, "nber_zeros": -1, "is_count_table": -1, "is_spatial": 0, "empty_cols": -1, "empty_rows": -1, "dataset_size": -1, "metadata": [], "warnings": []}
 
     # Create Loom file
     loom = None

@@ -768,6 +768,61 @@ class H5ADHandler:
         return tuple(int(x) for x in shape)
 
     @staticmethod
+    def get_table_size(grp, default=0):
+        """
+        Get the number of rows (cells for obs, genes for var) in an obs/var table.
+        Handles three storage layouts:
+          - Compound dataset (older AnnData)
+          - Group with column datasets and optional _index (current AnnData)
+          - Group containing categorical columns stored as sub-groups with {categories, codes}
+            (newer AnnData, e.g. CELLxGENE Visium H5ADs)
+        """
+        # Compound dataset
+        if isinstance(grp, h5py.Dataset):
+            return int(grp.shape[0]) if len(grp.shape) >= 1 else default
+
+        if not isinstance(grp, h5py.Group):
+            return default
+
+        # Prefer the _index dataset if declared
+        idx_attr = grp.attrs.get('_index', None)
+        if isinstance(idx_attr, bytes):
+            idx_attr = idx_attr.decode()
+        if idx_attr and idx_attr in grp and isinstance(grp[idx_attr], h5py.Dataset):
+            return int(grp[idx_attr].shape[0])
+        if '_index' in grp and isinstance(grp['_index'], h5py.Dataset):
+            return int(grp['_index'].shape[0])
+
+        # Otherwise scan columns until we find one with a recoverable length
+        for key in grp.keys():
+            item = grp[key]
+            if isinstance(item, h5py.Dataset) and len(item.shape) >= 1:
+                return int(item.shape[0])
+            # New-style categorical: Group with 'codes' dataset (1D, length == n_rows)
+            if isinstance(item, h5py.Group) and 'codes' in item and isinstance(item['codes'], h5py.Dataset):
+                return int(item['codes'].shape[0])
+
+        return default
+
+    @staticmethod
+    def detect_spatial(f):
+        """
+        Detect whether the H5AD is a spatial transcriptomics dataset (Visium / Slide-seqV2)
+        following the scFAIR v7.1.0 spatial schema. Returns (is_spatial, library_id_or_None).
+        """
+        if 'uns' not in f or 'spatial' not in f['uns']:
+            return False, None
+        spatial_grp = f['uns/spatial']
+        library_id = None
+        for k in spatial_grp.keys():
+            if k == 'is_single':
+                continue
+            if isinstance(spatial_grp[k], h5py.Group):
+                library_id = k
+                break
+        return True, library_id
+
+    @staticmethod
     def extract_index(f, path, orientation="Item", n=10):
         if path not in f:
             return [f"{orientation}_{i+1}" for i in range(n)]
@@ -841,6 +896,15 @@ class H5ADHandler:
             genes = H5ADHandler.extract_index(f, '/var', orientation='Gene')
             cells = H5ADHandler.extract_index(f, '/obs', orientation='Cell')
 
+            # Detect spatial transcriptomics datasets (Visium / Slide-seqV2). The presence
+            # of /uns/spatial is the scFAIR v7.1.0 marker. is_spatial is always
+            # emitted as 0 or 1 so downstream consumers don't need to test for
+            # key existence (matches the is_count / is_count_table convention).
+            is_spatial, spatial_library_id = H5ADHandler.detect_spatial(f)
+            result["is_spatial"] = 1 if is_spatial else 0
+            if is_spatial and spatial_library_id is not None:
+                result["spatial_library_id"] = spatial_library_id
+
             # Collect all matrix paths to report
             matrix_paths = []
 
@@ -852,8 +916,11 @@ class H5ADHandler:
                 # raw/X uses raw's own var (may differ in gene count)
                 raw_nGenes = nGenes
                 if 'var' in raw_grp:
-                    # raw can have more genes than filtered X
-                    raw_var_size = raw_grp['var'][list(raw_grp['var'].keys())[0]].shape[0] if raw_grp['var'].keys() else nGenes
+                    # raw can have more genes than filtered X. The first child of raw/var
+                    # may be a Group (categorical encoded as {categories, codes}), not a
+                    # Dataset, so we use the robust get_table_size helper instead of
+                    # blindly grabbing the first key's .shape.
+                    raw_var_size = H5ADHandler.get_table_size(raw_grp['var'], default=nGenes)
                     raw_nGenes = raw_var_size
                 if 'X' in raw_grp:
                     raw_nCells, raw_nGenes = H5ADHandler.get_size(f, '/raw/X')
@@ -912,6 +979,20 @@ class LoomHandler:
             # Get dimensions
             matrix_shape = f['/matrix'].shape
             nGenes, nCells = matrix_shape
+
+            # Detect spatial Loom (round-trip from a scFAIR-spatial H5AD parse).
+            # Our parser writes /attrs/spatial/... in this case. is_spatial is
+            # always emitted as 0 or 1 (matches the H5AD preparse convention).
+            result["is_spatial"] = 0
+            if '/attrs/spatial' in f and isinstance(f['/attrs/spatial'], h5py.Group):
+                result["is_spatial"] = 1
+                spatial_grp = f['/attrs/spatial']
+                for k in spatial_grp.keys():
+                    if k == 'is_single':
+                        continue
+                    if isinstance(spatial_grp[k], h5py.Group):
+                        result["spatial_library_id"] = k
+                        break
             
             # Get gene and cell names
             genes = [g.decode('utf-8') if isinstance(g, bytes) else str(g) 
