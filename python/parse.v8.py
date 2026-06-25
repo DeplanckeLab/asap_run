@@ -745,7 +745,25 @@ class H5ADHandler:
             gene_names = H5ADHandler.extract_index(f, var_path)
             cell_ids = H5ADHandler.extract_index(f, obs_path)
 
-            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+            # Which scFAIR feature_* columns does the original file already carry?
+            # These come from var_path (and /var, since the fallback sweep also
+            # transfers it). If present, we keep them and skip recomputing.
+            scfair_feature_names = {"feature_biotype", "feature_type", "feature_reference",
+                                    "feature_chromosome", "feature_length"}
+            present_cols = set(H5ADHandler._table_columns(f, var_path))
+            if var_path != "/var":
+                present_cols |= set(H5ADHandler._table_columns(f, "/var"))
+            file_feature_cols = scfair_feature_names & present_cols
+
+            # Which scFAIR dataset-level (uns) keys does the file already carry?
+            scfair_uns_names = {"organism", "organism_ontology_term_id", "ensembl_database",
+                                "ensembl_release", "ensembl_assembly", "schema_version",
+                                "schema_reference"}
+            file_uns_keys = set()
+            if "/uns" in f and isinstance(f["/uns"], h5py.Group):
+                file_uns_keys = scfair_uns_names & set(f["/uns"].keys())
+
+            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None), file_feature_cols=file_feature_cols, file_uns_keys=file_uns_keys)
 
             # Write Expression Matrix
             block_reader = H5ADHandler._create_h5ad_block_reader(f=f, src_path=input_group, n_cells=n_cells, n_genes=n_genes)
@@ -990,7 +1008,7 @@ class LoomHandler:
             cell_ids = LoomHandler._infer_cell_ids(f, n_cells)
             gene_names = LoomHandler._infer_gene_names(f, n_genes)
 
-            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
 
             block_reader = LoomHandler._create_loom_block_reader(f=f, src_path=matrix_path, n_cells=n_cells, n_genes=n_genes)
             stats = loom.write_expression_matrix(get_block=block_reader, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
@@ -1158,7 +1176,7 @@ class H510xHandler:
             cell_ids = (cell_ids + [f"Cell_{i+1}" for i in range(len(cell_ids), n_cells)])[:n_cells]
             gene_names = H510xHandler._read_feature_names(grp, n_genes)
 
-            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
 
             #stats = loom.write_expression_from_h510x(grp=grp, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
             block_reader = H510xHandler._create_10x_block_reader(grp=grp, n_cells=n_cells, n_genes=n_genes)
@@ -1432,7 +1450,7 @@ class RdsHandler:
             result["input_group"] = group_name
         
         # Write gene and cell names + gene database info
-        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
         
         # Write main expression matrix
         stats = loom.write_expression_matrix(get_block=get_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
@@ -1684,7 +1702,7 @@ class MexHandler:
             ErrorJSON("Cell barcodes are not unique in barcodes file")
         
         # Write gene and cell names + Chr/Biotypes info from DB
-        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cells, original_gene_names=gene_ids, gene_db=gene_db, gene_db_queries=gene_ids, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cells, original_gene_names=gene_ids, gene_db=gene_db, gene_db_queries=gene_ids, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
         
         # Write expression matrix
         get_block = MexHandler._create_mtx_block_reader(matrix_path, n_genes, n_cells, nnz, is_pattern)
@@ -1881,7 +1899,7 @@ class TextHandler:
             ErrorJSON("Cell names are not unique (from header).")
 
         # Write gene and cell names + Chr/Biotypes infos from DB
-        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cells, original_gene_names=genes_raw, gene_db=gene_db, gene_db_queries=genes_norm, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes)
+        parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cells, original_gene_names=genes_raw, gene_db=gene_db, gene_db_queries=genes_norm, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
 
         # Write expression using the shared core (cells x genes blocks)
         def get_block(start, end):
@@ -2055,7 +2073,7 @@ class LoomFile:
 
         return m
 
-    def write_names_and_gene_db(self, *, cell_ids: list[str], original_gene_names: list[str], gene_db: MapGene, output_dir: Path, result: dict, n_cells: int, n_genes: int, gene_db_queries: list[str] | None = None) -> tuple[list[Gene], set[str]]:
+    def write_names_and_gene_db(self, *, cell_ids: list[str], original_gene_names: list[str], gene_db: MapGene, output_dir: Path, result: dict, n_cells: int, n_genes: int, gene_db_queries: list[str] | None = None, organism_info: dict | None = None, file_feature_cols: set | None = None, file_uns_keys: set | None = None) -> tuple[list[Gene], set[str]]:
 
         # Write cell + raw gene names
         result["metadata"].append(self.write_metadata(cell_ids, "/col_attrs/CellID", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
@@ -2084,17 +2102,177 @@ class LoomFile:
         ens_ids = [g.ensembl_id for g in parsed_genes]
         gene_names = [g.name for g in parsed_genes]
         biotypes = [g.biotype for g in parsed_genes]
-        chroms = [g.chr for g in parsed_genes]
-        sum_exon_length = [g.sum_exon_length for g in parsed_genes]
 
         result["metadata"].append(self.write_metadata(ens_ids, "/row_attrs/Accession", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(gene_names, "/row_attrs/Gene", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(gene_names, "/row_attrs/Name", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
         result["metadata"].append(self.write_metadata(biotypes, "/row_attrs/_Biotypes", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=True))
-        result["metadata"].append(self.write_metadata(chroms, "/row_attrs/_Chromosomes", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=True))
-        result["metadata"].append(self.write_metadata(sum_exon_length, "/row_attrs/_SumExonLength", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
+
+        # scFAIR v7.1.0 gene-level (var) fields. These are derived from the DB and
+        # from spike-in detection on the original gene identifiers. Each one is
+        # only written if the original file did not already provide an equivalent
+        # column (file_feature_cols); otherwise we keep the file's version and warn.
+        self.write_scfair_gene_fields(
+            parsed_genes=parsed_genes,
+            original_gene_names=original_gene_names,
+            result=result,
+            n_cells=n_cells,
+            n_genes=n_genes,
+            organism_info=organism_info,
+            file_feature_cols=file_feature_cols or set(),
+        )
+
+        # scFAIR v7.1.0 dataset-level (uns) fields, deferring to file values.
+        self.write_scfair_global_fields(
+            parsed_genes=parsed_genes,
+            result=result,
+            n_cells=n_cells,
+            n_genes=n_genes,
+            organism_info=organism_info,
+            file_uns_keys=file_uns_keys or set(),
+        )
 
         return parsed_genes, set(not_found_genes)
+
+    # ERCC spike-in identifiers look like "ERCC-00003" (or "ERCC_00003"). scFAIR
+    # treats these as feature_biotype == "spike-in", feature_type == "synthetic",
+    # feature_reference == "NCBITaxon:32630" (synthetic construct).
+    _ERCC_PATTERN = re.compile(r"^ERCC[-_]\d+$", re.IGNORECASE)
+    _ERCC_TAXON = "NCBITaxon:32630"
+
+    @classmethod
+    def _is_spikein(cls, original_id: str, gene: "Gene") -> bool:
+        if original_id and cls._ERCC_PATTERN.match(original_id.strip()):
+            return True
+        # Also catch the case where the DB-resolved accession is an ERCC id
+        if gene and gene.ensembl_id and cls._ERCC_PATTERN.match(str(gene.ensembl_id).strip()):
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_biotype(biotype: str) -> str:
+        """scFAIR feature_type uses space-separated lowercase, e.g. 'protein coding'."""
+        if not biotype or biotype in ("__unknown",):
+            return "unknown"
+        return str(biotype).replace("_", " ")
+
+    def write_scfair_gene_fields(self, *, parsed_genes, original_gene_names, result, n_cells, n_genes, organism_info, file_feature_cols):
+        """
+        Write the scFAIR v7.1.0 var fields:
+          /row_attrs/feature_biotype    ("gene" | "spike-in")
+          /row_attrs/feature_type       (gene biotype, "synthetic" for spike-ins)
+          /row_attrs/feature_reference  (NCBITaxon of the gene's organism; ERCC -> NCBITaxon:32630)
+          /row_attrs/feature_chromosome (chromosome; "spike-in" for ERCC)  [renamed from _Chromosomes]
+          /row_attrs/feature_length     (sum exon length)                  [renamed from _SumExonLength]
+
+        For each, if a same-named column already came from the original file
+        (file_feature_cols), the file's version is preserved and a warning is
+        emitted instead of overwriting it.
+        """
+        organism_info = organism_info or {}
+        organism_taxon = organism_info.get("organism_ontology_term_id")
+
+        is_spikein = [self._is_spikein(orig, g) for orig, g in zip(original_gene_names, parsed_genes)]
+
+        feature_biotype = ["spike-in" if s else "gene" for s in is_spikein]
+        feature_type = [
+            "synthetic" if s else self._normalize_biotype(g.biotype)
+            for s, g in zip(is_spikein, parsed_genes)
+        ]
+        feature_reference = [
+            self._ERCC_TAXON if s else (organism_taxon or "unknown")
+            for s in is_spikein
+        ]
+        feature_chromosome = [
+            "spike-in" if s else (g.chr if (g.chr and g.chr != "__unknown") else "unknown")
+            for s, g in zip(is_spikein, parsed_genes)
+        ]
+        feature_length = [
+            0 if s else int(g.sum_exon_length or 0)
+            for s, g in zip(is_spikein, parsed_genes)
+        ]
+
+        # name -> (values, is_categorical)
+        targets = {
+            "feature_biotype": (feature_biotype, True),
+            "feature_type": (feature_type, True),
+            "feature_reference": (feature_reference, True),
+            "feature_chromosome": (feature_chromosome, True),
+            "feature_length": (feature_length, False),
+        }
+
+        for col, (values, is_cat) in targets.items():
+            if col in file_feature_cols:
+                result.setdefault("warnings", []).append(
+                    f"Field /row_attrs/{col} already present in the original file; "
+                    f"keeping the file's values instead of the computed ones.")
+                continue
+            result["metadata"].append(self.write_metadata(
+                values, f"/row_attrs/{col}", n_cells=n_cells, n_genes=n_genes,
+                imported=0, is_categorical=is_cat))
+
+    # scFAIR schema constants
+    _SCFAIR_SCHEMA_VERSION = "7.1.0"
+    _SCFAIR_SCHEMA_REFERENCE = "https://github.com/scFAIR/scFAIR/blob/main/schema/7.1.0/schema.md"
+
+    def write_scfair_global_fields(self, *, parsed_genes, result, n_cells, n_genes, organism_info, file_uns_keys):
+        """
+        Write the scFAIR v7.1.0 dataset-level (uns -> /attrs) fields:
+          /attrs/organism                   (organism human-readable name)
+          /attrs/organism_ontology_term_id  (NCBITaxon:<tax_id>)
+          /attrs/ensembl_database           (Ensembl / Ensembl Metazoa / ...)
+          /attrs/ensembl_release            (int, guessed from gene coverage)
+          /attrs/ensembl_assembly           (assembly name for the guessed release)
+          /attrs/schema_version             ("7.1.0")
+          /attrs/schema_reference           (URL to the schema)
+
+        For each, if the original file already provided the corresponding uns key
+        (file_uns_keys), the file's value is preserved and a warning is emitted.
+        """
+        organism_info = organism_info or {}
+        file_uns_keys = file_uns_keys or set()
+
+        # Guess Ensembl release + assembly from the matched genes
+        guess = MapGene.guess_ensembl_release(parsed_genes, organism_info.get("assemblies"))
+        ensembl_release = guess.get("ensembl_release")
+        ensembl_assembly = guess.get("ensembl_assembly")
+        # Organism-level fallback for release if the gene vote produced nothing
+        if not ensembl_release:
+            ensembl_release = organism_info.get("latest_ensembl_release")
+
+        if guess.get("n_genes_considered"):
+            result.setdefault("warnings", []).append(
+                f"Guessed Ensembl release {ensembl_release} from gene coverage "
+                f"({guess['n_genes_supporting']}/{guess['n_genes_considered']} genes support it)"
+                + (f", assembly {ensembl_assembly}." if ensembl_assembly else "."))
+
+        # name -> (value, scfair uns key)
+        targets = [
+            ("organism", organism_info.get("name"), "organism"),
+            ("organism_ontology_term_id", organism_info.get("organism_ontology_term_id"), "organism_ontology_term_id"),
+            ("ensembl_database", organism_info.get("ensembl_database"), "ensembl_database"),
+            ("ensembl_release", ensembl_release, "ensembl_release"),
+            ("ensembl_assembly", ensembl_assembly, "ensembl_assembly"),
+            ("schema_version", self._SCFAIR_SCHEMA_VERSION, "schema_version"),
+            ("schema_reference", self._SCFAIR_SCHEMA_REFERENCE, "schema_reference"),
+        ]
+
+        for attr_name, value, uns_key in targets:
+            if uns_key in file_uns_keys:
+                result.setdefault("warnings", []).append(
+                    f"Field /attrs/{attr_name} already present in the original file (uns/{uns_key}); "
+                    f"keeping the file's value instead of the computed one.")
+                continue
+            if value is None:
+                # Nothing to write (e.g. could not determine release). Skip quietly
+                # except for the ensembl_* trio, where it is worth noting.
+                if attr_name in ("ensembl_release", "ensembl_assembly", "ensembl_database"):
+                    result.setdefault("warnings", []).append(
+                        f"Could not determine {attr_name}; /attrs/{attr_name} not written.")
+                continue
+            result["metadata"].append(self.write_metadata(
+                value, f"/attrs/{attr_name}", n_cells=n_cells, n_genes=n_genes,
+                imported=0, is_categorical=False))
 
     def write_stable_ids(self, *, n_cells: int, n_genes: int, result: dict) -> None:
         result["metadata"].append(self.write_metadata(list(range(n_genes)), "/row_attrs/_StableID", n_cells=n_cells, n_genes=n_genes, imported=0, is_categorical=False))
@@ -2319,7 +2497,7 @@ class DBManager:
         self.map_gene.init()
 
         sql = """
-            SELECT ensembl_id, name, biotype, chr, gene_length, sum_exon_length, latest_ensembl_release, alt_names, obsolete_alt_names
+            SELECT ensembl_id, name, biotype, chr, gene_length, sum_exon_length, latest_ensembl_release, first_ensembl_release, alt_names, obsolete_alt_names
             FROM genes
             WHERE organism_id = %s
         """
@@ -2343,6 +2521,7 @@ class DBManager:
                 gene_length=int(r.get("gene_length") or 0),
                 sum_exon_length=int(r.get("sum_exon_length") or 0),
                 latest_ensembl_release=int(r.get("latest_ensembl_release") or 0),
+                first_ensembl_release=int(r.get("first_ensembl_release") or 0),
             )
 
             # By ensembl_id
@@ -2375,6 +2554,101 @@ class DBManager:
         self.connect()
         try:
             return self.get_genes_in_db(organism_id)
+        finally:
+            self.disconnect()
+
+    # Maps the ensembl_subdomains.name values used in the ASAP DB to the
+    # ensembl_database labels accepted by the scFAIR v7.1.0 schema.
+    _ENSEMBL_DB_LABELS = {
+        "vertebrates": "Ensembl",
+        "bacteria": "Ensembl Bacteria",
+        "fungi": "Ensembl Fungi",
+        "metazoa": "Ensembl Metazoa",
+        "plants": "Ensembl Plants",
+        "protists": "Ensembl Protists",
+    }
+
+    def get_organism_info(self, organism_id: int) -> dict:
+        """
+        Return organism-level metadata used to fill scFAIR schema fields:
+          - name              -> /attrs/organism
+          - tax_id            -> /attrs/organism_ontology_term_id (NCBITaxon:<tax_id>)
+          - ensembl_database  -> /attrs/ensembl_database (mapped from the subdomain)
+          - latest_ensembl_release (organism-level fallback)
+        Missing pieces come back as None so the caller can decide what to do.
+        """
+        sql = """
+            SELECT o.name AS name,
+                   o.tax_id AS tax_id,
+                   o.ensembl_db_name AS ensembl_db_name,
+                   o.latest_ensembl_release AS latest_ensembl_release,
+                   s.name AS subdomain_name
+            FROM organisms o
+            LEFT JOIN ensembl_subdomains s ON s.id = o.ensembl_subdomain_id
+            WHERE o.id = %s
+        """
+        try:
+            with self._cursor() as cur:
+                cur.execute(sql, (organism_id,))
+                row = cur.fetchone() or {}
+        except psycopg2.Error as e:
+            msg = str(e).strip() or e.__class__.__name__
+            ErrorJSON(f"Database error while reading organism info: {msg}")
+
+        subdomain = (row.get("subdomain_name") or "").strip().lower()
+        ensembl_database = self._ENSEMBL_DB_LABELS.get(subdomain)
+        tax_id = row.get("tax_id")
+
+        return {
+            "name": row.get("name"),
+            "tax_id": int(tax_id) if tax_id is not None else None,
+            "organism_ontology_term_id": f"NCBITaxon:{int(tax_id)}" if tax_id is not None else None,
+            "ensembl_database": ensembl_database,
+            "ensembl_db_name": row.get("ensembl_db_name"),
+            "latest_ensembl_release": int(row.get("latest_ensembl_release") or 0) or None,
+        }
+
+    def get_organism_info_once(self, organism_id: int) -> dict:
+        self.connect()
+        try:
+            return self.get_organism_info(organism_id)
+        finally:
+            self.disconnect()
+
+    def get_assemblies(self, organism_id: int) -> list:
+        """
+        Return the list of assemblies for an organism as dicts with keys
+        name / first_ensembl_release / latest_ensembl_release, ordered by
+        ascending first_ensembl_release. Used to map a guessed Ensembl release
+        to a concrete assembly name (e.g. release 112 -> 'GRCh38.p14').
+        """
+        sql = """
+            SELECT name, first_ensembl_release, latest_ensembl_release
+            FROM assemblies
+            WHERE organism_id = %s
+            ORDER BY first_ensembl_release ASC NULLS LAST
+        """
+        try:
+            with self._cursor() as cur:
+                cur.execute(sql, (organism_id,))
+                rows = cur.fetchall()
+        except psycopg2.Error as e:
+            msg = str(e).strip() or e.__class__.__name__
+            ErrorJSON(f"Database error while reading assemblies: {msg}")
+
+        out = []
+        for r in rows:
+            out.append({
+                "name": r.get("name"),
+                "first_ensembl_release": int(r.get("first_ensembl_release") or 0) or None,
+                "latest_ensembl_release": int(r.get("latest_ensembl_release") or 0) or None,
+            })
+        return out
+
+    def get_assemblies_once(self, organism_id: int) -> list:
+        self.connect()
+        try:
+            return self.get_assemblies(organism_id)
         finally:
             self.disconnect()
 
@@ -2479,6 +2753,7 @@ class Gene:
     gene_length: int = 0
     sum_exon_length: int = 0
     latest_ensembl_release: int = 0
+    first_ensembl_release: int = 0
     alt_names: Set[str] = field(default_factory=set)
     obsolete_alt_names: Set[str] = field(default_factory=set)
 
@@ -2505,6 +2780,97 @@ class MapGene:
             return None
         # Sorts by latest_ensembl_release descending and takes the first
         return sorted(db_hits, key=lambda g: g.latest_ensembl_release, reverse=True)[0]
+
+    @staticmethod
+    def guess_ensembl_release(parsed_genes: List["Gene"], assemblies: list = None) -> dict:
+        """
+        Guess the best Ensembl release (and matching assembly) for a parsed gene
+        list, using a coverage vote: for each gene that was matched in the DB, its
+        [first_ensembl_release, latest_ensembl_release] interval is the set of
+        releases in which that gene exists. The chosen release is the one covered
+        by the most input genes (ties broken by the most recent release).
+
+        The release is then mapped to an assembly whose [first, latest] range
+        contains it. Returns:
+            {"ensembl_release": int|None,
+             "ensembl_assembly": str|None,
+             "n_genes_supporting": int,
+             "n_genes_considered": int}
+        """
+        # Build the set of release endpoints to test. Testing only the endpoints
+        # that actually occur (firsts and lasts) is sufficient: the coverage
+        # function is piecewise-constant between consecutive endpoints, and its
+        # maxima always occur at a 'first_ensembl_release' boundary.
+        firsts = []
+        intervals = []
+        for g in parsed_genes:
+            if not g or g.ensembl_id in (None, "__unknown"):
+                continue
+            lo = g.first_ensembl_release or g.latest_ensembl_release or 0
+            hi = g.latest_ensembl_release or g.first_ensembl_release or 0
+            if hi <= 0:
+                continue
+            if lo <= 0:
+                lo = hi
+            if lo > hi:
+                lo, hi = hi, lo
+            intervals.append((lo, hi))
+            firsts.append(lo)
+
+        n_considered = len(intervals)
+        if n_considered == 0:
+            return {"ensembl_release": None, "ensembl_assembly": None,
+                    "n_genes_supporting": 0, "n_genes_considered": 0}
+
+        # Candidate releases: every distinct 'first' boundary, plus the assembly
+        # boundaries (so an assembly's exact release is testable too).
+        candidates = set(firsts)
+        for g in parsed_genes:
+            if g and g.latest_ensembl_release:
+                candidates.add(g.latest_ensembl_release)
+        if assemblies:
+            for a in assemblies:
+                if a.get("first_ensembl_release"):
+                    candidates.add(a["first_ensembl_release"])
+                if a.get("latest_ensembl_release"):
+                    candidates.add(a["latest_ensembl_release"])
+
+        def coverage(r):
+            return sum(1 for (lo, hi) in intervals if lo <= r <= hi)
+
+        # Pick max coverage; tie-break by most recent release.
+        best_release = None
+        best_cov = -1
+        for r in sorted(candidates):
+            c = coverage(r)
+            if c > best_cov or (c == best_cov and (best_release is None or r > best_release)):
+                best_cov = c
+                best_release = r
+
+        # Map the chosen release to an assembly whose range contains it.
+        assembly_name = None
+        if assemblies and best_release is not None:
+            containing = [a for a in assemblies
+                          if a.get("first_ensembl_release") and a.get("latest_ensembl_release")
+                          and a["first_ensembl_release"] <= best_release <= a["latest_ensembl_release"]]
+            if containing:
+                # Prefer the assembly with the most recent latest_ensembl_release
+                assembly_name = sorted(containing, key=lambda a: a["latest_ensembl_release"], reverse=True)[0]["name"]
+            else:
+                # No exact containment: fall back to the assembly whose latest
+                # release is closest to (but not exceeding) the chosen release,
+                # otherwise the newest assembly available.
+                below = [a for a in assemblies if a.get("latest_ensembl_release") and a["latest_ensembl_release"] <= best_release]
+                if below:
+                    assembly_name = sorted(below, key=lambda a: a["latest_ensembl_release"], reverse=True)[0]["name"]
+                elif assemblies:
+                    newest = sorted(assemblies, key=lambda a: (a.get("latest_ensembl_release") or 0), reverse=True)[0]
+                    assembly_name = newest["name"]
+
+        return {"ensembl_release": int(best_release) if best_release is not None else None,
+                "ensembl_assembly": assembly_name,
+                "n_genes_supporting": int(best_cov) if best_cov >= 0 else 0,
+                "n_genes_considered": int(n_considered)}
 
     def parse_gene(self, query: str, index: int) -> Gene:
         """ Translates a query string into a Gene object using the MapGene DB. """
@@ -2611,6 +2977,11 @@ def parse(args):
     # Extract genes from species
     gene_db = db.get_genes_in_db_once(args.organism)
 
+    # Organism-level scFAIR metadata (organism name, NCBITaxon, ensembl_database)
+    # and the list of assemblies (used to map a guessed release to an assembly).
+    organism_info = db.get_organism_info_once(args.organism)
+    organism_info["assemblies"] = db.get_assemblies_once(args.organism)
+
     # Fetch ribosomal protein gene symbols via GO and attach to gene_db object
     ribo_set = db.get_ribo_protein_gene_names_once(args.organism, go_term=DEFAULT_RIBO_GO_TERM)
 
@@ -2624,6 +2995,8 @@ def parse(args):
         
         # Attach ribo set
         loom.ribo_protein_gene_names = ribo_set
+        # Attach organism-level scFAIR metadata (used by handlers + finalize)
+        loom.organism_info = organism_info
         if not ribo_set:
             result["warnings"].append(f"No ribosomal protein genes found for {DEFAULT_RIBO_GO_TERM} (organism_id={args.organism}). Ribosomal protein content will be reported as 0 for all cells.")
          
