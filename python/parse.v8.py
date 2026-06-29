@@ -41,6 +41,29 @@ DEFAULT_RIBO_GO_TERM: Final[str] = "GO:0003735" # GO Term used for inferring rib
 DEFAULT_TEXT_DELIM: Final[str] = "\t" # For TextHandler, default delim
 DEFAULT_NP_DTYPE = np.float64 # Keeping internal best precision
 
+# scFAIR schema (https://github.com/scFAIR/scFAIR)
+SCFAIR_SCHEMA_VERSION: Final[str] = "7.1.0" # scFAIR schema version filled into /attrs/schema_version
+SCFAIR_SCHEMA_REFERENCE: Final[str] = "https://github.com/scFAIR/scFAIR/blob/main/schema/7.1.0/schema.md" # /attrs/schema_reference
+SCFAIR_ANALYSIS_SCHEMA_VERSION: Final[str] = "7.1.0+scfair1.0" # analysis_json schema_version (analysis_pipeline)
+
+# ERCC spike-in detection (scFAIR: feature_biotype "spike-in", feature_type "synthetic")
+ERCC_PATTERN: Final = re.compile(r"^ERCC[-_]\d+$", re.IGNORECASE) # Matches ERCC-00003 / ERCC_00003
+ERCC_TAXON: Final[str] = "NCBITaxon:32630" # NCBITaxon for synthetic constructs (ERCC feature_reference)
+
+# Maps ensembl_subdomains.name (ASAP DB) -> scFAIR ensembl_database label
+ENSEMBL_DB_LABELS: Final[dict] = {
+    "vertebrates": "Ensembl",
+    "bacteria": "Ensembl Bacteria",
+    "fungi": "Ensembl Fungi",
+    "metazoa": "Ensembl Metazoa",
+    "plants": "Ensembl Plants",
+    "protists": "Ensembl Protists",
+}
+
+# Gene-detection sanity warnings (percent of input genes)
+HIGH_MISSING_PCT: Final[float] = 90.0 # > this % of genes NOT detected -> probably the wrong organism
+FEW_MISSING_PCT: Final[float] = 5.0  # genes missing but <= this % -> probably a few mistyped/outdated IDs
+
 ## Format Handlers
 
 # Helper
@@ -1460,8 +1483,245 @@ class RdsHandler:
         
         if obj_class == "Seurat":
             RdsHandler._transfer_seurat_metadata(obj, group_name, loom, result, n_cells, n_genes, existing_paths)
+            # scFAIR: reconstruct the analysis pipeline from the Seurat command
+            # log (@commands) and store it as the /attrs/analysis_pipeline JSON
+            # string (analysis_json schema). This is Seurat-only.
+            RdsHandler._transfer_seurat_pipeline(obj, loom, result, n_cells, n_genes, existing_paths)
         
         return stats
+
+    # Maps a Seurat command's method name (the part before the first '.' in the
+    # command name, e.g. "NormalizeData" from "NormalizeData.RNA") to an scFAIR
+    # analysis_json step_category. Unmapped methods fall back to "Other".
+    _SEURAT_METHOD_CATEGORY = {
+        "Read10X": "Parsing",
+        "CreateSeuratObject": "Parsing",
+        "NormalizeData": "Normalization",
+        "SCTransform": "Normalization",
+        "ScaleData": "Scaling",
+        "FindVariableFeatures": "Feature Selection",
+        "RunPCA": "Dimensionality Reduction",
+        "RunICA": "Dimensionality Reduction",
+        "RunLSI": "Dimensionality Reduction",
+        "JackStraw": "Dimensionality Evaluation",
+        "ScoreJackStraw": "Dimensionality Evaluation",
+        "RunUMAP": "Embedding",
+        "RunTSNE": "Embedding",
+        "FindNeighbors": "Clustering",
+        "FindClusters": "Clustering",
+        "FindMarkers": "Marker Gene Detection",
+        "FindAllMarkers": "Marker Gene Detection",
+        "FindConservedMarkers": "Marker Gene Detection",
+        "CellCycleScoring": "Cell Cycle Scoring",
+        "IntegrateLayers": "Integration",
+        "IntegrateData": "Integration",
+        "FindIntegrationAnchors": "Integration",
+        "FindTransferAnchors": "Integration",
+        "TransferData": "Cell Type Annotation",
+        "HarmonyIntegration": "Batch Correction",
+        "RunHarmony": "Batch Correction",
+        "subset": "Subsetting",
+        "RunCCA": "Integration",
+    }
+
+    @staticmethod
+    def _seurat_param_type(value):
+        """Map a Python value to an scFAIR parameters[*].type string."""
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, (list, tuple)):
+            return "array"
+        return "string"
+
+    @staticmethod
+    def _seurat_commands_to_scfair(commands: list, *, seurat_version=None, r_version=None) -> dict:
+        """
+        Build an scFAIR v7.1.0 analysis_json document from a list of Seurat
+        command dicts (one per @commands entry, in chronological order).
+
+        Each command dict has keys:
+          name        -> str   (e.g. "NormalizeData.RNA")        [SeuratCommand@name]
+          call_string -> str   (the verbatim call)               [SeuratCommand@call.string]
+          time_stamp  -> str   (ISO 8601, or None)               [SeuratCommand@time.stamp]
+          assay_used  -> str   (e.g. "RNA", or None)             [SeuratCommand@assay.used]
+          params      -> dict  ({param_name: value, ...})        [SeuratCommand@params]
+
+        Returns the top-level pipeline object (a Python dict) ready to be JSON-encoded.
+        This is pure Python so it can be unit-tested without R.
+        """
+        steps = []
+        for cmd in commands:
+            name = cmd.get("name") or ""
+            # The Seurat method name is the token before the first '.'
+            # ("NormalizeData.RNA" -> "NormalizeData"). Fall back to the full name.
+            method = name.split(".", 1)[0] if name else None
+            call_string = cmd.get("call_string")
+            assay_used = cmd.get("assay_used")
+            params_dict = cmd.get("params") or {}
+
+            parameters = []
+            for p_name, p_val in params_dict.items():
+                parameters.append({
+                    "name": p_name,
+                    "value": p_val,
+                    "type": RdsHandler._seurat_param_type(p_val),
+                })
+
+            step = {
+                "step_label": name or (method or "Unknown"),
+                "step_category": RdsHandler._SEURAT_METHOD_CATEGORY.get(method, "Other"),
+                "method": f"Seurat::{method}" if method else "Seurat",
+                # The Seurat command log records the call string, not a shell
+                # command; it is still the most faithful "command" we have.
+                "command": call_string if call_string else None,
+                "software_version": seurat_version,
+                "programming_language": "R",
+                "programming_language_version": r_version,
+                "parameters": parameters if parameters else None,
+                "execution_timestamp": cmd.get("time_stamp"),
+            }
+            if assay_used:
+                step["assay_used"] = assay_used
+            steps.append(step)
+
+        pipeline = {
+            "schema_version": SCFAIR_ANALYSIS_SCHEMA_VERSION,
+            "pipeline_name": "Seurat",
+            "pipeline_version": seurat_version,
+            "pipeline_description": "Analysis pipeline reconstructed from the Seurat object command log (@commands).",
+            "pipeline_url": "https://satijalab.org/seurat/",
+            "steps": steps,
+        }
+        return pipeline
+
+    @staticmethod
+    def _extract_seurat_commands(obj):
+        """
+        Pull the Seurat @commands log into a list of plain Python dicts, in order.
+        Returns (commands_list, seurat_version, r_version). commands_list is [] if
+        the object has no command log. All R access is isolated here so the
+        conversion logic (_seurat_commands_to_scfair) stays testable without R.
+        """
+        r = ro.r
+
+        # Names of the commands, in stored (chronological) order.
+        names_r = r('''function(obj) {
+            if (.hasSlot(obj, "commands")) names(obj@commands) else character(0)
+        }''')(obj)
+        cmd_names = [str(x) for x in names_r] if names_r is not ro.NULL else []
+        if not cmd_names:
+            return [], None, None
+
+        # Seurat + R versions (best-effort).
+        seurat_version = None
+        r_version = None
+        try:
+            seurat_version = str(r('as.character(utils::packageVersion("Seurat"))')[0])
+        except Exception:
+            try:
+                seurat_version = str(r('as.character(utils::packageVersion("SeuratObject"))')[0])
+            except Exception:
+                seurat_version = None
+        try:
+            r_version = str(r('paste(R.version$major, R.version$minor, sep=".")')[0])
+        except Exception:
+            r_version = None
+
+        # Ensure jsonlite is loaded so the jsonlite::toJSON() call inside the R
+        # helper below resolves (params can be nested/typed; jsonlite handles the
+        # conversion cleanly).
+        try:
+            importr('jsonlite')
+        except Exception:
+            pass
+
+        get_slot = r('''function(obj, cmd, slot) {
+            cobj <- obj@commands[[cmd]]
+            if (!.hasSlot(cobj, slot)) return(NA_character_)
+            v <- slot(cobj, slot)
+            if (is.null(v) || length(v) == 0) return(NA_character_)
+            if (slot == "time.stamp") return(format(v, "%Y-%m-%dT%H:%M:%SZ", tz="UTC"))
+            # call.string (and others) may be a multi-element character vector when
+            # R deparses a long call across lines; collapse to a single string.
+            paste(as.character(v), collapse = " ")
+        }''')
+        get_params_json = r('''function(obj, cmd) {
+            cobj <- obj@commands[[cmd]]
+            if (!.hasSlot(cobj, "params")) return("{}")
+            p <- slot(cobj, "params")
+            if (is.null(p) || length(p) == 0) return("{}")
+            jsonlite::toJSON(p, auto_unbox = TRUE, null = "null", na = "null")
+        }''')
+
+        def _scalar(v):
+            if v is ro.NULL:
+                return None
+            try:
+                s = str(v[0])
+            except Exception:
+                s = str(v)
+            if s in ("NA", "NA_character_", "NaN", ""):
+                return None
+            return s
+
+        commands = []
+        for cname in cmd_names:
+            name = _scalar(get_slot(obj, cname, "name")) or cname
+            call_string = _scalar(get_slot(obj, cname, "call.string"))
+            time_stamp = _scalar(get_slot(obj, cname, "time.stamp"))
+            assay_used = _scalar(get_slot(obj, cname, "assay.used"))
+            params = {}
+            try:
+                params_json = str(get_params_json(obj, cname)[0])
+                parsed = json.loads(params_json) if params_json else {}
+                if isinstance(parsed, dict):
+                    params = parsed
+            except Exception:
+                params = {}
+            commands.append({
+                "name": name,
+                "call_string": call_string,
+                "time_stamp": time_stamp,
+                "assay_used": assay_used,
+                "params": params,
+            })
+
+        return commands, seurat_version, r_version
+
+    @staticmethod
+    def _transfer_seurat_pipeline(obj, loom, result, n_cells, n_genes, existing_paths):
+        """
+        Reconstruct the analysis pipeline from a Seurat object's @commands log and,
+        if non-empty, write it to /attrs/analysis_pipeline as a UTF-8 JSON string
+        following the scFAIR v7.1.0 analysis_json schema. Seurat-only.
+
+        @commands is a named list of SeuratCommand objects (in chronological
+        order), each with slots: name, time.stamp, assay.used, call.string, params.
+        """
+        loom_path = "/attrs/analysis_pipeline"
+        if loom_path in existing_paths:
+            return
+        try:
+            commands, seurat_version, r_version = RdsHandler._extract_seurat_commands(obj)
+            if not commands:
+                return  # No command log: nothing to write, no warning.
+
+            pipeline = RdsHandler._seurat_commands_to_scfair(
+                commands, seurat_version=seurat_version, r_version=r_version)
+            if not pipeline.get("steps"):
+                return
+
+            json_str = json.dumps(pipeline, ensure_ascii=False)
+            meta = loom.write_metadata(json_str, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
+            result["metadata"].append(meta)
+            existing_paths.add(loom_path)
+        except Exception as e:
+            result.setdefault("warnings", []).append(
+                f"Could not extract analysis pipeline from Seurat @commands: {str(e)}.")
 
 class MexHandler:
     """
@@ -2083,7 +2343,56 @@ class LoomFile:
         queries = gene_db_queries if gene_db_queries is not None else original_gene_names
         parsed_genes, not_found_queries = gene_db.parse_genes_list(queries)
         result["nber_not_found_genes"] = int(len(not_found_queries))
-        
+
+        # ---- Gene-detection sanity checks ----------------------------------
+        # Three bands, keyed on the percentage of input genes NOT found in the DB:
+        #   (a) > HIGH_MISSING_PCT missing  -> probably the wrong organism.
+        #   (b) <= FEW_MISSING_PCT missing  -> probably a few mistyped/outdated IDs.
+        #   (c) in between                  -> ambiguous; could be the wrong
+        #       organism, or an assembly too divergent from the Ensembl one.
+        n_total = int(n_genes) if n_genes else len(queries)
+        n_missing = int(len(not_found_queries))
+        n_detected = max(n_total - n_missing, 0)
+        if n_total > 0:
+            pct_detected = 100.0 * n_detected / n_total
+            pct_missing = 100.0 * n_missing / n_total
+
+            if pct_missing > HIGH_MISSING_PCT:
+                # Wrong-organism case: very few genes matched.
+                msg = (f"Only {n_detected} gene(s) out of {n_total} ({pct_detected:.1f}%) were found "
+                       f"for this organism in our database. This is unusually low; please double-check "
+                       f"that the correct organism was selected (--organism).")
+                # Try to suggest a better organism from the first few gene IDs.
+                # This only runs in this rare branch, and uses indexed lookups.
+                db = getattr(self, "db", None)
+                if db is not None:
+                    try:
+                        sample = list(queries)[:10]
+                        suggestion = db.suggest_organism_once(
+                            sample, exclude_organism_id=getattr(self, "organism_id", None))
+                    except Exception:
+                        suggestion = None
+                    if suggestion and suggestion.get("name"):
+                        tax = suggestion.get("tax_id")
+                        tax_str = f", NCBITaxon:{tax}" if tax is not None else ""
+                        msg += (f" Based on the first {suggestion['n_queried']} gene(s), the data may "
+                                f"instead be '{suggestion['name']}' (organism_id={suggestion['organism_id']}"
+                                f"{tax_str}; {suggestion['n_matched']} matched on {suggestion['matched_on']}).")
+                result.setdefault("warnings", []).append(msg)
+            elif n_missing > 0 and pct_missing <= FEW_MISSING_PCT:
+                # A-few-stragglers case: high coverage but some misses.
+                result.setdefault("warnings", []).append(
+                    f"{n_missing} gene(s) out of {n_total} ({pct_missing:.1f}%) were not found in our "
+                    f"database. You may want to check that their identifiers are written correctly "
+                    f"(see not_found_genes.txt).")
+            elif n_missing > 0:
+                # Ambiguous middle band.
+                result.setdefault("warnings", []).append(
+                    f"{n_missing} gene(s) out of {n_total} ({pct_missing:.1f}%) were not found in our "
+                    f"database. This is a substantial fraction: the selected organism may be wrong, or "
+                    f"the assembly used may be too different from the Ensembl one (see not_found_genes.txt).")
+        # --------------------------------------------------------------------
+
         # Find Original name of queried genes that are not found
         if gene_db_queries is not None:
             not_found_idx = [i for i, g in enumerate(parsed_genes) if g.biotype == "__unknown"]
@@ -2131,22 +2440,17 @@ class LoomFile:
             n_genes=n_genes,
             organism_info=organism_info,
             file_uns_keys=file_uns_keys or set(),
+            n_missing=n_missing,
         )
 
         return parsed_genes, set(not_found_genes)
 
-    # ERCC spike-in identifiers look like "ERCC-00003" (or "ERCC_00003"). scFAIR
-    # treats these as feature_biotype == "spike-in", feature_type == "synthetic",
-    # feature_reference == "NCBITaxon:32630" (synthetic construct).
-    _ERCC_PATTERN = re.compile(r"^ERCC[-_]\d+$", re.IGNORECASE)
-    _ERCC_TAXON = "NCBITaxon:32630"
-
     @classmethod
     def _is_spikein(cls, original_id: str, gene: "Gene") -> bool:
-        if original_id and cls._ERCC_PATTERN.match(original_id.strip()):
+        if original_id and ERCC_PATTERN.match(original_id.strip()):
             return True
         # Also catch the case where the DB-resolved accession is an ERCC id
-        if gene and gene.ensembl_id and cls._ERCC_PATTERN.match(str(gene.ensembl_id).strip()):
+        if gene and gene.ensembl_id and ERCC_PATTERN.match(str(gene.ensembl_id).strip()):
             return True
         return False
 
@@ -2181,7 +2485,7 @@ class LoomFile:
             for s, g in zip(is_spikein, parsed_genes)
         ]
         feature_reference = [
-            self._ERCC_TAXON if s else (organism_taxon or "unknown")
+            ERCC_TAXON if s else (organism_taxon or "unknown")
             for s in is_spikein
         ]
         feature_chromosome = [
@@ -2213,10 +2517,7 @@ class LoomFile:
                 imported=0, is_categorical=is_cat))
 
     # scFAIR schema constants
-    _SCFAIR_SCHEMA_VERSION = "7.1.0"
-    _SCFAIR_SCHEMA_REFERENCE = "https://github.com/scFAIR/scFAIR/blob/main/schema/7.1.0/schema.md"
-
-    def write_scfair_global_fields(self, *, parsed_genes, result, n_cells, n_genes, organism_info, file_uns_keys):
+    def write_scfair_global_fields(self, *, parsed_genes, result, n_cells, n_genes, organism_info, file_uns_keys, n_missing=0):
         """
         Write the scFAIR v7.1.0 dataset-level (uns -> /attrs) fields:
           /attrs/organism                   (organism human-readable name)
@@ -2229,6 +2530,8 @@ class LoomFile:
 
         For each, if the original file already provided the corresponding uns key
         (file_uns_keys), the file's value is preserved and a warning is emitted.
+        n_missing: number of input genes not found in the DB; used to conditionally
+        add an assembly-provenance hint to the release/assembly estimate warning.
         """
         organism_info = organism_info or {}
         file_uns_keys = file_uns_keys or set()
@@ -2242,10 +2545,20 @@ class LoomFile:
             ensembl_release = organism_info.get("latest_ensembl_release")
 
         if guess.get("n_genes_considered"):
-            result.setdefault("warnings", []).append(
-                f"Guessed Ensembl release {ensembl_release} from gene coverage "
-                f"({guess['n_genes_supporting']}/{guess['n_genes_considered']} genes support it)"
-                + (f", assembly {ensembl_assembly}." if ensembl_assembly else "."))
+            msg = (
+                f"Estimated Ensembl release {ensembl_release} (earliest release consistent with the most "
+                f"gene IDs: {guess['n_genes_supporting']}/{guess['n_genes_considered']} genes co-exist there)"
+                + (f", assembly '{ensembl_assembly}'." if ensembl_assembly else ".")
+                + " This is an estimate from gene-ID coverage, not a recorded provenance."
+            )
+            if n_missing > 0:
+                msg += (
+                    " Some gene IDs were not found, which may indicate that the data was built "
+                    "against an NCBI or UCSC assembly rather than an official Ensembl release. "
+                    "In that case, consider mapping your identifiers to an official Ensembl release "
+                    "for better gene matching."
+                )
+            result.setdefault("warnings", []).append(msg)
 
         # name -> (value, scfair uns key)
         targets = [
@@ -2254,8 +2567,8 @@ class LoomFile:
             ("ensembl_database", organism_info.get("ensembl_database"), "ensembl_database"),
             ("ensembl_release", ensembl_release, "ensembl_release"),
             ("ensembl_assembly", ensembl_assembly, "ensembl_assembly"),
-            ("schema_version", self._SCFAIR_SCHEMA_VERSION, "schema_version"),
-            ("schema_reference", self._SCFAIR_SCHEMA_REFERENCE, "schema_reference"),
+            ("schema_version", SCFAIR_SCHEMA_VERSION, "schema_version"),
+            ("schema_reference", SCFAIR_SCHEMA_REFERENCE, "schema_reference"),
         ]
 
         for attr_name, value, uns_key in targets:
@@ -2558,17 +2871,6 @@ class DBManager:
         finally:
             self.disconnect()
 
-    # Maps the ensembl_subdomains.name values used in the ASAP DB to the
-    # ensembl_database labels accepted by the scFAIR v7.1.0 schema.
-    _ENSEMBL_DB_LABELS = {
-        "vertebrates": "Ensembl",
-        "bacteria": "Ensembl Bacteria",
-        "fungi": "Ensembl Fungi",
-        "metazoa": "Ensembl Metazoa",
-        "plants": "Ensembl Plants",
-        "protists": "Ensembl Protists",
-    }
-
     def get_organism_info(self, organism_id: int) -> dict:
         """
         Return organism-level metadata used to fill scFAIR schema fields:
@@ -2597,7 +2899,7 @@ class DBManager:
             ErrorJSON(f"Database error while reading organism info: {msg}")
 
         subdomain = (row.get("subdomain_name") or "").strip().lower()
-        ensembl_database = self._ENSEMBL_DB_LABELS.get(subdomain)
+        ensembl_database = ENSEMBL_DB_LABELS.get(subdomain)
         tax_id = row.get("tax_id")
 
         return {
@@ -2650,6 +2952,93 @@ class DBManager:
         self.connect()
         try:
             return self.get_assemblies(organism_id)
+        finally:
+            self.disconnect()
+
+    def suggest_organism(self, gene_ids: list, exclude_organism_id: int = None) -> dict:
+        """
+        Given a small sample of gene identifiers, find the organism in the DB that
+        accounts for the most of them. Intended as a hint when the user likely
+        picked the wrong organism. Matches on genes.ensembl_id first (indexed,
+        unambiguous); only if that yields nothing does it fall back to genes.name.
+
+        Returns {"organism_id", "name", "tax_id", "n_matched", "n_queried",
+                 "matched_on"} for the best organism, or None if nothing matched.
+        exclude_organism_id (the organism the user already chose) is dropped from
+        the ranking so we only ever suggest a *different* one.
+        """
+        ids = [str(g).strip() for g in (gene_ids or []) if g and str(g).strip()]
+        if not ids:
+            return None
+
+        # Strip Ensembl version suffixes (e.g. ENSG000001.5 -> ENSG000001) so the
+        # match behaves like the main gene lookup.
+        ids_nover = [MapGene._VERSION_PATTERN.sub("", x) for x in ids]
+        # De-duplicate (case-insensitively) while preserving order
+        seen = set()
+        candidates = []
+        for x in (ids + ids_nover):
+            xl = x.upper()
+            if xl not in seen:
+                seen.add(xl)
+                candidates.append(x)
+
+        def _rank(column: str):
+            # Count, per organism, how many of the candidate IDs match. We match
+            # the raw column (not UPPER(col)) so a plain B-tree index on the
+            # column stays usable; we instead pass both the original and the
+            # upper-cased candidates in the parameter list. The candidate list is
+            # tiny (~10-40 values), so the ANY() scan is cheap.
+            sql = f"""
+                SELECT g.organism_id AS organism_id,
+                       o.name AS name,
+                       o.tax_id AS tax_id,
+                       COUNT(DISTINCT g.{column}) AS n_matched
+                FROM genes g
+                JOIN organisms o ON o.id = g.organism_id
+                WHERE g.{column} = ANY(%s)
+                {"AND g.organism_id <> %s" if exclude_organism_id is not None else ""}
+                GROUP BY g.organism_id, o.name, o.tax_id
+                ORDER BY n_matched DESC
+                LIMIT 1
+            """
+            # Pass original, upper- and lower-cased forms to be robust to the
+            # DB's stored casing without wrapping the column in a function.
+            variants = set()
+            for c in candidates:
+                variants.add(c)
+                variants.add(c.upper())
+                variants.add(c.lower())
+            params = [list(variants)]
+            if exclude_organism_id is not None:
+                params.append(exclude_organism_id)
+            try:
+                with self._cursor() as cur:
+                    cur.execute(sql, tuple(params))
+                    return cur.fetchone()
+            except psycopg2.Error as e:
+                # A failed suggestion is non-fatal: it is only a hint. Swallow the
+                # DB error rather than aborting the whole parse with ErrorJSON.
+                return None
+
+        for column, label in (("ensembl_id", "ensembl_id"), ("name", "name")):
+            row = _rank(column)
+            if row and int(row.get("n_matched") or 0) > 0:
+                tax = row.get("tax_id")
+                return {
+                    "organism_id": int(row["organism_id"]),
+                    "name": row.get("name"),
+                    "tax_id": int(tax) if tax is not None else None,
+                    "n_matched": int(row["n_matched"]),
+                    "n_queried": len(ids),
+                    "matched_on": label,
+                }
+        return None
+
+    def suggest_organism_once(self, gene_ids: list, exclude_organism_id: int = None) -> dict:
+        self.connect()
+        try:
+            return self.suggest_organism(gene_ids, exclude_organism_id=exclude_organism_id)
         finally:
             self.disconnect()
 
@@ -2839,14 +3228,21 @@ class MapGene:
         def coverage(r):
             return sum(1 for (lo, hi) in intervals if lo <= r <= hi)
 
-        # Pick max coverage; tie-break by most recent release.
+        # Pick the release with maximum coverage (the most genes co-existing).
+        # On a plateau of equal coverage, prefer the EARLIEST release: it is the
+        # most parsimonious provenance estimate (the oldest release in which all
+        # those genes co-existed). Tie-breaking toward the latest release would
+        # systematically over-estimate the era, since genes that still exist today
+        # keep coverage high all the way up to the most recent release.
         best_release = None
         best_cov = -1
         for r in sorted(candidates):
             c = coverage(r)
-            if c > best_cov or (c == best_cov and (best_release is None or r > best_release)):
+            if c > best_cov:
                 best_cov = c
                 best_release = r
+            # On equal coverage we keep the earlier release (already set), so we
+            # do NOT update best_release here.
 
         # Map the chosen release to an assembly whose range contains it.
         assembly_name = None
@@ -2855,8 +3251,11 @@ class MapGene:
                           if a.get("first_ensembl_release") and a.get("latest_ensembl_release")
                           and a["first_ensembl_release"] <= best_release <= a["latest_ensembl_release"]]
             if containing:
-                # Prefer the assembly with the most recent latest_ensembl_release
-                assembly_name = sorted(containing, key=lambda a: a["latest_ensembl_release"], reverse=True)[0]["name"]
+                # Usually exactly one assembly contains a given release. If a
+                # release sits on a boundary shared by two assemblies, prefer the
+                # earliest one, to stay consistent with the parsimonious (earliest)
+                # release choice above.
+                assembly_name = sorted(containing, key=lambda a: a["first_ensembl_release"])[0]["name"]
             else:
                 # No exact containment: fall back to the assembly whose latest
                 # release is closest to (but not exceeding) the chosen release,
@@ -2998,6 +3397,10 @@ def parse(args):
         loom.ribo_protein_gene_names = ribo_set
         # Attach organism-level scFAIR metadata (used by handlers + finalize)
         loom.organism_info = organism_info
+        # Attach the DB handle + chosen organism so write_names_and_gene_db can
+        # suggest a better organism if the wrong-organism warning triggers.
+        loom.db = db
+        loom.organism_id = args.organism
         if not ribo_set:
             result["warnings"].append(f"No ribosomal protein genes found for {DEFAULT_RIBO_GO_TERM} (organism_id={args.organism}). Ribosomal protein content will be reported as 0 for all cells.")
          
