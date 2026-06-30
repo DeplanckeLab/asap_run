@@ -2536,9 +2536,7 @@ class LoomFile:
         organism_info = organism_info or {}
         file_uns_keys = file_uns_keys or set()
 
-        # Guess Ensembl release + assembly from the matched genes.
-        # Selection rule: maximize direct (ensembl_id/name) support first,
-        # then all-source support, then prefer the oldest assembly.
+        # Guess Ensembl release + assembly from the matched genes
         guess = MapGene.guess_ensembl_release(parsed_genes, organism_info.get("assemblies"))
         ensembl_release = guess.get("ensembl_release")
         ensembl_assembly = guess.get("ensembl_assembly")
@@ -2553,14 +2551,14 @@ class LoomFile:
                 + (f", assembly '{ensembl_assembly}'." if ensembl_assembly else ".")
                 + " This is an estimate from gene-ID coverage, not a recorded provenance."
             )
-            result.setdefault("warnings", []).append(msg)
             if n_missing > 0:
-                result.setdefault("warnings", []).append(
-                    "Some gene IDs were not found, which may indicate that the data was built "
+                msg += (
+                    " Some gene IDs were not found, which may indicate that the data was built "
                     "against an NCBI or UCSC assembly rather than an official Ensembl release. "
                     "In that case, consider mapping your identifiers to an official Ensembl release "
                     "for better gene matching."
                 )
+            result.setdefault("warnings", []).append(msg)
 
         # name -> (value, scfair uns key)
         targets = [
@@ -2842,29 +2840,27 @@ class DBManager:
 
             # By ensembl_id
             if g.ensembl_id:
-                for key in MapGene._identifier_variants(g.ensembl_id):
-                    self.map_gene._add_index_hit(self.map_gene.ensembl_db, key, g)
+                key = g.ensembl_id.upper()
+                self.map_gene.ensembl_db.setdefault(key, []).append(g)
 
-            # By gene name (exact symbol/name lookup; do not add numeric/prefixed variants here)
+            # By gene name
             if g.name:
-                key = str(g.name).strip().upper()
-                self.map_gene._add_index_hit(self.map_gene.gene_db, key, g)
+                key = g.name.upper()
+                self.map_gene.gene_db.setdefault(key, []).append(g)
 
-            # alt_names can contain symbols, RefSeq accessions, NCBI Gene/Entrez IDs, etc.
-            alt_names_raw = r.get("alt_names")
-            for token in MapGene._iter_alias_tokens(alt_names_raw):
+            # alt_names (comma-separated string)
+            alt_names_raw = r.get("alt_names") or ""
+            for token in (t.strip() for t in alt_names_raw.split(",") if t.strip()):
                 token_up = token.upper()
                 g.alt_names.add(token_up)
-                for key in MapGene._identifier_variants(token):
-                    self.map_gene._add_index_hit(self.map_gene.alt_db, key, g)
+                self.map_gene.alt_db.setdefault(token_up, []).append(g)
 
-            # obsolete_alt_names are equally useful for old matrices/publication-era IDs.
-            obsolete_raw = r.get("obsolete_alt_names")
-            for token in MapGene._iter_alias_tokens(obsolete_raw):
+            # obsolete_alt_names (comma-separated string)
+            obsolete_raw = r.get("obsolete_alt_names") or ""
+            for token in (t.strip() for t in obsolete_raw.split(",") if t.strip()):
                 token_up = token.upper()
                 g.obsolete_alt_names.add(token_up)
-                for key in MapGene._identifier_variants(token):
-                    self.map_gene._add_index_hit(self.map_gene.obsolete_db, key, g)
+                self.map_gene.obsolete_db.setdefault(token_up, []).append(g)
 
         return self.map_gene
 
@@ -3150,13 +3146,6 @@ class Gene:
     first_ensembl_release: int = 0
     alt_names: Set[str] = field(default_factory=set)
     obsolete_alt_names: Set[str] = field(default_factory=set)
-    # How this input identifier matched the DB: ensembl_id, name, alt_name,
-    # obsolete_alt_name, or None for DB source records. Useful for debugging.
-    match_source: Optional[str] = None
-    # All release intervals that were compatible with the input identifier.
-    # For ambiguous symbols/aliases this preserves alternatives for release
-    # guessing, instead of only using the latest DB hit selected for metadata.
-    release_intervals: List[Tuple[int, int]] = field(default_factory=list)
 
 @dataclass
 class MapGene:
@@ -3167,131 +3156,6 @@ class MapGene:
     
     # Pre-compile regex pattern for version stripping (used in gene lookups)
     _VERSION_PATTERN = re.compile(r"\.\d+$")
-
-    @staticmethod
-    def _iter_alias_tokens(raw) -> list[str]:
-        """Return alias tokens from DB values stored as text, text[], JSON, or CSV."""
-        if raw is None:
-            return []
-        if isinstance(raw, (list, tuple, set, np.ndarray)):
-            out = []
-            for x in raw:
-                out.extend(MapGene._iter_alias_tokens(x))
-            return out
-        if isinstance(raw, (bytes, np.bytes_)):
-            raw = raw.decode(errors="ignore")
-
-        s = str(raw).strip()
-        if not s:
-            return []
-
-        # JSON arrays are common when aliases are exported from ETL steps.
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                loaded = json.loads(s)
-                if isinstance(loaded, (list, tuple)):
-                    return MapGene._iter_alias_tokens(loaded)
-            except Exception:
-                pass
-
-        # PostgreSQL text[] values can arrive as '{a,b,c}' if cast to text.
-        if s.startswith("{") and s.endswith("}"):
-            s = s[1:-1]
-
-        out = []
-        for token in re.split(r"[,;|]", s):
-            token = token.strip().strip('"').strip("'")
-            if token:
-                out.append(token)
-        return out
-
-    @staticmethod
-    def _identifier_variants(value: str) -> list[str]:
-        """Generate robust lookup keys for Ensembl/RefSeq/NCBI/Entrez aliases."""
-        if value is None:
-            return []
-        raw = str(value).strip()
-        if not raw:
-            return []
-
-        variants: list[str] = []
-
-        def add(x):
-            if x is None:
-                return
-            x = str(x).strip().strip('"').strip("'")
-            if not x:
-                return
-            x_up = x.upper()
-            compact = re.sub(r"\s+", "", x_up)
-            for y in (x_up, compact, MapGene._VERSION_PATTERN.sub("", x_up), MapGene._VERSION_PATTERN.sub("", compact)):
-                if y and y not in variants:
-                    variants.append(y)
-
-        add(raw)
-        compact = re.sub(r"\s+", "", raw.upper())
-
-        # Accept both prefixed and bare numeric forms, e.g. NCBIGene:12345,
-        # GeneID:12345, EntrezGene:12345, and 12345.
-        tails = []
-        if ":" in compact:
-            tails.append(compact.rsplit(":", 1)[1])
-        if compact.startswith("NCBIGENE") and compact[len("NCBIGENE"):].isdigit():
-            tails.append(compact[len("NCBIGENE"):])
-        if compact.startswith("GENEID") and compact[len("GENEID"):].isdigit():
-            tails.append(compact[len("GENEID"):])
-        if compact.startswith("ENTREZGENE") and compact[len("ENTREZGENE"):].isdigit():
-            tails.append(compact[len("ENTREZGENE"):])
-        if compact.isdigit():
-            tails.append(compact)
-
-        for tail in tails:
-            tail = MapGene._VERSION_PATTERN.sub("", tail)
-            add(tail)
-            if tail.isdigit():
-                for prefix in ("NCBIGENE", "NCBIGENE:", "GENEID", "GENEID:", "ENTREZGENE", "ENTREZGENE:", "ENTREZ", "ENTREZ:"):
-                    add(prefix + tail)
-
-        return variants
-
-    @staticmethod
-    def _add_index_hit(index: Dict[str, List[Gene]], key: str, gene: Gene) -> None:
-        if not key:
-            return
-        bucket = index.setdefault(key, [])
-        if all(existing is not gene for existing in bucket):
-            bucket.append(gene)
-
-    @staticmethod
-    def _gene_interval(g: "Gene") -> tuple[int, int] | None:
-        lo = g.first_ensembl_release or g.latest_ensembl_release or 0
-        hi = g.latest_ensembl_release or g.first_ensembl_release or 0
-        if hi <= 0:
-            return None
-        if lo <= 0:
-            lo = hi
-        if lo > hi:
-            lo, hi = hi, lo
-        return int(lo), int(hi)
-
-    @staticmethod
-    def _release_intervals_from_hits(db_hits: List["Gene"]) -> list[tuple[int, int]]:
-        seen = set()
-        intervals = []
-        for hit in db_hits or []:
-            iv = MapGene._gene_interval(hit)
-            if iv and iv not in seen:
-                seen.add(iv)
-                intervals.append(iv)
-        return intervals
-
-    @staticmethod
-    def _lookup_index(index: Dict[str, List[Gene]], variants: list[str]) -> list[Gene] | None:
-        for key in variants:
-            hits = index.get(key)
-            if hits:
-                return hits
-        return None
     
     def init(self) -> None:
         self.ensembl_db.clear()
@@ -3310,183 +3174,136 @@ class MapGene:
     @staticmethod
     def guess_ensembl_release(parsed_genes: List["Gene"], assemblies: list = None) -> dict:
         """
-        Estimate the Ensembl release from gene release intervals.
+        Guess the best Ensembl release (and matching assembly) for a parsed gene
+        list, using a coverage vote: for each gene that was matched in the DB, its
+        [first_ensembl_release, latest_ensembl_release] interval is the set of
+        releases in which that gene exists. The chosen release is the one covered
+        by the most input genes (ties broken by the most recent release).
 
-        Scoring rule:
-          1. maximize n_noobs_hits: direct ensembl_id/name matches only
-          2. if tied, maximize n_hits: all matches, including alt/obsolete aliases
-          3. if still tied, prefer the oldest assembly
-          4. if still tied, prefer the earliest release within that assembly
-
-        Returns:
-          {
-            "ensembl_release": int | None,
-            "ensembl_assembly": str | None,
-            "n_genes_supporting": int,              # direct-match support for chosen release
-            "n_genes_considered": int,
-            "n_genes_supporting_all_matches": int,  # all-source support for chosen release
-          }
+        The release is then mapped to an assembly whose [first, latest] range
+        contains it. Returns:
+            {"ensembl_release": int|None,
+             "ensembl_assembly": str|None,
+             "n_genes_supporting": int,
+             "n_genes_considered": int}
         """
-        assemblies = assemblies or []
-
-        gene_options: list[list[tuple[int, int]]] = []
-        # Same intervals, but only for identifiers that matched directly by
-        # Ensembl ID or current gene name. This intentionally excludes
-        # alt_names and obsolete_alt_names so debug output can show how much
-        # release support comes from direct/non-alias matches.
-        noobs_gene_options: list[list[tuple[int, int]]] = []
-        direct_match_sources = {"ensembl_id", "name"}
+        # Build the set of release endpoints to test. Testing only the endpoints
+        # that actually occur (firsts and lasts) is sufficient: the coverage
+        # function is piecewise-constant between consecutive endpoints, and its
+        # maxima always occur at a 'first_ensembl_release' boundary.
+        firsts = []
+        intervals = []
         for g in parsed_genes:
             if not g or g.ensembl_id in (None, "__unknown"):
                 continue
-
-            opts = list(getattr(g, "release_intervals", None) or [])
-            if not opts:
-                iv = MapGene._gene_interval(g)
-                if iv:
-                    opts = [iv]
-
-            # Deduplicate and normalize intervals per input gene. One input gene
-            # should contribute at most one hit to any release, even if several
-            # aliases point to records present in the same release.
-            normalized = []
-            seen = set()
-            for lo, hi in opts:
-                if hi <= 0:
-                    continue
-                if lo <= 0:
-                    lo = hi
-                if lo > hi:
-                    lo, hi = hi, lo
-                iv = (int(lo), int(hi))
-                if iv not in seen:
-                    seen.add(iv)
-                    normalized.append(iv)
-            if not normalized:
+            lo = g.first_ensembl_release or g.latest_ensembl_release or 0
+            hi = g.latest_ensembl_release or g.first_ensembl_release or 0
+            if hi <= 0:
                 continue
-            gene_options.append(normalized)
-            match_source = getattr(g, "match_source", None) or "unknown"
-            if match_source in direct_match_sources:
-                noobs_gene_options.append(normalized)
+            if lo <= 0:
+                lo = hi
+            if lo > hi:
+                lo, hi = hi, lo
+            intervals.append((lo, hi))
+            firsts.append(lo)
 
-        n_considered = len(gene_options)
+        n_considered = len(intervals)
         if n_considered == 0:
             return {"ensembl_release": None, "ensembl_assembly": None,
-                    "n_genes_supporting": 0, "n_genes_considered": 0,
-                    "n_genes_supporting_all_matches": 0}
+                    "n_genes_supporting": 0, "n_genes_considered": 0}
 
-        min_release = min(lo for opts in gene_options for lo, _ in opts)
-        max_release = max(hi for opts in gene_options for _, hi in opts)
+        # Candidate releases: every distinct 'first' boundary, plus the assembly
+        # boundaries (so an assembly's exact release is testable too).
+        candidates = set(firsts)
+        for g in parsed_genes:
+            if g and g.latest_ensembl_release:
+                candidates.add(g.latest_ensembl_release)
+        if assemblies:
+            for a in assemblies:
+                if a.get("first_ensembl_release"):
+                    candidates.add(a["first_ensembl_release"])
+                if a.get("latest_ensembl_release"):
+                    candidates.add(a["latest_ensembl_release"])
 
-        def coverage(r: int, options: list[list[tuple[int, int]]]) -> int:
-            return sum(1 for opts in options if any(lo <= r <= hi for lo, hi in opts))
+        def coverage(r):
+            return sum(1 for (lo, hi) in intervals if lo <= r <= hi)
 
-        def assembly_for_release(r: int) -> str | None:
+        # Pick the release with maximum coverage (the most genes co-existing).
+        # On a plateau of equal coverage, prefer the EARLIEST release: it is the
+        # most parsimonious provenance estimate (the oldest release in which all
+        # those genes co-existed). Tie-breaking toward the latest release would
+        # systematically over-estimate the era, since genes that still exist today
+        # keep coverage high all the way up to the most recent release.
+        best_release = None
+        best_cov = -1
+        for r in sorted(candidates):
+            c = coverage(r)
+            if c > best_cov:
+                best_cov = c
+                best_release = r
+            # On equal coverage we keep the earlier release (already set), so we
+            # do NOT update best_release here.
+
+        # Map the chosen release to an assembly whose range contains it.
+        assembly_name = None
+        if assemblies and best_release is not None:
             containing = [a for a in assemblies
                           if a.get("first_ensembl_release") and a.get("latest_ensembl_release")
-                          and a["first_ensembl_release"] <= r <= a["latest_ensembl_release"]]
+                          and a["first_ensembl_release"] <= best_release <= a["latest_ensembl_release"]]
             if containing:
-                return sorted(containing, key=lambda a: a["first_ensembl_release"])[0].get("name")
-            return None
+                # Usually exactly one assembly contains a given release. If a
+                # release sits on a boundary shared by two assemblies, prefer the
+                # earliest one, to stay consistent with the parsimonious (earliest)
+                # release choice above.
+                assembly_name = sorted(containing, key=lambda a: a["first_ensembl_release"])[0]["name"]
+            else:
+                # No exact containment: fall back to the assembly whose latest
+                # release is closest to (but not exceeding) the chosen release,
+                # otherwise the newest assembly available.
+                below = [a for a in assemblies if a.get("latest_ensembl_release") and a["latest_ensembl_release"] <= best_release]
+                if below:
+                    assembly_name = sorted(below, key=lambda a: a["latest_ensembl_release"], reverse=True)[0]["name"]
+                elif assemblies:
+                    newest = sorted(assemblies, key=lambda a: (a.get("latest_ensembl_release") or 0), reverse=True)[0]
+                    assembly_name = newest["name"]
 
-        # Lower rank means older assembly. Unknown assemblies are sorted after known assemblies.
-        assembly_rank_by_name = {}
-        for a in sorted(assemblies, key=lambda x: (x.get("first_ensembl_release") or 10**9,
-                                                   x.get("latest_ensembl_release") or 10**9,
-                                                   x.get("name") or "")):
-            name = a.get("name")
-            if name is not None and name not in assembly_rank_by_name:
-                assembly_rank_by_name[name] = len(assembly_rank_by_name)
-
-        release_counts = []
-        for r in range(int(min_release), int(max_release) + 1):
-            assembly = assembly_for_release(r)
-            release_counts.append({
-                "release": int(r),
-                "n_hits": int(coverage(r, gene_options)),
-                "n_noobs_hits": int(coverage(r, noobs_gene_options)),
-                "assembly": assembly,
-                "assembly_rank": assembly_rank_by_name.get(assembly, 10**9),
-            })
-
-        # Primary score is direct/non-alias coverage. All-source coverage is only
-        # a tie-breaker, followed by oldest assembly and then earliest release.
-        best = max(
-            release_counts,
-            key=lambda x: (x["n_noobs_hits"], x["n_hits"], -x["assembly_rank"], -x["release"])
-        )
-        best_release = int(best["release"])
-        best_direct_cov = int(best["n_noobs_hits"])
-        best_all_cov = int(best["n_hits"])
-
-        # Map the chosen release to an assembly whose range contains it. If the
-        # DB has assembly ranges with gaps, keep the previous fallback behavior.
-        assembly_name = best.get("assembly")
-        if assemblies and best_release is not None and assembly_name is None:
-            below = [a for a in assemblies if a.get("latest_ensembl_release") and a["latest_ensembl_release"] <= best_release]
-            if below:
-                assembly_name = sorted(below, key=lambda a: a["latest_ensembl_release"], reverse=True)[0].get("name")
-            elif assemblies:
-                newest = sorted(assemblies, key=lambda a: (a.get("latest_ensembl_release") or 0), reverse=True)[0]
-                assembly_name = newest.get("name")
-
-        return {"ensembl_release": best_release,
+        return {"ensembl_release": int(best_release) if best_release is not None else None,
                 "ensembl_assembly": assembly_name,
-                "n_genes_supporting": best_direct_cov,
-                "n_genes_considered": int(n_considered),
-                "n_genes_supporting_all_matches": best_all_cov}
+                "n_genes_supporting": int(best_cov) if best_cov >= 0 else 0,
+                "n_genes_considered": int(n_considered)}
 
     def parse_gene(self, query: str, index: int) -> Gene:
-        """Translates a query string into a Gene object using the MapGene DB."""
+        """ Translates a query string into a Gene object using the MapGene DB. """
         # 1. Clean the input
-        if not query or str(query).strip() == "":
+        if not query or query.strip() == "":
             query = None
-
+        
         db_hit = None
-        match_source = None
-
+        
         if query:
-            q_up = str(query).strip().upper()
-            q_nover = self._VERSION_PATTERN.sub("", q_up)
-            identifier_variants = self._identifier_variants(q_up)
-
-            lookup_plan = [
-                # Ensembl IDs first, including version-stripped forms.
-                ("ensembl_id", self.ensembl_db, [q_up, q_nover] if q_nover != q_up else [q_up]),
-                # Gene symbols/names keep exact symbol semantics.
-                ("name", self.gene_db, [q_up]),
-                # Alternative/obsolete names get robust NCBI/RefSeq/Entrez variants.
-                ("alt_name", self.alt_db, identifier_variants),
-                ("obsolete_alt_name", self.obsolete_db, identifier_variants),
-            ]
-
-            for source, index_db, variants in lookup_plan:
-                db_hit = self._lookup_index(index_db, variants)
-                if db_hit:
-                    match_source = source
-                    break
-
+            q_up = query.upper()
+            
+            # Waterfall search with optimized chained lookups
+            db_hit = (
+                self.ensembl_db.get(q_up) or
+                self.ensembl_db.get(self._VERSION_PATTERN.sub("", q_up)) or
+                self.gene_db.get(q_up) or
+                self.alt_db.get(q_up) or
+                self.obsolete_db.get(q_up)
+            )
+    
         # If found in DB
         if db_hit:
-            g_src = self.retrieve_latest(db_hit)
-            if g_src is None:
-                db_hit = None
-            else:
-                # Do not mutate the shared DB Gene instance: copy it and attach
-                # input-specific debugging/release-guess metadata.
-                g_hit = dataclasses.replace(
-                    g_src,
-                    name=(g_src.name or g_src.ensembl_id),
-                    alt_names=set(g_src.alt_names),
-                    obsolete_alt_names=set(g_src.obsolete_alt_names),
-                    match_source=match_source,
-                    release_intervals=self._release_intervals_from_hits(db_hit),
-                )
-                return g_hit
-
+            g_hit = self.retrieve_latest(db_hit)
+            # Ensure name is not null
+            if not g_hit.name:
+                g_hit.name = g_hit.ensembl_id
+            return g_hit
+    
         # If NOT found (Create fallback)
         fallback_name = query if query else f"Gene_{index + 1}"
-        return Gene(ensembl_id="__unknown", name=fallback_name, biotype="__unknown", chr="__unknown", sum_exon_length=0)
+        
+        return Gene(ensembl_id="__unknown", name=fallback_name, biotype="__unknown", chr="__unknown", sum_exon_length=0, alt_names=set())
 
     def parse_genes_list(self, queries: List[str]):
         """ Process a list of gene identifiers (e.g. var_genes)  and returns a list of Gene objects. """
