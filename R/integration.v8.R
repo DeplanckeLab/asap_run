@@ -103,11 +103,28 @@ PARSER_RECOMPUTED_ROW <- c(
   "_Biotypes", "_Chromosomes", "_SumExonLength"
 )
 
+# Redundant per-gene ID aliases that must NOT be carried into the output LOOM.
+# The canonical gene identifiers are Accession / Gene / Name / Original_Gene
+# (written by this script and/or recomputed by parse.v8.py). Anything below is a
+# duplicate of those, typically leaked in from an upstream AnnData '.var' column
+# ('gene_ids') and its per-batch concatenation variants ('gene_ids-0',
+# 'gene_ids-1', ...). They are never consumed by parse.v8.py's _infer_gene_names,
+# become meaningless after the common-gene intersection, and just clutter the LOOM.
+DROP_ROW <- c("gene_ids", "gene_id", "gene_ids_collapsed", "gene_names", "var_names")
+# AnnData/Scanpy concat-collision suffix (e.g. 'gene_ids-0', 'gene_ids-1'): the base
+# name is one of DROP_ROW followed by '-<integer>'.
+DROP_ROW_SUFFIX_RE <- paste0("^(", paste(DROP_ROW, collapse = "|"), ")-[0-9]+$")
+
 is_parser_recomputed_col <- function(k) {
   k %in% c(CANONICAL_COL, PARSER_RECOMPUTED_COL) || grepl("^pct_counts_in_top_[0-9]+_genes$", k)
 }
 is_parser_recomputed_row <- function(k) {
   k %in% c(CANONICAL_ROW, PARSER_RECOMPUTED_ROW)
+}
+# Row attrs to actively discard (redundant gene-ID aliases), separate from the
+# "parser recomputes this" logic above.
+is_dropped_row <- function(k) {
+  k %in% DROP_ROW || grepl(DROP_ROW_SUFFIX_RE, k)
 }
 
 option_list <- list(
@@ -501,7 +518,13 @@ for (k in transfer_col_keys) {
 # values and duplicate-skip warnings after parse.v8.py regenerates them.
 all_row_keys <- character(0)
 for (h in headers) all_row_keys <- union(all_row_keys, h$row_keys)
-transfer_row_keys <- all_row_keys[!vapply(all_row_keys, is_parser_recomputed_row, logical(1))]
+transfer_row_keys <- all_row_keys[!vapply(all_row_keys, function(k) {
+  is_parser_recomputed_row(k) || is_dropped_row(k)
+}, logical(1))]
+dropped_row_keys <- all_row_keys[vapply(all_row_keys, is_dropped_row, logical(1))]
+if (length(dropped_row_keys) > 0)
+  add_warning(paste0("Dropped redundant gene-ID row attrs (using Accession/Gene/Name/Original_Gene instead): ",
+                     paste(dropped_row_keys, collapse = ", "), "."))
 for (k in transfer_row_keys) {
   src_i <- which(vapply(headers, function(h) k %in% h$row_keys, logical(1)))[1]
   h <- headers[[src_i]]
