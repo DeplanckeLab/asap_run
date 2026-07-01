@@ -10,6 +10,7 @@ from urllib.parse import urlparse # For parsing host string
 import argparse # Needed to parse arguments
 import sys # Needed for ErrorJSON
 import os # Needed for pathjoin and path/create dirs
+import tempfile # Needed for the Seurat meta.data TSV round-trip
 import h5py # Needed for parsing hdf5 files
 import json # For writing output files
 import numpy as np # For diverse array calculations
@@ -1245,12 +1246,24 @@ class RdsHandler:
                     ErrorJSON(f"Multiple assays found: {seurat_assays}. Use --sel to specify which assay to use.")
                 assay_name = seurat_assays[0]
             
-            # Check if "counts" layer exists in the assay
-            layers_r = r(f'''function(obj) {{ assay <- "{assay_name}"; Layers(obj[[assay]]) }}''')(obj)
-            layers = [str(x) for x in layers_r]
-            
-            if "counts" not in layers:
-                ErrorJSON(f"Assay '{assay_name}' does not contain a 'counts' layer. Available layers: {layers}")
+            # Check that a "counts" matrix is retrievable. Seurat v5 exposes it as a
+            # "counts" *layer* (GetAssayData(..., layer=)); Seurat v4 as a "counts"
+            # *slot* (GetAssayData(..., slot=)). Try v5 first, fall back to v4 so the
+            # same script handles objects (and installs) of either major version.
+            _counts_ok = r('''
+                function(obj, assay) {
+                    d <- tryCatch(
+                        GetAssayData(obj, assay = assay, layer = "counts"),
+                        error = function(e) tryCatch(
+                            GetAssayData(obj, assay = assay, slot = "counts"),
+                            error = function(e2) NULL
+                        )
+                    )
+                    if (is.null(d) || length(dim(d)) != 2 || (nrow(d) == 0 && ncol(d) == 0)) "MISSING" else "OK"
+                }
+            ''')
+            if str(list(_counts_ok(obj, assay_name))[0]) == "MISSING":
+                ErrorJSON(f"Assay '{assay_name}' does not contain retrievable 'counts' data (checked both the Seurat v5 'counts' layer and the v4 'counts' slot).")
             
             # Get dimensions
             n_cells = int(list(r['ncol'](obj))[0])
@@ -1260,15 +1273,21 @@ class RdsHandler:
             gene_names = list(r['rownames'](obj))
             cell_ids = list(r['colnames'](obj))
             
-            # Create block reader function for Seurat counts matrix
+            # Block reader (returns genes×cells). Seurat v5 layer= / v4 slot= are both
+            # handled by the tryCatch fallback, so this works for either version.
+            _get_counts_block = r('''
+                function(obj, assay, start_col, end_col) {
+                    mat <- tryCatch(
+                        GetAssayData(obj, assay = assay, layer = "counts"),
+                        error = function(e) GetAssayData(obj, assay = assay, slot = "counts")
+                    )
+                    block <- mat[, start_col:end_col, drop = FALSE]
+                    as.matrix(t(block))
+                }
+            ''')
             def get_block(start, end):
-                # Extract block from Seurat (cells x genes)
-                # R uses 1-based indexing
-                r_start = start + 1
-                r_end = end
-                
-                block_r = r(f'''function(obj, start_col, end_col) {{ mat <- GetAssayData(obj, layer="counts", assay="{assay_name}"); block <- mat[, start_col:end_col, drop=FALSE]; as.matrix(t(block)) }}''')(obj, r_start, r_end)
-                
+                # R uses 1-based, inclusive column indexing
+                block_r = _get_counts_block(obj, assay_name, start + 1, end)
                 return np.array(block_r, dtype=DEFAULT_NP_DTYPE)
             
             return gene_names, cell_ids, n_genes, n_cells, get_block, assay_name
@@ -1318,11 +1337,50 @@ class RdsHandler:
             pandas2ri.activate()
             r = ro.r
             
-            # Transfer cell metadata (meta.data)
+            # Transfer cell metadata (meta.data).
+            # rpy2's in-memory data.frame/vector conversion is fragile across versions:
+            # a single non-atomic column (list-column, AsIs/S4, matrix-column) makes the
+            # whole conversion raise "Can't implicitly convert non-string objects to
+            # strings" and lose everything. Instead we let R coerce every column to a
+            # writable atomic form, dump the frame to a temporary TSV, and read it back
+            # with pandas — which handles dtypes and NA natively and never touches rpy2's
+            # converter. meta.data is a plain data.frame in both Seurat v4 and v5, so this
+            # is version-agnostic.
             try:
-                meta_data_r = r('''function(obj) { obj@meta.data }''')(obj)
-                meta_df = pandas2ri.rpy2py(meta_data_r)
-                
+                _tmp_fd, _tmp_path = tempfile.mkstemp(suffix=".tsv", prefix="seurat_meta_")
+                os.close(_tmp_fd)
+                try:
+                    _dump_meta = r('''
+                        function(obj, path) {
+                            df <- obj@meta.data
+                            if (ncol(df) == 0) { file.create(path); return(invisible(NULL)) }
+                            df[] <- lapply(df, function(v) {
+                                if (is.factor(v)) return(as.character(v))
+                                if (is.atomic(v) && is.null(dim(v))) return(v)
+                                # list-column / S4 / matrix / nested column: stringify per row
+                                n <- nrow(df)
+                                vapply(seq_len(n), function(i) {
+                                    x <- tryCatch(v[[i]], error = function(e) tryCatch(v[i], error = function(e2) NA))
+                                    if (is.null(x) || length(x) == 0) NA_character_
+                                    else paste(as.character(x), collapse = ";")
+                                }, character(1))
+                            })
+                            write.table(df, path, sep = "\t", quote = TRUE,
+                                        row.names = FALSE, col.names = TRUE, na = "NA")
+                            invisible(NULL)
+                        }
+                    ''')
+                    _dump_meta(obj, _tmp_path)
+                    if os.path.getsize(_tmp_path) > 0:
+                        meta_df = pd.read_csv(_tmp_path, sep="\t")
+                    else:
+                        meta_df = pd.DataFrame()
+                finally:
+                    try:
+                        os.remove(_tmp_path)
+                    except OSError:
+                        pass
+
                 for col in meta_df.columns:
                     loom_path = f"/col_attrs/{col}"
                     
@@ -1399,17 +1457,52 @@ class RdsHandler:
             
             # Transfer additional layers (if any besides "counts")
             try:
-                layers_r = r(f'''function(obj) {{ assay <- "{assay_name}"; Layers(obj[[assay]]) }}''')(obj)
-                layers = [str(x) for x in layers_r]
+                # v5 exposes named layers via Layers(); v4 Assay objects instead have
+                # data / scale.data slots. List whichever applies, and define reusable
+                # helpers that read a layer by name via layer= (v5) or slot= (v4).
+                _list_layers = r('''
+                    function(obj, assay) {
+                        a <- obj[[assay]]
+                        ly <- tryCatch(Layers(a), error = function(e) NULL)   # Seurat v5
+                        if (!is.null(ly)) return(ly)
+                        out <- character(0)                                    # Seurat v4
+                        for (s in c("data", "scale.data")) {
+                            m <- tryCatch(methods::slot(a, s), error = function(e) NULL)
+                            if (!is.null(m) && length(dim(m)) == 2 && nrow(m) > 0 && ncol(m) > 0) out <- c(out, s)
+                        }
+                        out
+                    }
+                ''')
+                _layer_dims = r('''
+                    function(obj, assay, lyr) {
+                        m <- tryCatch(
+                            GetAssayData(obj, assay = assay, layer = lyr),
+                            error = function(e) GetAssayData(obj, assay = assay, slot = lyr)
+                        )
+                        c(nrow(m), ncol(m))
+                    }
+                ''')
+                _get_layer_block_r = r('''
+                    function(obj, assay, lyr, start_col, end_col) {
+                        mat <- tryCatch(
+                            GetAssayData(obj, assay = assay, layer = lyr),
+                            error = function(e) GetAssayData(obj, assay = assay, slot = lyr)
+                        )
+                        block <- mat[, start_col:end_col, drop = FALSE]
+                        as.matrix(t(block))
+                    }
+                ''')
+                layers = [str(x) for x in list(_list_layers(obj, assay_name))]
                 
                 for layer_name in layers:
                     if layer_name == "counts":
                         continue  # Skip counts as it's already the main matrix
                     
                     try:
-                        # Get layer dimensions first
-                        layer_ncol = int(list(r(f'''function(obj) {{ ncol(GetAssayData(obj, layer="{layer_name}", assay="{assay_name}")) }}''')(obj))[0])
-                        layer_nrow = int(list(r(f'''function(obj) {{ nrow(GetAssayData(obj, layer="{layer_name}", assay="{assay_name}")) }}''')(obj))[0])
+                        # Get layer dimensions first (v5 layer= / v4 slot= via helper)
+                        _dims = list(_layer_dims(obj, assay_name, layer_name))
+                        layer_nrow = int(_dims[0])
+                        layer_ncol = int(_dims[1])
                         
                         if layer_nrow != n_genes or layer_ncol != n_cells:
                             result.setdefault("warnings", []).append(f"Skipping layer '{layer_name}': dimension mismatch (expected {n_genes}x{n_cells}, found {layer_nrow}x{layer_ncol}).")
@@ -1421,11 +1514,9 @@ class RdsHandler:
                             result.setdefault("warnings", []).append(f"Skipping layer '{layer_name}': path already exists.")
                             continue
                         
-                        # Create block reader for this layer
+                        # Create block reader for this layer (v5 layer= / v4 slot=)
                         def get_layer_block(start, end, ln=layer_name, an=assay_name):
-                            r_start = start + 1
-                            r_end = end
-                            block_r = r(f'''function(obj, start_col, end_col) {{ mat <- GetAssayData(obj, layer="{ln}", assay="{an}"); block <- mat[, start_col:end_col, drop=FALSE]; as.matrix(t(block)) }}''')(obj, r_start, r_end)
+                            block_r = _get_layer_block_r(obj, an, ln, start + 1, end)
                             return np.array(block_r, dtype=DEFAULT_NP_DTYPE)
                         
                         # Write layer
@@ -2188,11 +2279,35 @@ class ErrorJSON(Exception):
         # then immediately exit with an error code
         sys.exit(1)
 
+## LOOM file open with retry (mirrors normalize.v8.py._open_loom_with_retry)
+def _open_loom_with_retry(path: str, mode: str, max_wait: int = 600) -> tuple:
+    """Try to open a LOOM/HDF5 file, retrying every second if locked.
+    Returns (h5py.File, wait_time_seconds). Mirrors normalize.v8.py._open_loom_with_retry."""
+    import time as _time
+    elapsed = 0
+    while True:
+        try:
+            return h5py.File(path, mode), elapsed
+        except OSError as e:
+            if elapsed >= max_wait:
+                ErrorJSON(f"Could not open {path!r} in mode {mode!r} after {max_wait}s: {e}")
+            _time.sleep(1)
+            elapsed += 1
+
 ## Output Loom file handling
 class LoomFile:
     def __init__(self, output_path: str):
         self.loomPath = Path(output_path)
-        self.handle = h5py.File(self.loomPath, "w") # This automatically overwrites the file if it exists      
+        # A leftover output.loom from a run that was killed mid-write can keep a stale
+        # HDF5/NFS lock on its inode. Opening in "w" must acquire that lock before it can
+        # truncate, so it fails even though "w" would overwrite. Unlinking first drops that
+        # inode and gives us a fresh, unlocked one; the retry then only has to cover
+        # genuinely transient contention (another run still finishing).
+        try:
+            self.loomPath.unlink(missing_ok=True)
+        except OSError:
+            pass  # if unlink fails, the retry-open below surfaces the real error
+        self.handle, self.open_wait_time = _open_loom_with_retry(str(self.loomPath), "w")
         self.ribo_protein_gene_names: set[str] = set()
         self._ensure_loom_v3_layout()
 
@@ -2553,7 +2668,7 @@ class LoomFile:
                 + (f", assembly '{ensembl_assembly}'." if ensembl_assembly else ".")
                 + " This is an estimate from gene-ID coverage, not a recorded provenance."
             )
-            result.setdefault("warnings", []).append(msg)
+            result.setdefault("messages", []).append(msg)
             if n_missing > 0:
                 result.setdefault("warnings", []).append(
                     "Some gene IDs were not found, which may indicate that the data was built "
@@ -3569,12 +3684,13 @@ def parse(args):
     ribo_set = db.get_ribo_protein_gene_names_once(args.organism, go_term=DEFAULT_RIBO_GO_TERM)
 
     # Create result dict
-    result = {"detected_format": args.filetype, "input_path": args.f, "input_group": "", "output_path": args.output_path, "nber_rows": -1, "nber_cols": -1, "nber_not_found_genes": -1, "nber_zeros": -1, "is_count_table": -1, "is_spatial": 0, "empty_cols": -1, "empty_rows": -1, "dataset_size": -1, "metadata": [], "warnings": []}
+    result = {"detected_format": args.filetype, "input_path": args.f, "input_group": "", "output_path": args.output_path, "nber_rows": -1, "nber_cols": -1, "nber_not_found_genes": -1, "nber_zeros": -1, "is_count_table": -1, "is_spatial": 0, "empty_cols": -1, "empty_rows": -1, "dataset_size": -1, "metadata": [], "wait_time": 0, "messages": [], "warnings": []}
 
     # Create Loom file
     loom = None
     try:
         loom = LoomFile(args.output_path)
+        result["wait_time"] = loom.open_wait_time
         
         # Attach ribo set
         loom.ribo_protein_gene_names = ribo_set
@@ -3605,6 +3721,9 @@ def parse(args):
     # Clean empty warnings
     if "warnings" in result and not result["warnings"]:
         del result["warnings"]
+    # Clean empty messages
+    if "messages" in result and not result["messages"]:
+        del result["messages"]
     
     # Build JSON and write to output
     json_str = json.dumps(result, default=dataclass_to_json, ensure_ascii=False)
