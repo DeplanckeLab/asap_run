@@ -22,6 +22,8 @@ import polars as pl # For fast-reading text matrices (csv, tsv, ...)
 import rpy2.robjects as ro # For reading RDS files
 from rpy2.robjects.packages import importr # For reading RDS files
 from rpy2.robjects import pandas2ri
+from rpy2.robjects import numpy2ri # explicit R-matrix -> numpy (rpy2 >= 3.6 has no default numpy conv)
+from rpy2.robjects.conversion import localconverter # rpy2 >= 3.6 removed pandas2ri.activate()
 import pandas as pd # For handling dataframes (especially used with RDS files)
 
 ## Constants
@@ -1213,6 +1215,15 @@ class H510xHandler:
 
         return stats
 
+def _rmat_to_np(rmat, dtype=DEFAULT_NP_DTYPE):
+    """Convert a raw rpy2 numeric matrix/vector to a numpy array, independent of any
+    globally-active converter. rpy2 >= 3.6 does not enable numpy conversion by default
+    (and pandas2ri.activate() now raises), so np.array(rmatrix) can silently lose the
+    2-D shape; convert explicitly through a local numpy2ri context instead. Pass the raw
+    rpy2 object (call the R function OUTSIDE this helper so it is not pre-converted)."""
+    with localconverter(ro.default_converter + numpy2ri.converter) as cv:
+        return np.asarray(cv.rpy2py(rmat), dtype=dtype)
+
 class RdsHandler:
     @staticmethod
     def _detect_object_class(obj):
@@ -1288,7 +1299,7 @@ class RdsHandler:
             def get_block(start, end):
                 # R uses 1-based, inclusive column indexing
                 block_r = _get_counts_block(obj, assay_name, start + 1, end)
-                return np.array(block_r, dtype=DEFAULT_NP_DTYPE)
+                return _rmat_to_np(block_r)
             
             return gene_names, cell_ids, n_genes, n_cells, get_block, assay_name
             
@@ -1299,10 +1310,11 @@ class RdsHandler:
     def _extract_dataframe_data(obj):
         """Extract matrix, genes, and cells from data.frame object."""
         try:
-            pandas2ri.activate()
-            
-            # Convert R data.frame to pandas
-            df = pandas2ri.rpy2py(obj)
+            # Convert R data.frame to pandas via an explicit conversion context.
+            # rpy2 >= 3.6 removed pandas2ri.activate(); this works on old and new rpy2.
+            _cv = ro.default_converter + pandas2ri.converter
+            with localconverter(_cv):
+                df = _cv.rpy2py(obj)
             
             n_genes = len(df)
             n_cells = len(df.columns)
@@ -1334,7 +1346,6 @@ class RdsHandler:
     def _transfer_seurat_metadata(obj, assay_name, loom, result, n_cells, n_genes, existing_paths):
         """Transfer metadata from Seurat object to Loom."""
         try:           
-            pandas2ri.activate()
             r = ro.r
             
             # Transfer cell metadata (meta.data).
@@ -1456,7 +1467,7 @@ class RdsHandler:
                     try:
                         # Get embedding coordinates
                         embedding_r = r(f'''function(obj) {{ Embeddings(obj, reduction="{reduction_name}") }}''')(obj)
-                        embedding = np.array(embedding_r, dtype=DEFAULT_NP_DTYPE)
+                        embedding = _rmat_to_np(embedding_r)
                         
                         # Check dimensions
                         if embedding.shape[0] != n_cells:
@@ -1541,7 +1552,7 @@ class RdsHandler:
                         # Create block reader for this layer (v5 layer= / v4 slot=)
                         def get_layer_block(start, end, ln=layer_name, an=assay_name):
                             block_r = _get_layer_block_r(obj, an, ln, start + 1, end)
-                            return np.array(block_r, dtype=DEFAULT_NP_DTYPE)
+                            return _rmat_to_np(block_r)
                         
                         # Write layer
                         layer_stats = loom.write_expression_matrix(get_block=get_layer_block, n_cells=n_cells, n_genes=n_genes, gene_metadata=None, dest_path=dest_path)
