@@ -1371,8 +1371,21 @@ class RdsHandler:
                         }
                     ''')
                     _dump_meta(obj, _tmp_path)
+                    # Column types straight from R (is.numeric), so integer-like factors
+                    # (e.g. cluster IDs) are not silently re-inferred as numbers by pandas.
+                    _numeric_cols = set(str(c) for c in r('''
+                        function(obj) {
+                            df <- obj@meta.data
+                            names(df)[vapply(df, function(v) is.numeric(v) && is.null(dim(v)), logical(1))]
+                        }
+                    ''')(obj))
                     if os.path.getsize(_tmp_path) > 0:
-                        meta_df = pd.read_csv(_tmp_path, sep="\t")
+                        # Read everything as text so R factors/characters stay categorical,
+                        # then convert only the R-numeric columns back to numbers.
+                        meta_df = pd.read_csv(_tmp_path, sep="\t", dtype=str, na_values=["NA"], keep_default_na=True)
+                        for _c in meta_df.columns:
+                            if _c in _numeric_cols:
+                                meta_df[_c] = pd.to_numeric(meta_df[_c], errors="coerce")
                     else:
                         meta_df = pd.DataFrame()
                 finally:
@@ -1404,11 +1417,15 @@ class RdsHandler:
                     # Now handle pandas NA values
                     if series.isna().all():
                         values = np.array(["nan"] * len(series), dtype=object)
+                    elif pd.api.types.is_numeric_dtype(series):
+                        # Numeric column: keep it numeric, NA stays as float NaN so
+                        # _coerce_for_h5 writes a NUMERIC dataset. Mixing numbers with a
+                        # "nan" string would make an object array that h5py rejects for a
+                        # string dataset ("Can't implicitly convert non-string objects to
+                        # strings"), which is what truncated the transfer before.
+                        values = series.astype("float64").to_numpy()
                     elif series.isna().any():
-                        if pd.api.types.is_numeric_dtype(series):
-                            values = series.astype(object).apply(lambda x: "nan" if pd.isna(x) else x).to_numpy()
-                        else:
-                            values = series.fillna("nan").to_numpy()
+                        values = series.fillna("nan").to_numpy()
                     else:
                         values = series.to_numpy()
                     
@@ -1417,9 +1434,16 @@ class RdsHandler:
                         result.setdefault("warnings", []).append(f"Skipping Seurat meta.data column '{col}': length mismatch (expected {n_cells}, found {len(values)}).")
                         continue
                     
-                    meta = loom.write_metadata(values, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
-                    result["metadata"].append(meta)
-                    existing_paths.add(loom_path)
+                    # Isolate per-column write failures: one unwritable column must not
+                    # abort the rest. Drop any half-created dataset and record a warning.
+                    try:
+                        meta = loom.write_metadata(values, loom_path, n_cells=n_cells, n_genes=n_genes, imported=1)
+                        result["metadata"].append(meta)
+                        existing_paths.add(loom_path)
+                    except Exception as _we:
+                        if loom_path in loom.handle:
+                            del loom.handle[loom_path]
+                        result.setdefault("warnings", []).append(f"Skipping Seurat meta.data column '{col}': could not write ({_we}).")
                     
             except Exception as e:
                 result.setdefault("warnings", []).append(f"Could not transfer Seurat meta.data: {str(e)}")
