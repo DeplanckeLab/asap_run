@@ -238,7 +238,7 @@ def hvg(args):
     except Exception as e_plot:
         warnings.append(f"Plot generation failed: {e_plot}")
 
-    result["metadata"] = [{"name": args.output_meta, "on": "GENE", "type": "INTEGER",
+    result["metadata"] = [{"name": args.output_meta, "on": "GENE", "type": "DISCRETE",
                             "nber_rows": n_genes, "nber_cols": 1,
                             "dataset_size": size_hvg, "imported": 0}]
 

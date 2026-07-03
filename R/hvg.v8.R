@@ -47,7 +47,7 @@ Output JSON hvg block:
 Output JSON metadata entry:
   name          str  — LOOM-internal path of the HVG flag (= --output_meta)
   on            str  — always 'GENE'
-  type          str  — always 'INTEGER'
+  type          str  — always 'DISCRETE'
   nber_rows     int  — number of genes
   nber_cols     int  — always 1
   dataset_size  int  — on-disk compressed size in bytes
@@ -287,7 +287,7 @@ h5_loom$close_all()
 result$metadata <- list(list(
   name         = args$output_meta,
   on           = "GENE",
-  type         = "INTEGER",
+  type         = "DISCRETE",
   nber_rows    = as.integer(n_genes),
   nber_cols    = 1L,
   dataset_size = as.integer(size_hvg),
