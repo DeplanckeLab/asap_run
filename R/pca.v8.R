@@ -36,7 +36,7 @@ Options:
 
   --help             Show this message and exit.
 
-Output JSON pca block:
+Output JSON pca_sc block:
   tool             str    — always 'Seurat'
   tool_version     str    — installed Seurat version
   n_pcs            int    — number of PCs computed
@@ -177,7 +177,7 @@ capture_warnings <- function(expr) {
 
 result <- list(
   parameters = list(),
-  pca        = list(tool = "Seurat", tool_version = seurat_version,
+  pca_sc     = list(tool = "Seurat", tool_version = seurat_version,
                     n_pcs = args$n_pcs, n_features = -1L,
                     variance = NULL, variance_ratio = NULL),
   metadata   = list(),
@@ -240,8 +240,8 @@ result$parameters <- list(
   weight_by_var    = args$weight_by_var,
   seed_use         = args$seed_use
 )
-result$pca$n_pcs      <- n_pcs_actual
-result$pca$n_features <- length(features_vec)
+result$pca_sc$n_pcs      <- n_pcs_actual
+result$pca_sc$n_features <- length(features_vec)
 
 ## ── Create Seurat object and run PCA ─────────────────────────────────────────
 
@@ -266,8 +266,8 @@ stdev           <- seurat_obj[["pca"]]@stdev
 variance        <- stdev^2
 variance_ratio  <- variance / sum(variance)
 
-result$pca$variance       <- as.numeric(variance)
-result$pca$variance_ratio <- as.numeric(variance_ratio)
+result$pca_sc$variance       <- as.numeric(variance)
+result$pca_sc$variance_ratio <- as.numeric(variance_ratio)
 
 ## ── Append cell embeddings into the LOOM ─────────────────────────────────────
 

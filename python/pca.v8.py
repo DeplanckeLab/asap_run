@@ -99,7 +99,7 @@ def pca(args):
 
     result: dict = {
         "parameters": {},
-        "pca":        {"tool": "scanpy", "tool_version": tool_version,
+        "pca_sc":     {"tool": "scanpy", "tool_version": tool_version,
                        "n_pcs": args.n_pcs, "n_features": -1,
                        "variance": None, "variance_ratio": None},
         "metadata":   [],
@@ -160,8 +160,8 @@ def pca(args):
         "chunked":          args.chunked,
         "chunk_size":       args.chunk_size,
     }
-    result["pca"]["n_pcs"]      = n_pcs_actual
-    result["pca"]["n_features"] = n_features
+    result["pca_sc"]["n_pcs"]      = n_pcs_actual
+    result["pca_sc"]["n_features"] = n_features
 
     # Build AnnData (cells x genes), subsetting to selected features
     import anndata
@@ -184,8 +184,8 @@ def pca(args):
     variance        = adata.uns["pca"]["variance"].astype(DEFAULT_NP_DTYPE)
     variance_ratio  = adata.uns["pca"]["variance_ratio"].astype(DEFAULT_NP_DTYPE)
 
-    result["pca"]["variance"]       = variance.tolist()
-    result["pca"]["variance_ratio"] = variance_ratio.tolist()
+    result["pca_sc"]["variance"]       = variance.tolist()
+    result["pca_sc"]["variance_ratio"] = variance_ratio.tolist()
 
     # Append cell embeddings into the LOOM
     f_rw, wt = _open_loom_with_retry(str(input_path), "r+")
