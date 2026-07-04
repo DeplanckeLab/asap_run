@@ -121,6 +121,31 @@ if (df_version != "unknown" && numeric_version(df_version) < numeric_version("2.
 .paramSweep    <- if (exists("paramSweep"))    paramSweep    else paramSweep_v3
 .doubletFinder <- if (exists("doubletFinder")) doubletFinder else doubletFinder_v3
 
+# Same BCmetric table as DoubletFinder::find.pK, without opening a graphics device.
+# find.pK() calls par()/plot() and tries to write Rplots.pdf in getwd(), which fails
+# in SLURM/docker jobs when the working directory is not writable.
+bcmvn_from_sweep_stats <- function(sweep.stats) {
+  pK_vals <- unique(sweep.stats$pK)
+  bc.mvn <- data.frame(
+    ParamID = seq_along(pK_vals),
+    pK = pK_vals,
+    stringsAsFactors = FALSE
+  )
+  bc.mvn$MeanBC <- vapply(bc.mvn$pK, function(pk) {
+    mean(sweep.stats[sweep.stats$pK == pk, "BCreal"])
+  }, numeric(1))
+  bc.mvn$VarBC <- vapply(bc.mvn$pK, function(pk) {
+    sd(sweep.stats[sweep.stats$pK == pk, "BCreal"])^2
+  }, numeric(1))
+  bc.mvn$BCmetric <- bc.mvn$MeanBC / bc.mvn$VarBC
+  if ("AUC" %in% colnames(sweep.stats)) {
+    bc.mvn$MeanAUC <- vapply(bc.mvn$pK, function(pk) {
+      mean(sweep.stats[sweep.stats$pK == pk, "AUC"])
+    }, numeric(1))
+  }
+  bc.mvn
+}
+
 ## ── LOOM helpers ──────────────────────────────────────────────────────────────
 
 write_1d_float <- function(h5, path, vec) {
@@ -263,7 +288,7 @@ if (is.null(args$pK)) {
   .silence({
     sweep.res   <<- suppressMessages(.paramSweep(seurat_obj, PCs = seq_len(n_dims), sct = FALSE, num.cores = 1L))
     sweep.stats <<- summarizeSweep(sweep.res, GT = FALSE)
-    bcmvn       <<- find.pK(sweep.stats)
+    bcmvn       <<- bcmvn_from_sweep_stats(sweep.stats)
   })
   pK_used     <- as.double(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
   warn_env$w  <- c(warn_env$w, paste0("Auto-selected pK = ", pK_used, " (maximizes BCmetric)."))
