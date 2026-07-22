@@ -264,8 +264,8 @@ result <- list(
     name         = args$output_meta,
     on           = "CELL",
     type         = "NUMERIC",
-    nber_rows    = as.integer(n_samples),
-    nber_cols    = as.integer(n_components_out),
+    nber_rows    = as.integer(n_components_out),
+    nber_cols    = as.integer(n_samples),
     dataset_size = as.integer(size_tsne),
     imported     = 0L
   ))

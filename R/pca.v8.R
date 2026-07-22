@@ -48,8 +48,8 @@ Output JSON metadata entry:
   name          str  — LOOM-internal path of cell embeddings (= --output_meta)
   on            str  — always 'CELL'
   type          str  — always 'NUMERIC'
-  nber_rows     int  — number of cells
-  nber_cols     int  — number of PCs
+  nber_rows     int  — number of PCs
+  nber_cols     int  — number of cells
   dataset_size  int  — on-disk compressed size in bytes
   imported      int  — always 0
 
@@ -288,8 +288,8 @@ result$metadata <- list(list(
   name         = args$output_meta,
   on           = "CELL",
   type         = "NUMERIC",
-  nber_rows    = as.integer(n_cells),
-  nber_cols    = as.integer(n_pcs_actual),
+  nber_rows    = as.integer(n_pcs_actual),
+  nber_cols    = as.integer(n_cells),
   dataset_size = as.integer(size_ce),
   imported     = 0L
 ))

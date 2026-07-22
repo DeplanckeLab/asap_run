@@ -185,7 +185,7 @@ def tsne(args):
         size_tsne = _write_dataset_2d(f_rw, out_path, tsne_embeddings)
 
     result["metadata"] = [{"name": args.output_meta, "on": "CELL", "type": "NUMERIC",
-                            "nber_rows": n_cells, "nber_cols": args.n_components,
+                            "nber_rows": args.n_components, "nber_cols": n_cells,
                             "dataset_size": size_tsne, "imported": 0}]
 
     if warnings:

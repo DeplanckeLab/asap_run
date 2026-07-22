@@ -197,7 +197,7 @@ def pca(args):
         size_ce = _write_dataset_2d(f_rw, out_path, cell_embeddings)
 
     result["metadata"] = [{"name": args.output_meta, "on": "CELL", "type": "NUMERIC",
-                            "nber_rows": n_cells, "nber_cols": n_pcs_actual,
+                            "nber_rows": n_pcs_actual, "nber_cols": n_cells,
                             "dataset_size": size_ce, "imported": 0}]
 
     if warnings:
