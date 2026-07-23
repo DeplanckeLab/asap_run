@@ -3,10 +3,33 @@ import sys # Needed for ErrorJSON
 import os # Needed for pathjoin and path/create dirs
 import h5py # Needed for parsing hdf5 files
 import json # For writing output files
+import math
 import numpy as np # For diverse array calculations
 import tarfile # To check if file is a TAR archive
 from pathlib import Path # Needed for file extension manipulation
 import shutil # For moving files and removing directories
+
+def scrub_json_value(value):
+    """Convert values to strict JSON types. Python allows NaN/Infinity in dumps; Ruby does not."""
+    if isinstance(value, dict):
+        return {key: scrub_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_json_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return scrub_json_value(value.tolist())
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
+    return value
+
+def dumps_output_json(result):
+    return json.dumps(scrub_json_value(result), ensure_ascii=False, allow_nan=False)
 
 custom_help = """
 Preparsing Mode
@@ -748,7 +771,7 @@ class H510xHandler:
                     result["list_groups"].append(entry)
 
         # Serialize to JSON
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
         
         # Either write to file or print
         if args.o:
@@ -959,7 +982,7 @@ class H5ADHandler:
                 }
                 result["list_groups"].append(entry)
 
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
@@ -1014,7 +1037,7 @@ class LoomHandler:
             }
             result["list_groups"].append(entry)
         
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
@@ -1110,7 +1133,7 @@ class RdsHandler:
         else:
             result["warnings"].append(f"WARNING: RDS object type not handled [{obj_class}]. Only handled types are [Seurat, data.frame]")
         
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
 
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
@@ -1126,7 +1149,7 @@ class ArchiveHandler:
             "file_path": file_path, # Path of the archive (should be decompressed already)
             "list_files": [{"filename": f} for f in list_files]
         }
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
@@ -1262,7 +1285,7 @@ class MexHandler:
             }
         result["list_groups"].append(entry)
         
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
 
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
@@ -1361,7 +1384,7 @@ class TextHandler:
             del result["warnings"]
         
         # Write JSON output
-        json_str = json.dumps(result, ensure_ascii=False)
+        json_str = dumps_output_json(result)
         if args.o:
             with open(os.path.join(args.o, "output.json"), "w", encoding="utf-8") as out:
                 out.write(json_str)
