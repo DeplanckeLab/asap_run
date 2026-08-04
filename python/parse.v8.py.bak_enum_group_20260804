@@ -127,32 +127,16 @@ class H5ADHandler:
 
     @staticmethod
     def _table_columns(f, table_path: str):
-        """Extract column names from obs/var table.
-
-        AnnData dataframes store the ordered column list in the ``column-order``
-        attribute (see AnnData on-disk format). Nested columns appear as paths
-        such as ``Region/Tooth #``. Older writers may use ``_column_names`` instead.
-        Falling back to ``list(node.keys())`` is last-resort only: it incorrectly
-        treats intermediate Groups (parents of nested columns) as columns.
-        """
+        """Extract column names from obs/var table."""
         if table_path not in f:
             return []
         
         node = f[table_path]
         if isinstance(node, h5py.Group):
-            cols = node.attrs.get('column-order', None)
-            if cols is None:
-                cols = node.attrs.get('_column_names', None)
-            if cols is None:
-                cols = list(node.keys())
+            cols = node.attrs.get('_column_names', list(node.keys()))
             if isinstance(cols, np.ndarray):
                 cols = cols.tolist()
-            out = []
-            for c in cols:
-                if isinstance(c, bytes):
-                    c = c.decode()
-                out.append(str(c))
-            return out
+            return cols
         elif _is_compound_dataset(node):
             return list(node.dtype.names or [])
         else:
@@ -195,8 +179,6 @@ class H5ADHandler:
     @staticmethod
     def _decode_enum_if_needed(item: h5py.Dataset) -> np.ndarray | None:
         """If dataset is H5T_ENUM, decode integer codes to string labels. Returns None if not enum."""
-        if not isinstance(item, h5py.Dataset):
-            return None
         enum_dict = h5py.check_enum_dtype(item.dtype)
         if enum_dict is None:
             return None
@@ -204,36 +186,6 @@ class H5ADHandler:
         code_to_label = {v: k for k, v in enum_dict.items()}
         codes = item[:]
         return np.array([code_to_label.get(int(c), "nan") for c in codes.flat], dtype=object).reshape(codes.shape)
-
-    @staticmethod
-    def _decode_nullable_group(item: h5py.Group) -> np.ndarray | None:
-        """Decode AnnData nullable-{integer,boolean,string-array} groups (values + mask)."""
-        if not isinstance(item, h5py.Group) or "values" not in item or "mask" not in item:
-            return None
-        values = item["values"][:]
-        mask = np.asarray(item["mask"][:], dtype=bool)
-        enc = item.attrs.get("encoding-type", None)
-        if isinstance(enc, bytes):
-            enc = enc.decode()
-        enc = str(enc) if enc is not None else ""
-
-        if enc == "nullable-boolean" or values.dtype.kind == "b":
-            return np.array(
-                ["nan" if m else str(bool(v)) for v, m in zip(values.flat, mask.flat)],
-                dtype=object,
-            ).reshape(values.shape)
-        if enc == "nullable-string-array" or values.dtype.kind in ("S", "U", "O"):
-            out = []
-            for v, m in zip(values.flat, mask.flat):
-                if m:
-                    out.append("nan")
-                else:
-                    out.append(v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v))
-            return np.array(out, dtype=object).reshape(values.shape)
-        # nullable-integer (and any other numeric nullable): keep numeric, NaN for masked
-        out = values.astype(np.float64, copy=True)
-        out[mask] = np.nan
-        return out
     
     @staticmethod
     def _detect_sparse_encoding(node: h5py.Group, n_cells: int, n_genes: int) -> str:
@@ -336,53 +288,23 @@ class H5ADHandler:
             if col in skip_cols or (index_col and col == index_col):
                 continue
             
-            values = None
-            
-            # ---- CASE 1: Group-based column ----
-            # column-order may use nested paths (e.g. "Region/Tooth #"); flatten "/" for loom.
-            loom_col = col.replace("/", "_")
-            loom_path = f"/{'col' if orientation == 'CELL' else 'row'}_attrs/{loom_col}"
+            loom_path = f"/{'col' if orientation == 'CELL' else 'row'}_attrs/{col}"
             if loom_path in existing_paths:
                 if not silent_skip:
                     result.setdefault("warnings", []).append(f"Skipping {group_path}/{col} -> {loom_path} transfer: already exists.")
                 continue
-
+            
+            values = None
+            
+            # ---- CASE 1: Group-based column ----
             if isinstance(node, h5py.Group):
-                # h5py "in" only checks immediate children; nested column-order
-                # paths like "Region/Tooth #" must be resolved via __getitem__.
-                try:
-                    item = node[col]
-                except KeyError:
-                    result.setdefault("warnings", []).append(
-                        f"Skipping {group_path}/{col}: listed in column-order but missing from group."
-                    )
-                    continue
+                item = node[col]
                 
                 # New-style categorical group: {categories, codes}
                 if isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
                     cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item['categories'][:]]
                     codes = item['codes'][:]
                     values = np.array([cats[c] if c != -1 else "nan" for c in codes], dtype=object)
-
-                # Nullable integer/boolean/string: {values, mask}
-                elif isinstance(item, h5py.Group) and 'values' in item and 'mask' in item:
-                    values = H5ADHandler._decode_nullable_group(item)
-                    if values is None:
-                        result.setdefault("warnings", []).append(
-                            f"Skipping {group_path}/{col}: could not decode nullable group."
-                        )
-                        continue
-
-                # Unknown / nested intermediate Group (e.g. parent of nested columns)
-                elif isinstance(item, h5py.Group):
-                    enc = item.attrs.get("encoding-type", None)
-                    if isinstance(enc, bytes):
-                        enc = enc.decode()
-                    result.setdefault("warnings", []).append(
-                        f"Skipping {group_path}/{col}: unsupported Group column "
-                        f"(keys={list(item.keys())}, encoding-type={enc!r})."
-                    )
-                    continue
                 
                 # Old-style categorical: codes in dataset, categories elsewhere
                 elif isinstance(item, h5py.Dataset) and np.issubdtype(item.dtype, np.integer):
@@ -404,7 +326,7 @@ class H5ADHandler:
                         else:
                             values = item[:]
                 
-                elif isinstance(item, h5py.Dataset):
+                else:
                     decoded = H5ADHandler._decode_enum_if_needed(item)
                     if decoded is not None:
                         values = np.array([str(v) for v in decoded.flat], dtype=object).reshape(decoded.shape)
@@ -416,11 +338,6 @@ class H5ADHandler:
                             values = np.array([str(bool(v)) for v in raw_values], dtype=object)
                         else:
                             values = raw_values
-                else:
-                    result.setdefault("warnings", []).append(
-                        f"Skipping {group_path}/{col}: unsupported HDF5 type {type(item).__name__}."
-                    )
-                    continue
             
             # ---- CASE 2: Compound dataset ----
             else:
