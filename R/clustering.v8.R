@@ -50,12 +50,16 @@ Output JSON clustering block:
   resolution    num    — resolution parameter
   n_clusters    int    — number of clusters found
 
+Output JSON top-level:
+  nber_clusters int  — number of clusters found (legacy key for ASAP UI)
+
 Output JSON metadata entry:
   name          str  — LOOM-internal path of cluster labels (= --output_meta)
   on            str  — always 'CELL'
-  type          str  — always 'INTEGER'
-  nber_rows     int  — number of cells
-  nber_cols     int  — always 1
+  type          str  — always 'DISCRETE'
+  nber_rows     int  — always 1
+  nber_cols     int  — number of cells
+  categories    obj  — map of cluster label -> cell count
   dataset_size  int  — on-disk compressed size in bytes
   imported      int  — always 0
 
@@ -280,13 +284,17 @@ size_cl <- write_1d_integer(h5_loom, out_path_h5, cluster_labels)
 h5_loom$close_all()
 
 ## ── Metadata + JSON ──────────────────────────────────────────────────────────
+# Same DISCRETE metadata shape as parse.v8 / legacy clustering (categories for Annot.nber_cats).
+categories <- as.list(table(cluster_labels))
+result$nber_clusters <- as.integer(n_clusters)
 
 result$metadata <- list(list(
   name         = args$output_meta,
   on           = "CELL",
-  type         = "INTEGER",
-  nber_rows    = as.integer(n_cells),
-  nber_cols    = 1L,
+  type         = "DISCRETE",
+  nber_rows    = 1L,
+  nber_cols    = as.integer(n_cells),
+  categories   = categories,
   dataset_size = as.integer(size_cl),
   imported     = 0L
 ))

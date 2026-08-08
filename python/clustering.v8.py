@@ -183,8 +183,12 @@ def clustering(args):
         cluster_key = "louvain"
 
     cluster_labels = adata.obs[cluster_key].astype(int).values.astype(np.int32)
-    n_clusters     = int(len(np.unique(cluster_labels)))
+    clusts, counts = np.unique(cluster_labels, return_counts=True)
+    n_clusters = int(clusts.shape[0])
     result["clustering"]["n_clusters"] = n_clusters
+    # Legacy top-level key still read by the clustering runs table / dashboard card.
+    result["nber_clusters"] = n_clusters
+    categories = {str(a): int(b) for a, b in zip(clusts, counts)}
 
     # Write cluster labels into the LOOM
     f_rw, wt = _open_loom_with_retry(str(input_path), "r+")
@@ -195,8 +199,10 @@ def clustering(args):
             warnings.append(f"Path '{out_path}' already exists and will be overwritten.")
         size_cl = _write_dataset_1d_int(f_rw, out_path, cluster_labels)
 
-    result["metadata"] = [{"name": args.output_meta, "on": "CELL", "type": "INTEGER",
-                            "nber_rows": n_cells, "nber_cols": 1,
+    # Same DISCRETE metadata shape as parse.v8 / legacy clustering (categories for Annot.nber_cats).
+    result["metadata"] = [{"name": args.output_meta, "on": "CELL", "type": "DISCRETE",
+                            "nber_rows": 1, "nber_cols": n_cells,
+                            "categories": categories,
                             "dataset_size": size_cl, "imported": 0}]
 
     if warnings:
