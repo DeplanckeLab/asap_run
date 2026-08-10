@@ -242,6 +242,15 @@ def main():
     parser.add_argument("--learning_rate",type=str,   default="auto")
 
     args = parser.parse_args()
+    # CLI passes learning_rate as a string; sklearn/scanpy require 'auto' or a float.
+    lr = (args.learning_rate or "auto").strip()
+    if lr.lower() == "auto":
+        args.learning_rate = "auto"
+    else:
+        try:
+            args.learning_rate = float(lr)
+        except ValueError:
+            ErrorJSON(f"--learning_rate must be 'auto' or a positive float, got: {args.learning_rate!r}")
     tsne(args)
 
 if __name__ == "__main__":
