@@ -91,7 +91,12 @@ if (is.null(args$input_meta))  ErrorJSON("Missing required argument --input_meta
 if (is.null(args$output_meta)) ErrorJSON("Missing required argument --output_meta.")
 if (is.null(args$method))      ErrorJSON("Missing required argument --method.")
 if (is.null(args$k))           ErrorJSON("Missing required argument -k.")
-if (!args$method %in% c("hierarchical", "kmeans")) ErrorJSON(paste0("Unknown method '", args$method, "'. Valid: hierarchical, kmeans."))
+# ASAP std_method_name is "hclust"; accept that as an alias of "hierarchical"
+method <- args$method
+if (identical(method, "hclust")) method <- "hierarchical"
+if (!method %in% c("hierarchical", "kmeans")) {
+  ErrorJSON(paste0("Unknown method '", args$method, "'. Valid: hierarchical, hclust, kmeans."))
+}
 if (!startsWith(args$output_meta, "/col_attrs/")) ErrorJSON(paste0("--output_meta must be under /col_attrs/ (e.g. /col_attrs/cluster_vst), got: '", args$output_meta, "'."))
 if (args$k < 2L) ErrorJSON(paste0("-k must be >= 2, got: ", args$k))
 
@@ -157,7 +162,7 @@ if (n_top < n_genes) {
 
 ## ── Cluster samples ───────────────────────────────────────────────────────────
 
-if (args$method == "hierarchical") {
+if (method == "hierarchical") {
 
   valid_distances <- c("euclidean", "pearson", "spearman")
   valid_linkages  <- c("ward.D2", "complete", "average", "single", "mcquitty", "median", "centroid")
@@ -176,7 +181,7 @@ if (args$method == "hierarchical") {
 
   clust_params <- list(distance = args$distance, linkage = args$linkage)
 
-} else if (args$method == "kmeans") {
+} else if (method == "kmeans") {
 
   set.seed(args$seed)
   km <- tryCatch(
@@ -203,27 +208,43 @@ if (h5_loom$exists(out_path_h5)) {
   parent_grp <- if (length(parts) > 1) h5_loom[[paste(parts[-length(parts)], collapse = "/")]] else h5_loom
   parent_grp$link_delete(parts[length(parts)])
 }
-h5_loom[[out_path_h5]] <- cluster_labels
+h5_loom[[out_path_h5]] <- as.integer(cluster_labels)
+dataset_size <- tryCatch(as.integer(h5_loom[[out_path_h5]]$get_storage_size()), error = function(e) NULL)
 h5_loom$close_all()
 
 ## ── Cluster size summary ─────────────────────────────────────────────────────
 
-cluster_sizes <- as.list(table(cluster_labels))
+categories <- as.list(table(cluster_labels))
+cluster_sizes <- categories
 names(cluster_sizes) <- paste0("cluster_", names(cluster_sizes))
+n_clusters <- length(unique(cluster_labels))
 
 ## ── Emit output.json ─────────────────────────────────────────────────────────
+# metadata[] is required for Basic.finish_run to create the Annot / results link
+# (same DISCRETE shape as clustering.v8.R / Seurat clustering).
 
 result <- list(
   loom_path        = input_path,
   tool             = "base R",
   tool_version     = as.character(getRversion()),
-  method           = args$method,
+  method           = method,
   nber_rows        = n_genes,
   nber_cols        = n_samples,
+  nber_clusters    = as.integer(n_clusters),
   input_loom_path  = args$input_meta,
   output_loom_path = args$output_meta,
   parameters       = c(list(input_loom_path = args$input_meta, output_loom_path = args$output_meta, k = args$k, top_var_genes = n_top, filter_meta = args$filter_meta), clust_params),
-  cluster_sizes    = cluster_sizes
+  cluster_sizes    = cluster_sizes,
+  metadata         = list(list(
+    name         = args$output_meta,
+    on           = "CELL",
+    type         = "DISCRETE",
+    nber_rows    = 1L,
+    nber_cols    = as.integer(n_samples),
+    categories   = categories,
+    dataset_size = dataset_size,
+    imported     = 0L
+  ))
 )
 if (length(warn_env$w) > 0) result$warnings <- as.list(warn_env$w)
 
