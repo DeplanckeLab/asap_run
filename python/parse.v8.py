@@ -50,8 +50,18 @@ SCFAIR_SCHEMA_REFERENCE: Final[str] = "https://github.com/scFAIR/scFAIR/blob/mai
 SCFAIR_ANALYSIS_SCHEMA_VERSION: Final[str] = "7.1.0+scfair1.0" # analysis_json schema_version (analysis_pipeline)
 
 # ERCC spike-in detection (scFAIR: feature_biotype "spike-in", feature_type "synthetic")
-ERCC_PATTERN: Final = re.compile(r"^ERCC[-_]\d+$", re.IGNORECASE) # Matches ERCC-00003 / ERCC_00003
+ERCC_PATTERN: Final = re.compile(r"^ERCC[-_](\d+)$", re.IGNORECASE) # Matches ERCC-00003 / ERCC_00003
 ERCC_TAXON: Final[str] = "NCBITaxon:32630" # NCBITaxon for synthetic constructs (ERCC feature_reference)
+
+
+def normalize_ercc_id(query: str) -> Optional[str]:
+    """Return scFAIR var-index form ERCC-<digits>, or None if not an ERCC identifier."""
+    if not query:
+        return None
+    match = ERCC_PATTERN.match(str(query).strip())
+    if not match:
+        return None
+    return f"ERCC-{match.group(1)}"
 
 # Maps ensembl_subdomains.name (ASAP DB) -> scFAIR ensembl_database label
 ENSEMBL_DB_LABELS: Final[dict] = {
@@ -3572,6 +3582,12 @@ class MapGene:
         for g in parsed_genes:
             if not g or g.ensembl_id in (None, "__unknown"):
                 continue
+            # Spike-ins use ERCC Accessions; they are not Ensembl genes and must
+            # not influence ensembl_release / ensembl_assembly guessing.
+            if g.biotype == "spike-in" or (getattr(g, "match_source", None) == "ercc_spike_in"):
+                continue
+            if ERCC_PATTERN.match(str(g.ensembl_id).strip()):
+                continue
 
             opts = list(getattr(g, "release_intervals", None) or [])
             if not opts:
@@ -3674,6 +3690,20 @@ class MapGene:
         # 1. Clean the input
         if not query or str(query).strip() == "":
             query = None
+
+        # ERCC spike-ins are valid scFAIR var-index identifiers (not Ensembl genes).
+        # Keep Accession = ERCC-<digits> so uniqueness / release checks stay schema-aligned.
+        if query:
+            ercc_id = normalize_ercc_id(query)
+            if ercc_id:
+                return Gene(
+                    ensembl_id=ercc_id,
+                    name=ercc_id,
+                    biotype="spike-in",
+                    chr="spike-in",
+                    sum_exon_length=0,
+                    match_source="ercc_spike_in",
+                )
 
         db_hit = None
         match_source = None
