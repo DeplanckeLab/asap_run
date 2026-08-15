@@ -54,28 +54,29 @@ ERCC_PATTERN: Final = re.compile(r"^ERCC[-_](\d+)$", re.IGNORECASE) # Matches ER
 ERCC_TAXON: Final[str] = "NCBITaxon:32630" # NCBITaxon for synthetic constructs (ERCC feature_reference)
 
 
-def normalize_ercc_id(query: str) -> Optional[str]:
-    """Return scFAIR var-index form ERCC-<digits>, or None if not an ERCC identifier."""
-    if not query:
-        return None
-    match = ERCC_PATTERN.match(str(query).strip())
-    if not match:
-        return None
-    return f"ERCC-{match.group(1)}"
 
 # Maps ensembl_subdomains.name (ASAP DB) -> scFAIR ensembl_database label
-ENSEMBL_DB_LABELS: Final[dict] = {
-    "vertebrates": "Ensembl",
-    "bacteria": "Ensembl Bacteria",
-    "fungi": "Ensembl Fungi",
-    "metazoa": "Ensembl Metazoa",
-    "plants": "Ensembl Plants",
-    "protists": "Ensembl Protists",
-}
+from ensembl_release_names import (  # noqa: E402
+    DEFAULT_ENSEMBL_DATA_DIR,
+    ENSEMBL_DB_LABELS,
+    compute_feature_names as _compute_feature_names_shared,
+    load_ensembl_release_gene_names as _load_ensembl_release_gene_names_shared,
+    normalize_ensembl_stable_id,
+    normalize_ercc_id,
+)
 
 # Gene-detection sanity warnings (percent of input genes)
 HIGH_MISSING_PCT: Final[float] = 90.0 # > this % of genes NOT detected -> probably the wrong organism
 FEW_MISSING_PCT: Final[float] = 5.0  # genes missing but <= this % -> probably a few mistyped/outdated IDs
+
+
+def load_ensembl_release_gene_names(**kwargs):
+    """Parse wrapper: surface dump/resolution failures via ErrorJSON."""
+    try:
+        return _load_ensembl_release_gene_names_shared(**kwargs)
+    except ValueError as e:
+        ErrorJSON(str(e))
+
 
 ## Format Handlers
 
@@ -2662,9 +2663,16 @@ class LoomFile:
         # from spike-in detection on the original gene identifiers. Each one is
         # only written if the original file did not already provide an equivalent
         # column (file_feature_cols); otherwise we keep the file's version and warn.
+        # Exception: feature_name is always computed for the guessed Ensembl
+        # release (display_xref rules); upstream CellXGene feature_name must not win.
         # Note: feature_type is the scFAIR successor of the legacy _Biotypes field
         # (gene biotype, "synthetic" for spike-ins), so _Biotypes is no longer
         # written separately.
+        guess = MapGene.guess_ensembl_release(parsed_genes, (organism_info or {}).get("assemblies"))
+        ensembl_release = guess.get("ensembl_release")
+        if not ensembl_release:
+            ensembl_release = (organism_info or {}).get("latest_ensembl_release")
+
         self.write_scfair_gene_fields(
             parsed_genes=parsed_genes,
             original_gene_names=original_gene_names,
@@ -2673,6 +2681,7 @@ class LoomFile:
             n_genes=n_genes,
             organism_info=organism_info,
             file_feature_cols=file_feature_cols or set(),
+            ensembl_release=ensembl_release,
         )
 
         # scFAIR v7.1.0 dataset-level (uns) fields, deferring to file values.
@@ -2684,6 +2693,7 @@ class LoomFile:
             organism_info=organism_info,
             file_uns_keys=file_uns_keys or set(),
             n_missing=n_missing,
+            guess=guess,
         )
 
         return parsed_genes, set(not_found_genes)
@@ -2704,7 +2714,18 @@ class LoomFile:
             return "unknown"
         return str(biotype).replace("_", " ")
 
-    def write_scfair_gene_fields(self, *, parsed_genes, original_gene_names, result, n_cells, n_genes, organism_info, file_feature_cols):
+    def write_scfair_gene_fields(
+        self,
+        *,
+        parsed_genes,
+        original_gene_names,
+        result,
+        n_cells,
+        n_genes,
+        organism_info,
+        file_feature_cols,
+        ensembl_release=None,
+    ):
         """
         Write the scFAIR v7.1.0 var fields:
           /row_attrs/feature_biotype    ("gene" | "spike-in")
@@ -2712,10 +2733,15 @@ class LoomFile:
           /row_attrs/feature_reference  (NCBITaxon of the gene's organism; ERCC -> NCBITaxon:32630)
           /row_attrs/feature_chromosome (chromosome; "spike-in" for ERCC)  [renamed from _Chromosomes]
           /row_attrs/feature_length     (sum exon length)                  [renamed from _SumExonLength]
+          /row_attrs/feature_name       (release display name or Accession; spike-in label)
 
-        For each, if a same-named column already came from the original file
-        (file_feature_cols), the file's version is preserved and a warning is
-        emitted instead of overwriting it.
+        For each field except feature_name, if a same-named column already came from
+        the original file (file_feature_cols), the file's version is preserved and a
+        warning is emitted instead of overwriting it.
+
+        feature_name is always written from the Ensembl dump for ensembl_release
+        (display_xref when assigned, otherwise stable_id), matching scFAIR
+        var.cross_field.feature_name.index.
         """
         organism_info = organism_info or {}
         organism_taxon = organism_info.get("organism_ontology_term_id")
@@ -2740,6 +2766,47 @@ class LoomFile:
             for s, g in zip(is_spikein, parsed_genes)
         ]
 
+        # Release-scoped display names (not latest genes.name — that can post-date
+        # the guessed release and fail scFAIR feature_name vs index checks).
+        gene_ids_for_lookup = [
+            normalize_ensembl_stable_id(g.ensembl_id)
+            for g, spike in zip(parsed_genes, is_spikein)
+            if not spike and g and g.ensembl_id not in (None, "__unknown")
+        ]
+        release_names: dict[str, str] = {}
+        if any(not s for s in is_spikein):
+            if not ensembl_release:
+                ErrorJSON(
+                    "Cannot resolve feature_name: ensembl_release could not be determined "
+                    "from gene coverage or organism.latest_ensembl_release"
+                )
+            release_names = load_ensembl_release_gene_names(
+                ensembl_subdomain=organism_info.get("ensembl_subdomain") or "",
+                ensembl_db_name=organism_info.get("ensembl_db_name") or "",
+                release=int(ensembl_release),
+                ensembl_ids=[i for i in gene_ids_for_lookup if i],
+            )
+            result.setdefault("messages", []).append(
+                f"Resolved feature_name from Ensembl {organism_info.get('ensembl_subdomain')}/"
+                f"{int(ensembl_release)}/{organism_info.get('ensembl_db_name')} "
+                f"({len(release_names)} genes with dump rows)."
+            )
+
+        feature_name: list[str] = []
+        for orig, g, spike in zip(original_gene_names, parsed_genes, is_spikein):
+            if spike:
+                ercc = normalize_ercc_id(orig) or normalize_ercc_id(g.ensembl_id) or str(
+                    g.ensembl_id or orig or ""
+                ).strip()
+                feature_name.append(f"{ercc} (spike-in control)")
+                continue
+            stable = normalize_ensembl_stable_id(g.ensembl_id)
+            if not stable:
+                feature_name.append(str(orig or "").strip() or "unknown")
+                continue
+            # Dump miss => treat as unassigned gene_name => feature_name = index.
+            feature_name.append(release_names.get(stable, stable))
+
         # name -> (values, is_categorical)
         targets = {
             "feature_biotype": (feature_biotype, True),
@@ -2747,20 +2814,27 @@ class LoomFile:
             "feature_reference": (feature_reference, True),
             "feature_chromosome": (feature_chromosome, True),
             "feature_length": (feature_length, False),
+            "feature_name": (feature_name, False),
         }
 
         for col, (values, is_cat) in targets.items():
-            if col in file_feature_cols:
+            # Always overwrite feature_name (upstream CellXGene values are not release-scoped).
+            if col != "feature_name" and col in file_feature_cols:
                 result.setdefault("warnings", []).append(
                     f"Field /row_attrs/{col} already present in the original file; "
                     f"keeping the file's values instead of the computed ones.")
                 continue
+            if col == "feature_name" and col in file_feature_cols:
+                result.setdefault("messages", []).append(
+                    "Field /row_attrs/feature_name was present in the original file; "
+                    "replaced with Ensembl-release display names for scFAIR compliance."
+                )
             result["metadata"].append(self.write_metadata(
                 values, f"/row_attrs/{col}", n_cells=n_cells, n_genes=n_genes,
                 imported=0, is_categorical=is_cat))
 
     # scFAIR schema constants
-    def write_scfair_global_fields(self, *, parsed_genes, result, n_cells, n_genes, organism_info, file_uns_keys, n_missing=0):
+    def write_scfair_global_fields(self, *, parsed_genes, result, n_cells, n_genes, organism_info, file_uns_keys, n_missing=0, guess=None):
         """
         Write the scFAIR v7.1.0 dataset-level (uns -> /attrs) fields:
           /attrs/organism                   (organism human-readable name)
@@ -2779,10 +2853,12 @@ class LoomFile:
         organism_info = organism_info or {}
         file_uns_keys = file_uns_keys or set()
 
-        # Guess Ensembl release + assembly from the matched genes.
+        # Guess Ensembl release + assembly from the matched genes (reuse caller guess
+        # when feature_name was resolved against the same release).
         # Selection rule: maximize direct (ensembl_id/name) support first,
         # then all-source support, then prefer the oldest assembly.
-        guess = MapGene.guess_ensembl_release(parsed_genes, organism_info.get("assemblies"))
+        if guess is None:
+            guess = MapGene.guess_ensembl_release(parsed_genes, organism_info.get("assemblies"))
         ensembl_release = guess.get("ensembl_release")
         ensembl_assembly = guess.get("ensembl_assembly")
         # Organism-level fallback for release if the gene vote produced nothing
@@ -2816,12 +2892,19 @@ class LoomFile:
             ("schema_reference", SCFAIR_SCHEMA_REFERENCE, "schema_reference"),
         ]
 
+        # Always overwrite schema_version / schema_reference (CellXGene carries CZI URLs).
+        force_overwrite = {"schema_version", "schema_reference"}
+
         for attr_name, value, uns_key in targets:
-            if uns_key in file_uns_keys:
+            if uns_key in file_uns_keys and uns_key not in force_overwrite:
                 result.setdefault("warnings", []).append(
                     f"Field /attrs/{attr_name} already present in the original file (uns/{uns_key}); "
                     f"keeping the file's value instead of the computed one.")
                 continue
+            if uns_key in file_uns_keys and uns_key in force_overwrite:
+                result.setdefault("messages", []).append(
+                    f"Field /attrs/{attr_name} was present in the original file; "
+                    f"replaced with the scFAIR value.")
             if value is None:
                 # Nothing to write (e.g. could not determine release). Skip quietly
                 # except for the ensembl_* trio, where it is worth noting.
@@ -3154,6 +3237,7 @@ class DBManager:
             "tax_id": int(tax_id) if tax_id is not None else None,
             "organism_ontology_term_id": f"NCBITaxon:{int(tax_id)}" if tax_id is not None else None,
             "ensembl_database": ensembl_database,
+            "ensembl_subdomain": subdomain or None,
             "ensembl_db_name": row.get("ensembl_db_name"),
             "latest_ensembl_release": int(row.get("latest_ensembl_release") or 0) or None,
         }

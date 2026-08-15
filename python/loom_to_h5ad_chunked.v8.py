@@ -142,105 +142,13 @@ def copy_loom_attrs_to_uns(loom_file: str, adata) -> int:
     return n
 
 
-def _parse_dburl(dburl: str) -> tuple[str, int, str]:
-    from urllib.parse import urlparse
-
-    u = urlparse("http://" + dburl) if "://" not in dburl else urlparse(dburl)
-    host = u.hostname
-    port = u.port or 5432
-    dbname = (u.path or "").lstrip("/")
-    if not host or not dbname:
-        raise ValueError(f"Invalid --dburl {dburl!r}; expected HOST:PORT/DBNAME")
-    return host, int(port), dbname
-
-
-def _tax_id_from_ontology_term(term: str) -> int | None:
-    s = str(term or "").strip()
-    if s.upper().startswith("NCBITAXON:"):
-        tail = s.split(":", 1)[1]
-        if tail.isdigit():
-            return int(tail)
-    if s.isdigit():
-        return int(s)
-    return None
-
-
-def align_feature_name_to_gene_db(adata, *, dburl: str) -> None:
-    """Set var['feature_name'] from ASAP genes.name by Accession (scFAIR)."""
-    import os
-    import re
-
-    import numpy as np
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-
-    if adata.n_vars <= 0:
-        return
-
-    tax_id = _tax_id_from_ontology_term(adata.uns.get("organism_ontology_term_id", ""))
-    if tax_id is None:
+def require_feature_name_from_loom(adata) -> None:
+    """feature_name must come from parse (Ensembl-release display rules), not genes.name."""
+    if "feature_name" not in adata.var.columns:
         raise ValueError(
-            "uns/organism_ontology_term_id is required to align feature_name "
-            "(NCBITaxon:<tax_id>)"
+            "Loom is missing row_attrs/feature_name. Re-parse with a current parse.v8.py "
+            "so feature_name is written from the Ensembl release dumps."
         )
-
-    user = os.environ.get("POSTGRES_USER")
-    password = os.environ.get("POSTGRES_PASSWORD")
-    if not user or not password:
-        raise ValueError(
-            "POSTGRES_USER and POSTGRES_PASSWORD are required to align feature_name"
-        )
-
-    host, port, dbname = _parse_dburl(dburl)
-    accessions = [str(x) for x in adata.var_names.tolist()]
-    accessions_nover = [re.sub(r"\.\d+$", "", a) for a in accessions]
-
-    sql = """
-        SELECT g.ensembl_id, g.name
-        FROM genes g
-        JOIN organisms o ON o.id = g.organism_id
-        WHERE o.tax_id = %s
-          AND regexp_replace(g.ensembl_id, '\\.\\d+$', '') = ANY(%s)
-    """
-    with psycopg2.connect(
-        host=host, port=port, dbname=dbname, user=user, password=password
-    ) as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (tax_id, accessions_nover))
-            rows = cur.fetchall()
-
-    name_by_id: dict[str, str] = {}
-    for row in rows:
-        eid = re.sub(r"\.\d+$", "", str(row["ensembl_id"] or "").strip())
-        name = str(row["name"] or "").strip()
-        if eid:
-            name_by_id[eid] = name or eid
-
-    biotypes = (
-        adata.var["feature_biotype"].astype(str).tolist()
-        if "feature_biotype" in adata.var.columns
-        else ["gene"] * adata.n_vars
-    )
-
-    out: list[str] = []
-    missing = 0
-    for acc, bt in zip(accessions, biotypes):
-        if bt == "spike-in" or acc.upper().startswith("ERCC"):
-            out.append(f"{acc} (spike-in control)")
-            continue
-        key = re.sub(r"\.\d+$", "", acc)
-        name = name_by_id.get(key)
-        if not name:
-            missing += 1
-            name = acc
-        out.append(name)
-
-    adata.var["feature_name"] = np.array(out, dtype=object)
-    print(
-        f"Aligned feature_name from gene DB (tax_id={tax_id}, "
-        f"looked_up={len(name_by_id)}, missing_fallback_to_index={missing})",
-        flush=True,
-    )
 
 
 def _as_1d_object_strings(values) -> list[str]:
@@ -387,7 +295,6 @@ def convert_chunked(
     *,
     chunk_cells: int,
     tmp_parent: str,
-    dburl: str,
 ) -> tuple[int, int]:
     import anndata as ad
     import h5py
@@ -477,8 +384,9 @@ def convert_chunked(
             if layer_scratch is not None:
                 merged.layers["X"] = _csr_from_scratch(layer_scratch, n_cells, n_genes)
             copy_loom_attrs_to_uns(loom_file, merged)
-            align_feature_name_to_gene_db(merged, dburl=dburl)
-            merged.write_h5ad(h5ad_file)
+            require_feature_name_from_loom(merged)
+            # gzip is HDF5-native (scFAIR-safe); shrinks CSR X/layers vs uncompressed default.
+            merged.write_h5ad(h5ad_file, compression="gzip")
             del merged
             gc.collect()
     finally:
@@ -502,8 +410,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dburl",
-        required=True,
-        help="ASAP gene DB HOST:PORT/DBNAME (same as parse.v8.py --dburl)",
+        required=False,
+        default=None,
+        help="Unused (kept for StdMethod CLI compatibility). feature_name comes from the loom.",
     )
     args = parser.parse_args(argv)
 
@@ -530,7 +439,6 @@ def main(argv: list[str] | None = None) -> int:
             h5ad_file,
             chunk_cells=args.chunk_cells,
             tmp_parent=output_dir,
-            dburl=args.dburl,
         )
     except Exception as exc:  # noqa: BLE001 - surface any convert failure in output.json
         fail(f"Loom to H5AD conversion failed: {exc}", output_json)

@@ -13,3 +13,5 @@ python/de.v8.*.py
 # Ignore all compiled Java classes except ASAP.jar
 java/bin/*
 !java/bin/ASAP.jar
+
+*.pyc
