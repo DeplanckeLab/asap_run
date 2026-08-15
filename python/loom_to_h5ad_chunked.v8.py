@@ -8,9 +8,9 @@ matrices plus a vstack copy.
 
 Mirrors anndata.io.read_loom conventions used by ASAP looms:
   - loom matrix is genes x cells; AnnData X is cells x genes (float32 CSR)
-  - CellID -> obs index; Gene -> var index
+  - CellID -> obs index; Accession -> var index (scFAIR); Gene kept as var column
   - 1D col/row attrs -> obs/var columns; 2D col attrs -> obsm
-  - named loom layer "X" -> adata.layers["X"] when present
+  - named loom layer "X" -> adata.layers["X"] when present and not identical to /matrix
 
 CLI is compatible with loom_to_h5ad.v8.py (-i/-o/-d) plus --chunk-cells.
 """
@@ -108,6 +108,141 @@ def install_loompy_none_attr_recovery() -> None:
     AttributeManager.__getattr__ = __getattr__  # type: ignore[method-assign]
 
 
+def _decode_loom_attr_scalar(raw):
+    """Normalize a loom /attrs value to a Python scalar suitable for adata.uns."""
+    import numpy as np
+
+    if isinstance(raw, (bytes, bytearray, np.bytes_)):
+        return bytes(raw).decode("utf-8")
+    if isinstance(raw, np.ndarray):
+        if raw.shape == ():
+            return _decode_loom_attr_scalar(raw.item())
+        if raw.ndim == 1 and raw.size == 1:
+            return _decode_loom_attr_scalar(raw[0])
+        return [_decode_loom_attr_scalar(v) for v in raw.tolist()]
+    if isinstance(raw, np.generic):
+        return raw.item()
+    return raw
+
+
+def copy_loom_attrs_to_uns(loom_file: str, adata) -> int:
+    """Copy loom /attrs/* into adata.uns (scFAIR uns metadata)."""
+    import h5py
+
+    n = 0
+    with h5py.File(loom_file, "r") as hf:
+        if "attrs" not in hf:
+            return 0
+        for key in hf["attrs"].keys():
+            raw = hf["attrs"][key][()]
+            adata.uns[key] = _decode_loom_attr_scalar(raw)
+            n += 1
+    if n:
+        print(f"Copied {n} loom /attrs keys into uns", flush=True)
+    return n
+
+
+def _parse_dburl(dburl: str) -> tuple[str, int, str]:
+    from urllib.parse import urlparse
+
+    u = urlparse("http://" + dburl) if "://" not in dburl else urlparse(dburl)
+    host = u.hostname
+    port = u.port or 5432
+    dbname = (u.path or "").lstrip("/")
+    if not host or not dbname:
+        raise ValueError(f"Invalid --dburl {dburl!r}; expected HOST:PORT/DBNAME")
+    return host, int(port), dbname
+
+
+def _tax_id_from_ontology_term(term: str) -> int | None:
+    s = str(term or "").strip()
+    if s.upper().startswith("NCBITAXON:"):
+        tail = s.split(":", 1)[1]
+        if tail.isdigit():
+            return int(tail)
+    if s.isdigit():
+        return int(s)
+    return None
+
+
+def align_feature_name_to_gene_db(adata, *, dburl: str) -> None:
+    """Set var['feature_name'] from ASAP genes.name by Accession (scFAIR)."""
+    import os
+    import re
+
+    import numpy as np
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    if adata.n_vars <= 0:
+        return
+
+    tax_id = _tax_id_from_ontology_term(adata.uns.get("organism_ontology_term_id", ""))
+    if tax_id is None:
+        raise ValueError(
+            "uns/organism_ontology_term_id is required to align feature_name "
+            "(NCBITaxon:<tax_id>)"
+        )
+
+    user = os.environ.get("POSTGRES_USER")
+    password = os.environ.get("POSTGRES_PASSWORD")
+    if not user or not password:
+        raise ValueError(
+            "POSTGRES_USER and POSTGRES_PASSWORD are required to align feature_name"
+        )
+
+    host, port, dbname = _parse_dburl(dburl)
+    accessions = [str(x) for x in adata.var_names.tolist()]
+    accessions_nover = [re.sub(r"\.\d+$", "", a) for a in accessions]
+
+    sql = """
+        SELECT g.ensembl_id, g.name
+        FROM genes g
+        JOIN organisms o ON o.id = g.organism_id
+        WHERE o.tax_id = %s
+          AND regexp_replace(g.ensembl_id, '\\.\\d+$', '') = ANY(%s)
+    """
+    with psycopg2.connect(
+        host=host, port=port, dbname=dbname, user=user, password=password
+    ) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (tax_id, accessions_nover))
+            rows = cur.fetchall()
+
+    name_by_id: dict[str, str] = {}
+    for row in rows:
+        eid = re.sub(r"\.\d+$", "", str(row["ensembl_id"] or "").strip())
+        name = str(row["name"] or "").strip()
+        if eid:
+            name_by_id[eid] = name or eid
+
+    biotypes = (
+        adata.var["feature_biotype"].astype(str).tolist()
+        if "feature_biotype" in adata.var.columns
+        else ["gene"] * adata.n_vars
+    )
+
+    out: list[str] = []
+    missing = 0
+    for acc, bt in zip(accessions, biotypes):
+        if bt == "spike-in" or acc.upper().startswith("ERCC"):
+            out.append(f"{acc} (spike-in control)")
+            continue
+        key = re.sub(r"\.\d+$", "", acc)
+        name = name_by_id.get(key)
+        if not name:
+            missing += 1
+            name = acc
+        out.append(name)
+
+    adata.var["feature_name"] = np.array(out, dtype=object)
+    print(
+        f"Aligned feature_name from gene DB (tax_id={tax_id}, "
+        f"looked_up={len(name_by_id)}, missing_fallback_to_index={missing})",
+        flush=True,
+    )
+
+
 def _as_1d_object_strings(values) -> list[str]:
     import numpy as np
 
@@ -146,7 +281,7 @@ def extract_obs_var_obsm(ds):
     if "CellID" in ds.ca:
         obs_index = _as_1d_object_strings(ds.ca["CellID"])
     else:
-        obs_index = [str(i) for i in range(n_cells)]
+        raise ValueError("Loom is missing col_attrs/CellID (required for obs index)")
     if len(obs_index) != n_cells:
         raise ValueError(f"CellID length {len(obs_index)} != n_cells {n_cells}")
     obs = pd.DataFrame(obs_data, index=pd.Index(obs_index, name="CellID"))
@@ -156,17 +291,20 @@ def extract_obs_var_obsm(ds):
         vals = np.asarray(ds.ra[key])
         if vals.ndim != 1:
             raise ValueError(f"Unsupported ra[{key!r}] ndim={vals.ndim}")
-        if key in {"Gene", "var_names", "gene_names", "GeneName"}:
+        if key in {"Accession", "var_names", "gene_ids"}:
             continue
         var_data[key] = vals
 
-    if "Gene" in ds.ra:
-        var_index = _as_1d_object_strings(ds.ra["Gene"])
-    else:
-        var_index = [str(i) for i in range(n_genes)]
+    if "Accession" not in ds.ra:
+        raise ValueError("Loom is missing row_attrs/Accession (required for var index / scFAIR)")
+    var_index = _as_1d_object_strings(ds.ra["Accession"])
     if len(var_index) != n_genes:
-        raise ValueError(f"Gene length {len(var_index)} != n_genes {n_genes}")
-    var = pd.DataFrame(var_data, index=pd.Index(var_index, name="Gene"))
+        raise ValueError(f"Accession length {len(var_index)} != n_genes {n_genes}")
+    if len(set(var_index)) != n_genes:
+        raise ValueError(
+            f"Accession values are not unique ({len(set(var_index))} unique / {n_genes})"
+        )
+    var = pd.DataFrame(var_data, index=pd.Index(var_index, name="Accession"))
 
     return obs, var, obsm
 
@@ -249,6 +387,7 @@ def convert_chunked(
     *,
     chunk_cells: int,
     tmp_parent: str,
+    dburl: str,
 ) -> tuple[int, int]:
     import anndata as ad
     import h5py
@@ -337,6 +476,8 @@ def convert_chunked(
                 merged.obsm[key] = np.asarray(arr)
             if layer_scratch is not None:
                 merged.layers["X"] = _csr_from_scratch(layer_scratch, n_cells, n_genes)
+            copy_loom_attrs_to_uns(loom_file, merged)
+            align_feature_name_to_gene_db(merged, dburl=dburl)
             merged.write_h5ad(h5ad_file)
             del merged
             gc.collect()
@@ -358,6 +499,11 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=int(os.environ.get("LOOM_TO_H5AD_CHUNK_CELLS", "2000")),
         help="Cells per chunk (default 2000, or LOOM_TO_H5AD_CHUNK_CELLS)",
+    )
+    parser.add_argument(
+        "--dburl",
+        required=True,
+        help="ASAP gene DB HOST:PORT/DBNAME (same as parse.v8.py --dburl)",
     )
     args = parser.parse_args(argv)
 
@@ -384,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
             h5ad_file,
             chunk_cells=args.chunk_cells,
             tmp_parent=output_dir,
+            dburl=args.dburl,
         )
     except Exception as exc:  # noqa: BLE001 - surface any convert failure in output.json
         fail(f"Loom to H5AD conversion failed: {exc}", output_json)
