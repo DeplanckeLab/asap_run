@@ -103,6 +103,37 @@ def install_loompy_none_attr_recovery() -> None:
     AttributeManager.__getattr__ = __getattr__  # type: ignore[method-assign]
 
 
+def drop_redundant_layer_x(adata) -> bool:
+    """Remove adata.layers['X'] when it is identical to adata.X.
+
+    ASAP looms often carry both /matrix and /layers/X with the same values.
+    read_loom maps both into X and layers['X'], doubling h5ad size. scFAIR
+    requires X, not a duplicate layers['X'].
+    """
+    from scipy import sparse
+
+    if "X" not in adata.layers:
+        return False
+
+    x = adata.X
+    layer = adata.layers["X"]
+    if not sparse.issparse(x):
+        x = sparse.csr_matrix(x)
+    else:
+        x = x.tocsr()
+    if not sparse.issparse(layer):
+        layer = sparse.csr_matrix(layer)
+    else:
+        layer = layer.tocsr()
+
+    if x.shape != layer.shape or (x != layer).nnz != 0:
+        return False
+
+    del adata.layers["X"]
+    print("Dropped redundant layers['X'] (identical to X)", flush=True)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Convert Loom to H5AD")
     parser.add_argument("-i", "--input", required=True, help="Absolute path to input .loom")
@@ -131,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         ad.settings.allow_write_nullable_strings = True
         print(f"Converting {loom_file} -> {h5ad_file}", flush=True)
         adata = read_loom(loom_file)
+        drop_redundant_layer_x(adata)
         adata.write_h5ad(h5ad_file)
     except Exception as exc:  # noqa: BLE001 - surface any convert failure in output.json
         fail(f"Loom to H5AD conversion failed: {exc}", output_json)

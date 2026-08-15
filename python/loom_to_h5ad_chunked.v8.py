@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Chunked Loom -> H5AD converter with bounded RAM (AnnData-native encoding).
 
-Does not replace loom_to_h5ad.v8.py. This variant streams cell chunks into
-temporary AnnData files, then stacks sparse X / obs / obsm / layers and writes
-the final .h5ad with AnnData.write_h5ad so encoding stays AnnData-compliant.
-Peak RAM is roughly one matrix chunk during conversion, then the stacked sparse
-CSR at assemble time (still far below a dense full-loom load).
+Does not replace loom_to_h5ad.v8.py. Streams cell chunks into on-disk CSR
+scratch, then builds one AnnData and write_h5ad. Peak RAM is about one full
+sparse X (plus layer X if present) at assemble/write time — not N chunk
+matrices plus a vstack copy.
 
 Mirrors anndata.io.read_loom conventions used by ASAP looms:
   - loom matrix is genes x cells; AnnData X is cells x genes (float32 CSR)
@@ -184,6 +183,66 @@ def read_matrix_chunk_csr(dataset, start: int, end: int):
     return sparse.csr_matrix(block.T)
 
 
+def _init_csr_scratch(hf, name: str, n_rows: int):
+    """Growing on-disk CSR buffers (avoids holding all chunk matrices in RAM)."""
+    g = hf.create_group(name)
+    g.create_dataset("data", shape=(0,), maxshape=(None,), dtype="float32", chunks=True)
+    g.create_dataset("indices", shape=(0,), maxshape=(None,), dtype="int32", chunks=True)
+    g.create_dataset(
+        "indptr",
+        shape=(n_rows + 1,),
+        dtype="int64",
+        fillvalue=0,
+    )
+    g.attrs["nnz"] = 0
+    g.attrs["n_rows_filled"] = 0
+    return g
+
+
+def _append_csr_chunk(group, X) -> None:
+    """Append one CSR block (rows) onto scratch datasets."""
+    import numpy as np
+
+    X = X.tocsr()
+    data = np.asarray(X.data, dtype=np.float32)
+    indices = np.asarray(X.indices, dtype=np.int32)
+    indptr = np.asarray(X.indptr, dtype=np.int64)
+
+    nnz0 = int(group.attrs["nnz"])
+    n_rows0 = int(group.attrs["n_rows_filled"])
+    n_new = int(X.shape[0])
+    if n_rows0 + n_new > group["indptr"].shape[0] - 1:
+        raise ValueError(
+            f"CSR scratch overflow: filled={n_rows0} + {n_new} "
+            f"> capacity={group['indptr'].shape[0] - 1}"
+        )
+
+    n_data = data.shape[0]
+    group["data"].resize((nnz0 + n_data,))
+    group["indices"].resize((nnz0 + n_data,))
+    group["data"][nnz0 : nnz0 + n_data] = data
+    group["indices"][nnz0 : nnz0 + n_data] = indices
+    # Skip indptr[0] (==0); offset remaining entries by existing nnz.
+    group["indptr"][n_rows0 + 1 : n_rows0 + n_new + 1] = indptr[1:] + nnz0
+    group.attrs["nnz"] = nnz0 + n_data
+    group.attrs["n_rows_filled"] = n_rows0 + n_new
+
+
+def _csr_from_scratch(group, n_rows: int, n_cols: int):
+    """Load one CSR from scratch (single final copy, not per-chunk list + vstack)."""
+    import numpy as np
+    from scipy import sparse
+
+    if int(group.attrs["n_rows_filled"]) != n_rows:
+        raise ValueError(
+            f"CSR row mismatch: filled={group.attrs['n_rows_filled']} expected={n_rows}"
+        )
+    data = np.asarray(group["data"][:], dtype=np.float32)
+    indices = np.asarray(group["indices"][:], dtype=np.int32)
+    indptr = np.asarray(group["indptr"][: n_rows + 1], dtype=np.int64)
+    return sparse.csr_matrix((data, indices, indptr), shape=(n_rows, n_cols))
+
+
 def convert_chunked(
     loom_file: str,
     h5ad_file: str,
@@ -209,81 +268,78 @@ def convert_chunked(
         raise ValueError("chunk_cells must be positive")
 
     tmp_dir = tempfile.mkdtemp(prefix="loom2h5ad_chunks_", dir=tmp_parent)
-    chunk_paths: list[str] = []
+    scratch_path = os.path.join(tmp_dir, "csr_scratch.h5")
     try:
-        with h5py.File(loom_file, "r") as hf:
-            if "matrix" not in hf:
-                raise ValueError("Loom file has no /matrix dataset")
-            matrix_ds = hf["matrix"]
-            layer_x_ds = hf["layers"]["X"] if "layers" in hf and "X" in hf["layers"] else None
+        with h5py.File(scratch_path, "w") as scratch:
+            x_scratch = _init_csr_scratch(scratch, "X", n_cells)
+            layer_scratch = None
 
-            n_chunks = (n_cells + chunk_cells - 1) // chunk_cells
-            for chunk_i, start in enumerate(range(0, n_cells, chunk_cells)):
-                end = min(start + chunk_cells, n_cells)
-                print(
-                    f"Chunk {chunk_i + 1}/{n_chunks}: cells [{start}:{end}) "
-                    f"({end - start} cells)",
-                    flush=True,
+            with h5py.File(loom_file, "r") as hf:
+                if "matrix" not in hf:
+                    raise ValueError("Loom file has no /matrix dataset")
+                matrix_ds = hf["matrix"]
+                layer_x_ds = (
+                    hf["layers"]["X"] if "layers" in hf and "X" in hf["layers"] else None
                 )
-                X = read_matrix_chunk_csr(matrix_ds, start, end)
-                adata_chunk = ad.AnnData(
-                    X=X,
-                    obs=obs.iloc[start:end].copy(deep=True),
-                    var=var.copy(deep=True),
-                )
-                for key, arr in obsm.items():
-                    adata_chunk.obsm[key] = np.asarray(arr[start:end])
-                if layer_x_ds is not None:
-                    adata_chunk.layers["X"] = read_matrix_chunk_csr(layer_x_ds, start, end)
+                layer_differs = False
 
-                chunk_path = os.path.join(tmp_dir, f"chunk_{chunk_i:05d}.h5ad")
-                adata_chunk.write_h5ad(chunk_path)
-                chunk_paths.append(chunk_path)
-                del adata_chunk, X
-                gc.collect()
+                n_chunks = (n_cells + chunk_cells - 1) // chunk_cells
+                for chunk_i, start in enumerate(range(0, n_cells, chunk_cells)):
+                    end = min(start + chunk_cells, n_cells)
+                    print(
+                        f"Chunk {chunk_i + 1}/{n_chunks}: cells [{start}:{end}) "
+                        f"({end - start} cells)",
+                        flush=True,
+                    )
+                    X = read_matrix_chunk_csr(matrix_ds, start, end)
+                    _append_csr_chunk(x_scratch, X)
+                    if layer_x_ds is not None and not layer_differs:
+                        L = read_matrix_chunk_csr(layer_x_ds, start, end)
+                        if (X != L).nnz != 0:
+                            layer_differs = True
+                            print(
+                                "loom layer 'X' differs from /matrix; "
+                                "will keep layers['X'] in h5ad",
+                                flush=True,
+                            )
+                        del L
+                    del X
+                    gc.collect()
 
-        if not chunk_paths:
-            raise ValueError("No chunks written")
+                if layer_x_ds is not None and layer_differs:
+                    layer_scratch = _init_csr_scratch(scratch, "layer_X", n_cells)
+                    print(
+                        f"Second pass: writing non-redundant loom layer 'X' "
+                        f"({n_chunks} chunks)",
+                        flush=True,
+                    )
+                    for chunk_i, start in enumerate(range(0, n_cells, chunk_cells)):
+                        end = min(start + chunk_cells, n_cells)
+                        L = read_matrix_chunk_csr(layer_x_ds, start, end)
+                        _append_csr_chunk(layer_scratch, L)
+                        del L
+                        gc.collect()
+                elif layer_x_ds is not None:
+                    print(
+                        "Skipping redundant loom layer 'X' (identical to /matrix)",
+                        flush=True,
+                    )
 
-        print(f"Assembling {len(chunk_paths)} chunks -> {h5ad_file}", flush=True)
-        if os.path.exists(h5ad_file):
-            os.remove(h5ad_file)
-        # Avoid anndata.concat here: ASAP looms often have duplicate Gene names,
-        # and concat reindexes var (InvalidIndexError). Chunks share identical var
-        # order, so stack X/obs/obsm/layers and reuse var from the first chunk.
-        from scipy import sparse
-        import pandas as pd
-
-        x_parts = []
-        obs_parts = []
-        obsm_parts: dict[str, list] = {}
-        layer_parts: dict[str, list] = {}
-        var = None
-        for path in chunk_paths:
-            piece = ad.read_h5ad(path)
-            if var is None:
-                var = piece.var.copy(deep=True)
-            x_parts.append(piece.X.tocsr())
-            obs_parts.append(piece.obs)
-            for key in piece.obsm.keys():
-                obsm_parts.setdefault(key, []).append(np.asarray(piece.obsm[key]))
-            for key in piece.layers.keys():
-                layer_parts.setdefault(key, []).append(piece.layers[key].tocsr())
-            del piece
-
-        merged = ad.AnnData(
-            X=sparse.vstack(x_parts, format="csr"),
-            obs=pd.concat(obs_parts, axis=0),
-            var=var,
-        )
-        for key, parts in obsm_parts.items():
-            merged.obsm[key] = np.concatenate(parts, axis=0)
-        for key, parts in layer_parts.items():
-            merged.layers[key] = sparse.vstack(parts, format="csr")
-        del x_parts, obs_parts, obsm_parts, layer_parts
-        merged.write_h5ad(h5ad_file)
-        del merged
-        gc.collect()
+            print(f"Assembling CSR from scratch -> {h5ad_file}", flush=True)
+            if os.path.exists(h5ad_file):
+                os.remove(h5ad_file)
+            # Reuse obs/var/obsm already in memory (no chunk reload / vstack of parts).
+            # Peak RAM is about one full sparse X (+ layer only if it differs).
+            X = _csr_from_scratch(x_scratch, n_cells, n_genes)
+            merged = ad.AnnData(X=X, obs=obs, var=var)
+            del X
+            for key, arr in obsm.items():
+                merged.obsm[key] = np.asarray(arr)
+            if layer_scratch is not None:
+                merged.layers["X"] = _csr_from_scratch(layer_scratch, n_cells, n_genes)
+            merged.write_h5ad(h5ad_file)
+            del merged
+            gc.collect()
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
