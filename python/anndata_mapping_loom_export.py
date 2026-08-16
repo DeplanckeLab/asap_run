@@ -233,10 +233,17 @@ def matrix_shape(hf: h5py.File, path: str) -> tuple[int, int]:
 
 
 def copy_loom_attrs_to_uns(loom_file: str, adata, mapping: dict[str, Any] | None = None) -> int:
-    """Copy loom /attrs/* into adata.uns; parse JSON keys listed in mapping."""
-    uns_json_keys = set()
-    if mapping and isinstance(mapping.get("uns_json_keys"), list):
-        uns_json_keys = {str(k) for k in mapping["uns_json_keys"]}
+    """Copy loom /attrs/* into adata.uns as decoded scalars / JSON text.
+
+    Keys listed in mapping['uns_json_keys'] (e.g. analysis_pipeline) stay as JSON
+    strings. Expanding them to nested dicts breaks anndata write_elem on typical
+    pipeline payloads (list-of-dicts with nulls / mixed parameter value types:
+    "Can't implicitly convert non-string objects to strings"). Consumers that
+    need structure should json.loads the string.
+
+    ``mapping`` is accepted for call-site compatibility; JSON keys are not expanded.
+    """
+    _ = mapping
 
     n = 0
     with h5py.File(loom_file, "r") as hf:
@@ -244,13 +251,7 @@ def copy_loom_attrs_to_uns(loom_file: str, adata, mapping: dict[str, Any] | None
             return 0
         for key in hf["attrs"].keys():
             raw = hf["attrs"][key][()]
-            value = _decode_scalar(raw)
-            if key in uns_json_keys and isinstance(value, str):
-                try:
-                    value = json.loads(value)
-                except json.JSONDecodeError:
-                    pass
-            adata.uns[key] = value
+            adata.uns[key] = _decode_scalar(raw)
             n += 1
     if n:
         print(f"Copied {n} loom /attrs keys into uns", flush=True)

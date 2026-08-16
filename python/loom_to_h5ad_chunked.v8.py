@@ -360,6 +360,25 @@ def _stream_csr_group_from_scratch(
         )
 
 
+def _h5ad_has_matrix_x(h5ad_file: str) -> bool:
+    """True when the file has a real AnnData X (CSR group or dense dataset)."""
+    import h5py
+
+    if not os.path.isfile(h5ad_file) or os.path.getsize(h5ad_file) <= 0:
+        return False
+    try:
+        with h5py.File(h5ad_file, "r") as f:
+            if "X" not in f:
+                return False
+            x = f["X"]
+            if isinstance(x, h5py.Dataset):
+                return x.size > 0
+            # CSR / CSC encoding
+            return "data" in x and "indices" in x and "indptr" in x
+    except OSError:
+        return False
+
+
 def _write_h5ad_streamed_from_scratch(
     h5ad_file: str,
     scratch_path: str,
@@ -375,7 +394,11 @@ def _write_h5ad_streamed_from_scratch(
     has_raw: bool,
     layer_names: list[str],
 ) -> None:
-    """Write metadata via write_elem, then stream CSR matrices from scratch."""
+    """Write metadata via write_elem, then stream CSR matrices from scratch.
+
+    Writes to ``h5ad_file + ".partial"`` and renames only after X is present, so a
+    failed mid-write cannot leave a metadata-only file that looks "ready".
+    """
     import anndata as ad
     import h5py
     import numpy as np
@@ -384,6 +407,9 @@ def _write_h5ad_streamed_from_scratch(
     from scipy import sparse
 
     ad.settings.allow_write_nullable_strings = True
+    partial_file = f"{h5ad_file}.partial"
+    if os.path.exists(partial_file):
+        os.remove(partial_file)
 
     # Placeholder X is never written; only obs/var/uns/obsm/varm go through write_elem.
     shell = ad.AnnData(
@@ -398,59 +424,68 @@ def _write_h5ad_streamed_from_scratch(
     copy_loom_attrs_to_uns(loom_file, shell, mapping)
     require_feature_name_from_loom(shell)
 
-    if os.path.exists(h5ad_file):
-        os.remove(h5ad_file)
+    try:
+        dataset_kwargs = {"compression": "gzip"}
+        with h5py.File(partial_file, "w") as f:
+            f.attrs["encoding-type"] = "anndata"
+            f.attrs["encoding-version"] = "0.1.0"
+            write_elem(f, "obs", shell.obs, dataset_kwargs=dataset_kwargs)
+            write_elem(f, "var", shell.var, dataset_kwargs=dataset_kwargs)
+            write_elem(f, "uns", dict(shell.uns), dataset_kwargs=dataset_kwargs)
+            if len(shell.obsm):
+                write_elem(f, "obsm", dict(shell.obsm), dataset_kwargs=dataset_kwargs)
+            if len(shell.varm):
+                write_elem(f, "varm", dict(shell.varm), dataset_kwargs=dataset_kwargs)
+            if has_raw:
+                raw_g = f.create_group("raw")
+                raw_g.attrs["encoding-type"] = "raw"
+                raw_g.attrs["encoding-version"] = "0.1.0"
+                # Match previous behavior: raw.var is a copy of var.
+                write_elem(raw_g, "var", shell.var, dataset_kwargs=dataset_kwargs)
+            if layer_names:
+                layers_g = f.create_group("layers")
+                layers_g.attrs["encoding-type"] = "dict"
+                layers_g.attrs["encoding-version"] = "0.1.0"
 
-    dataset_kwargs = {"compression": "gzip"}
-    with h5py.File(h5ad_file, "w") as f:
-        f.attrs["encoding-type"] = "anndata"
-        f.attrs["encoding-version"] = "0.1.0"
-        write_elem(f, "obs", shell.obs, dataset_kwargs=dataset_kwargs)
-        write_elem(f, "var", shell.var, dataset_kwargs=dataset_kwargs)
-        write_elem(f, "uns", dict(shell.uns), dataset_kwargs=dataset_kwargs)
-        if len(shell.obsm):
-            write_elem(f, "obsm", dict(shell.obsm), dataset_kwargs=dataset_kwargs)
-        if len(shell.varm):
-            write_elem(f, "varm", dict(shell.varm), dataset_kwargs=dataset_kwargs)
-        if has_raw:
-            raw_g = f.create_group("raw")
-            raw_g.attrs["encoding-type"] = "raw"
-            raw_g.attrs["encoding-version"] = "0.1.0"
-            # Match previous behavior: raw.var is a copy of var.
-            write_elem(raw_g, "var", shell.var, dataset_kwargs=dataset_kwargs)
-        if layer_names:
-            layers_g = f.create_group("layers")
-            layers_g.attrs["encoding-type"] = "dict"
-            layers_g.attrs["encoding-version"] = "0.1.0"
+        del shell
+        gc.collect()
 
-    del shell
-    gc.collect()
-
-    with h5py.File(scratch_path, "r") as scratch:
-        print(f"Streaming CSR X -> {h5ad_file}", flush=True)
-        _stream_csr_group_from_scratch(
-            scratch["X"], h5ad_file, "X", n_cells, n_genes, compression="gzip"
-        )
-        if has_raw:
-            print(f"Streaming CSR raw/X -> {h5ad_file}", flush=True)
+        with h5py.File(scratch_path, "r") as scratch:
+            print(f"Streaming CSR X -> {partial_file}", flush=True)
             _stream_csr_group_from_scratch(
-                scratch["extra___raw__"],
-                h5ad_file,
-                "raw/X",
-                n_cells,
-                n_genes,
-                compression="gzip",
+                scratch["X"], partial_file, "X", n_cells, n_genes, compression="gzip"
             )
-        for name in layer_names:
-            print(f"Streaming CSR layers[{name!r}] -> {h5ad_file}", flush=True)
-            _stream_csr_group_from_scratch(
-                scratch[f"extra_{name}"],
-                h5ad_file,
-                f"layers/{name}",
-                n_cells,
-                n_genes,
-                compression="gzip",
+            if has_raw:
+                print(f"Streaming CSR raw/X -> {partial_file}", flush=True)
+                _stream_csr_group_from_scratch(
+                    scratch["extra___raw__"],
+                    partial_file,
+                    "raw/X",
+                    n_cells,
+                    n_genes,
+                    compression="gzip",
+                )
+            for name in layer_names:
+                print(f"Streaming CSR layers[{name!r}] -> {partial_file}", flush=True)
+                _stream_csr_group_from_scratch(
+                    scratch[f"extra_{name}"],
+                    partial_file,
+                    f"layers/{name}",
+                    n_cells,
+                    n_genes,
+                    compression="gzip",
+                )
+
+        if not _h5ad_has_matrix_x(partial_file):
+            raise RuntimeError(
+                f"H5AD partial write finished without matrix X: {partial_file}"
             )
+
+        os.replace(partial_file, h5ad_file)
+    except Exception:
+        if os.path.exists(partial_file):
+            os.remove(partial_file)
+        raise
 
 
 def convert_chunked(
@@ -606,10 +641,22 @@ def main(argv: list[str] | None = None) -> int:
             tmp_parent=output_dir,
         )
     except Exception as exc:  # noqa: BLE001 - surface any convert failure in output.json
+        for path in (h5ad_file, f"{h5ad_file}.partial"):
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         fail(f"Loom to H5AD conversion failed: {exc}", output_json)
 
     if not os.path.isfile(h5ad_file) or os.path.getsize(h5ad_file) <= 0:
         fail("H5AD output was not written or is empty", output_json)
+    if not _h5ad_has_matrix_x(h5ad_file):
+        try:
+            os.remove(h5ad_file)
+        except OSError:
+            pass
+        fail("H5AD output is missing matrix X (incomplete write)", output_json)
 
     payload = {
         "status": "success",

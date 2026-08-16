@@ -236,6 +236,16 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isfile(h5ad_file) or os.path.getsize(h5ad_file) <= 0:
         fail("H5AD output was not written or is empty", output_json)
 
+    import h5py
+
+    with h5py.File(h5ad_file, "r") as hf:
+        if "X" not in hf:
+            try:
+                os.remove(h5ad_file)
+            except OSError:
+                pass
+            fail("H5AD output is missing matrix X (incomplete write)", output_json)
+
     payload = {
         "status": "success",
         "input_loom": loom_file,
