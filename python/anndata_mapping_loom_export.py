@@ -116,6 +116,19 @@ def _as_1d_strings(values) -> list[str]:
     return out
 
 
+def _pandas_index_name_for_h5ad(h5ad_index_key: str | None) -> str | None:
+    """Map anndata_mapping h5ad_*_index_key to pandas Index.name for AnnData write.
+
+    AnnData stores an unnamed index as the dataset ``_index`` (CellXGene default).
+    A non-``_index`` name becomes that dataset name and must then appear in
+    column-order for ASAP scFAIR checks.
+    """
+    key = (h5ad_index_key or "_index").strip() or "_index"
+    if key == "_index":
+        return None
+    return key
+
+
 def build_obs_var_obsm_varm(hf: h5py.File, mapping: dict[str, Any], n_genes: int, n_cells: int):
     """Build obs/var/obsm/varm from mapping (+ 1D attrs under obs_path/var_path)."""
     import pandas as pd
@@ -124,6 +137,8 @@ def build_obs_var_obsm_varm(hf: h5py.File, mapping: dict[str, Any], n_genes: int
     var_path = mapping.get("var_path") or "/row_attrs"
     obs_index_key = mapping.get("obs_index_key") or "CellID"
     var_index_key = mapping.get("var_index_key") or "Accession"
+    h5ad_obs_index_key = mapping.get("h5ad_obs_index_key") or "_index"
+    h5ad_var_index_key = mapping.get("h5ad_var_index_key") or "_index"
     obsm_map = mapping.get("obsm") if isinstance(mapping.get("obsm"), dict) else {}
     varm_map = mapping.get("varm") if isinstance(mapping.get("varm"), dict) else {}
     categoricals = mapping.get("categoricals") if isinstance(mapping.get("categoricals"), dict) else {}
@@ -179,8 +194,16 @@ def build_obs_var_obsm_varm(hf: h5py.File, mapping: dict[str, Any], n_genes: int
             continue
         var_data[key] = vals
 
-    obs = pd.DataFrame(obs_data, index=pd.Index(obs_index, name=obs_index_key))
-    var = pd.DataFrame(var_data, index=pd.Index(var_index, name=var_index_key))
+    # Loom supplies values via obs_index_key/var_index_key; H5AD index dataset
+    # names come from h5ad_*_index_key (default _index, matching CellXGene).
+    obs = pd.DataFrame(
+        obs_data,
+        index=pd.Index(obs_index, name=_pandas_index_name_for_h5ad(h5ad_obs_index_key)),
+    )
+    var = pd.DataFrame(
+        var_data,
+        index=pd.Index(var_index, name=_pandas_index_name_for_h5ad(h5ad_var_index_key)),
+    )
 
     for key, cat_meta in categoricals.items():
         if key not in obs.columns and key not in var.columns:
@@ -372,11 +395,13 @@ def apply_mapping_embeddings_to_adata(adata, loom_file: str, mapping: dict[str, 
 
 
 def reindex_from_mapping(adata, loom_file: str, mapping: dict[str, Any]) -> None:
-    """Ensure obs/var index keys match the mapping."""
+    """Ensure obs/var index values match the loom mapping; H5AD names use h5ad_* keys."""
     import pandas as pd
 
     obs_index_key = mapping.get("obs_index_key") or "CellID"
     var_index_key = mapping.get("var_index_key") or "Accession"
+    h5ad_obs_index_key = mapping.get("h5ad_obs_index_key") or "_index"
+    h5ad_var_index_key = mapping.get("h5ad_var_index_key") or "_index"
     obs_path = mapping.get("obs_path") or "/col_attrs"
     var_path = mapping.get("var_path") or "/row_attrs"
 
@@ -391,8 +416,12 @@ def reindex_from_mapping(adata, loom_file: str, mapping: dict[str, Any]) -> None
     if len(var_index) != adata.n_vars:
         raise ValueError(f"{var_index_key} length {len(var_index)} != n_vars {adata.n_vars}")
 
-    adata.obs_names = pd.Index(obs_index, name=obs_index_key)
-    adata.var_names = pd.Index(var_index, name=var_index_key)
+    adata.obs_names = pd.Index(
+        obs_index, name=_pandas_index_name_for_h5ad(h5ad_obs_index_key)
+    )
+    adata.var_names = pd.Index(
+        var_index, name=_pandas_index_name_for_h5ad(h5ad_var_index_key)
+    )
     if obs_index_key in adata.obs.columns:
         adata.obs.drop(columns=[obs_index_key], inplace=True)
     if var_index_key in adata.var.columns:

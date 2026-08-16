@@ -188,7 +188,7 @@ def extract_obs_var_obsm(ds):
         raise ValueError("Loom is missing col_attrs/CellID (required for obs index)")
     if len(obs_index) != n_cells:
         raise ValueError(f"CellID length {len(obs_index)} != n_cells {n_cells}")
-    obs = pd.DataFrame(obs_data, index=pd.Index(obs_index, name="CellID"))
+    obs = pd.DataFrame(obs_data, index=pd.Index(obs_index, name=None))
 
     var_data: dict = {}
     for key in ds.ra.keys():
@@ -208,7 +208,7 @@ def extract_obs_var_obsm(ds):
         raise ValueError(
             f"Accession values are not unique ({len(set(var_index))} unique / {n_genes})"
         )
-    var = pd.DataFrame(var_data, index=pd.Index(var_index, name="Accession"))
+    var = pd.DataFrame(var_data, index=pd.Index(var_index, name=None))
 
     return obs, var, obsm
 
