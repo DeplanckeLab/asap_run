@@ -295,39 +295,68 @@ def convert_chunked(
     *,
     chunk_cells: int,
     tmp_parent: str,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict]:
     import anndata as ad
     import h5py
-    import loompy
     import numpy as np
+    from anndata_mapping_loom_export import (
+        build_obs_var_obsm_varm,
+        copy_loom_attrs_to_uns,
+        load_anndata_mapping,
+        matrix_shape,
+        read_matrix_csr_cells_by_genes,
+        resolve_dataset,
+    )
 
     ad.settings.allow_write_nullable_strings = True
     install_loompy_none_attr_recovery()
 
-    with loompy.connect(loom_file, mode="r") as ds:
-        n_genes, n_cells = (int(ds.shape[0]), int(ds.shape[1]))
-        if n_genes <= 0 or n_cells <= 0:
-            raise ValueError(f"Invalid loom shape {ds.shape}")
-        obs, var, obsm = extract_obs_var_obsm(ds)
+    mapping = load_anndata_mapping(loom_file)
+    x_path = str(mapping["x_path"])
+    raw_x_path = mapping.get("raw_x_path")
+    raw_x_path = str(raw_x_path) if raw_x_path else None
+    layers_map = mapping.get("layers") if isinstance(mapping.get("layers"), dict) else {}
+
+    with h5py.File(loom_file, "r") as hf:
+        n_genes, n_cells = matrix_shape(hf, x_path)
+        obs, var, obsm, varm = build_obs_var_obsm_varm(hf, mapping, n_genes, n_cells)
 
     if chunk_cells <= 0:
         raise ValueError("chunk_cells must be positive")
+
+    print(
+        f"Using anndata_mapping x_path={x_path} raw_x_path={raw_x_path} "
+        f"layers={list(layers_map.keys())}",
+        flush=True,
+    )
+
+    # Extra matrices to stream: declared layers + raw (not X).
+    extra_paths: list[tuple[str, str]] = []
+    used = {x_path}
+    if raw_x_path and raw_x_path not in used:
+        extra_paths.append(("__raw__", raw_x_path))
+        used.add(raw_x_path)
+    for layer_name, layer_path in layers_map.items():
+        layer_path = str(layer_path)
+        if layer_path in used:
+            continue
+        extra_paths.append((str(layer_name), layer_path))
+        used.add(layer_path)
 
     tmp_dir = tempfile.mkdtemp(prefix="loom2h5ad_chunks_", dir=tmp_parent)
     scratch_path = os.path.join(tmp_dir, "csr_scratch.h5")
     try:
         with h5py.File(scratch_path, "w") as scratch:
             x_scratch = _init_csr_scratch(scratch, "X", n_cells)
-            layer_scratch = None
+            extra_scratches: dict[str, object] = {}
 
             with h5py.File(loom_file, "r") as hf:
-                if "matrix" not in hf:
-                    raise ValueError("Loom file has no /matrix dataset")
-                matrix_ds = hf["matrix"]
-                layer_x_ds = (
-                    hf["layers"]["X"] if "layers" in hf and "X" in hf["layers"] else None
-                )
-                layer_differs = False
+                x_ds = resolve_dataset(hf, x_path)
+                extra_dss = {
+                    name: resolve_dataset(hf, path) for name, path in extra_paths
+                }
+                for name, _path in extra_paths:
+                    extra_scratches[name] = _init_csr_scratch(scratch, f"extra_{name}", n_cells)
 
                 n_chunks = (n_cells + chunk_cells - 1) // chunk_cells
                 for chunk_i, start in enumerate(range(0, n_cells, chunk_cells)):
@@ -337,62 +366,45 @@ def convert_chunked(
                         f"({end - start} cells)",
                         flush=True,
                     )
-                    X = read_matrix_chunk_csr(matrix_ds, start, end)
+                    X = read_matrix_csr_cells_by_genes(x_ds, start, end)
                     _append_csr_chunk(x_scratch, X)
-                    if layer_x_ds is not None and not layer_differs:
-                        L = read_matrix_chunk_csr(layer_x_ds, start, end)
-                        if (X != L).nnz != 0:
-                            layer_differs = True
-                            print(
-                                "loom layer 'X' differs from /matrix; "
-                                "will keep layers['X'] in h5ad",
-                                flush=True,
-                            )
-                        del L
+                    for name, ds in extra_dss.items():
+                        block = read_matrix_csr_cells_by_genes(ds, start, end)
+                        _append_csr_chunk(extra_scratches[name], block)
+                        del block
                     del X
                     gc.collect()
-
-                if layer_x_ds is not None and layer_differs:
-                    layer_scratch = _init_csr_scratch(scratch, "layer_X", n_cells)
-                    print(
-                        f"Second pass: writing non-redundant loom layer 'X' "
-                        f"({n_chunks} chunks)",
-                        flush=True,
-                    )
-                    for chunk_i, start in enumerate(range(0, n_cells, chunk_cells)):
-                        end = min(start + chunk_cells, n_cells)
-                        L = read_matrix_chunk_csr(layer_x_ds, start, end)
-                        _append_csr_chunk(layer_scratch, L)
-                        del L
-                        gc.collect()
-                elif layer_x_ds is not None:
-                    print(
-                        "Skipping redundant loom layer 'X' (identical to /matrix)",
-                        flush=True,
-                    )
 
             print(f"Assembling CSR from scratch -> {h5ad_file}", flush=True)
             if os.path.exists(h5ad_file):
                 os.remove(h5ad_file)
-            # Reuse obs/var/obsm already in memory (no chunk reload / vstack of parts).
-            # Peak RAM is about one full sparse X (+ layer only if it differs).
             X = _csr_from_scratch(x_scratch, n_cells, n_genes)
             merged = ad.AnnData(X=X, obs=obs, var=var)
             del X
             for key, arr in obsm.items():
                 merged.obsm[key] = np.asarray(arr)
-            if layer_scratch is not None:
-                merged.layers["X"] = _csr_from_scratch(layer_scratch, n_cells, n_genes)
-            copy_loom_attrs_to_uns(loom_file, merged)
+            for key, arr in varm.items():
+                merged.varm[key] = np.asarray(arr)
+
+            if "__raw__" in extra_scratches:
+                raw_X = _csr_from_scratch(extra_scratches["__raw__"], n_cells, n_genes)
+                merged.raw = ad.AnnData(X=raw_X, var=merged.var.copy())
+                del raw_X
+
+            for name, group in extra_scratches.items():
+                if name == "__raw__":
+                    continue
+                merged.layers[name] = _csr_from_scratch(group, n_cells, n_genes)
+
+            copy_loom_attrs_to_uns(loom_file, merged, mapping)
             require_feature_name_from_loom(merged)
-            # gzip is HDF5-native (scFAIR-safe); shrinks CSR X/layers vs uncompressed default.
             merged.write_h5ad(h5ad_file, compression="gzip")
             del merged
             gc.collect()
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return n_cells, n_genes
+    return n_cells, n_genes, mapping
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -429,12 +441,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         apply_numpy_compat()
+        import numpy as np  # noqa: F401 - used by convert_chunked assembly
+
         print(
             f"Converting {loom_file} -> {h5ad_file} "
             f"(chunk_cells={args.chunk_cells}, converter=chunked)",
             flush=True,
         )
-        n_obs, n_vars = convert_chunked(
+        n_obs, n_vars, mapping = convert_chunked(
             loom_file,
             h5ad_file,
             chunk_cells=args.chunk_cells,
@@ -454,7 +468,9 @@ def main(argv: list[str] | None = None) -> int:
         "n_obs": int(n_obs),
         "n_vars": int(n_vars),
         "chunk_cells": int(args.chunk_cells),
-        "converter": "chunked_anndata_concat",
+        "converter": "chunked_anndata_mapping",
+        "anndata_mapping_x_path": mapping.get("x_path"),
+        "anndata_mapping_raw_x_path": mapping.get("raw_x_path"),
     }
     write_output_json(output_json, payload)
     print(

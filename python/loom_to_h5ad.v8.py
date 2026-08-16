@@ -210,14 +210,23 @@ def main(argv: list[str] | None = None) -> int:
         import loompy  # noqa: F401 - load before patching AttributeManager
         import anndata as ad
         from anndata.io import read_loom
+        from anndata_mapping_loom_export import apply_anndata_mapping, load_anndata_mapping
 
         install_loompy_none_attr_recovery()
         ad.settings.allow_write_nullable_strings = True
+        mapping = load_anndata_mapping(loom_file)
+        obs_names = mapping.get("obs_index_key") or "CellID"
+        var_names = mapping.get("var_index_key") or "Accession"
         print(f"Converting {loom_file} -> {h5ad_file}", flush=True)
-        # scFAIR: obs index = CellID, var index = Accession (Ensembl), not Gene symbols.
-        adata = read_loom(loom_file, obs_names="CellID", var_names="Accession")
-        drop_redundant_layer_x(adata)
-        copy_loom_attrs_to_uns(loom_file, adata)
+        print(
+            f"Using anndata_mapping x_path={mapping.get('x_path')} "
+            f"raw_x_path={mapping.get('raw_x_path')} "
+            f"obs_index={obs_names} var_index={var_names}",
+            flush=True,
+        )
+        # Initial load; matrix roles / embeddings / uns are corrected from mapping next.
+        adata = read_loom(loom_file, obs_names=obs_names, var_names=var_names)
+        apply_anndata_mapping(adata, loom_file, mapping)
         require_feature_name_from_loom(adata)
         # gzip is HDF5-native (scFAIR-safe); shrinks CSR X/layers vs uncompressed default.
         adata.write_h5ad(h5ad_file, compression="gzip")
@@ -234,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         "output_h5ad_bytes": os.path.getsize(h5ad_file),
         "n_obs": int(getattr(adata, "n_obs", 0)),
         "n_vars": int(getattr(adata, "n_vars", 0)),
+        "anndata_mapping_x_path": mapping.get("x_path"),
+        "anndata_mapping_raw_x_path": mapping.get("raw_x_path"),
     }
     write_output_json(output_json, payload)
     print(
