@@ -2,15 +2,11 @@
 """Chunked Loom -> H5AD converter with bounded RAM (AnnData-native encoding).
 
 Does not replace loom_to_h5ad.v8.py. Streams cell chunks into on-disk CSR
-scratch, then builds one AnnData and write_h5ad. Peak RAM is about one full
-sparse X (plus layer X if present) at assemble/write time — not N chunk
-matrices plus a vstack copy.
+scratch, then writes the h5ad shell (obs/var/uns/obsm/varm) and streams CSR
+arrays (X, raw/X, layers/*) from scratch into the file. Peak RAM stays near
+one chunk plus metadata — not a full sparse X at assemble/write time.
 
-Mirrors anndata.io.read_loom conventions used by ASAP looms:
-  - loom matrix is genes x cells; AnnData X is cells x genes (float32 CSR)
-  - CellID -> obs index; Accession -> var index (scFAIR); Gene kept as var column
-  - 1D col/row attrs -> obs/var columns; 2D col attrs -> obsm
-  - named loom layer "X" -> adata.layers["X"] when present and not identical to /matrix
+Uses /attrs/anndata_mapping for matrix roles (X / raw / layers) and indices.
 
 CLI is compatible with loom_to_h5ad.v8.py (-i/-o/-d) plus --chunk-cells.
 """
@@ -274,19 +270,187 @@ def _append_csr_chunk(group, X) -> None:
     group.attrs["n_rows_filled"] = n_rows0 + n_new
 
 
-def _csr_from_scratch(group, n_rows: int, n_cols: int):
-    """Load one CSR from scratch (single final copy, not per-chunk list + vstack)."""
+def _h5_copy_dataset_chunked(
+    src,
+    dst_group,
+    name: str,
+    *,
+    dtype,
+    compression: str | None = "gzip",
+    chunk_elems: int = 2_000_000,
+) -> None:
+    """Copy a 1D HDF5 dataset in bounded slices (no full-array materialization)."""
     import numpy as np
+
+    n = int(src.shape[0])
+    if n == 0:
+        chunks = (1024,)
+    else:
+        chunks = (min(chunk_elems, n),)
+    kwargs: dict = {
+        "shape": (n,),
+        "maxshape": (None,),
+        "dtype": dtype,
+        "chunks": chunks,
+    }
+    if compression is not None:
+        kwargs["compression"] = compression
+    dst = dst_group.create_dataset(name, **kwargs)
+    if n == 0:
+        return
+    for start in range(0, n, chunk_elems):
+        end = min(start + chunk_elems, n)
+        dst[start:end] = np.asarray(src[start:end], dtype=dtype)
+
+
+def _stream_csr_group_from_scratch(
+    scratch_group,
+    h5ad_path: str,
+    key: str,
+    n_rows: int,
+    n_cols: int,
+    *,
+    compression: str | None = "gzip",
+) -> None:
+    """Write an AnnData CSR group by streaming scratch datasets (bounded RAM)."""
+    import h5py
+
+    if int(scratch_group.attrs["n_rows_filled"]) != n_rows:
+        raise ValueError(
+            f"CSR row mismatch: filled={scratch_group.attrs['n_rows_filled']} "
+            f"expected={n_rows}"
+        )
+
+    parts = [p for p in key.split("/") if p]
+    if not parts:
+        raise ValueError(f"Invalid CSR key: {key!r}")
+
+    with h5py.File(h5ad_path, "a") as out:
+        parent = out
+        for part in parts[:-1]:
+            if part not in parent:
+                raise ValueError(
+                    f"Missing parent group {part!r} while writing {key!r}; "
+                    "create encoding attrs before streaming CSR"
+                )
+            parent = parent[part]
+        name = parts[-1]
+        if name in parent:
+            del parent[name]
+        g = parent.create_group(name)
+        g.attrs["encoding-type"] = "csr_matrix"
+        g.attrs["encoding-version"] = "0.1.0"
+        g.attrs["shape"] = [int(n_rows), int(n_cols)]
+        _h5_copy_dataset_chunked(
+            scratch_group["data"], g, "data", dtype="float32", compression=compression
+        )
+        _h5_copy_dataset_chunked(
+            scratch_group["indices"],
+            g,
+            "indices",
+            dtype="int32",
+            compression=compression,
+        )
+        _h5_copy_dataset_chunked(
+            scratch_group["indptr"],
+            g,
+            "indptr",
+            dtype="int64",
+            compression=compression,
+        )
+
+
+def _write_h5ad_streamed_from_scratch(
+    h5ad_file: str,
+    scratch_path: str,
+    *,
+    obs,
+    var,
+    obsm: dict,
+    varm: dict,
+    loom_file: str,
+    mapping: dict,
+    n_cells: int,
+    n_genes: int,
+    has_raw: bool,
+    layer_names: list[str],
+) -> None:
+    """Write metadata via write_elem, then stream CSR matrices from scratch."""
+    import anndata as ad
+    import h5py
+    import numpy as np
+    from anndata.io import write_elem
+    from anndata_mapping_loom_export import copy_loom_attrs_to_uns
     from scipy import sparse
 
-    if int(group.attrs["n_rows_filled"]) != n_rows:
-        raise ValueError(
-            f"CSR row mismatch: filled={group.attrs['n_rows_filled']} expected={n_rows}"
+    ad.settings.allow_write_nullable_strings = True
+
+    # Placeholder X is never written; only obs/var/uns/obsm/varm go through write_elem.
+    shell = ad.AnnData(
+        X=sparse.csr_matrix((n_cells, n_genes), dtype=np.float32),
+        obs=obs,
+        var=var,
+    )
+    for key, arr in obsm.items():
+        shell.obsm[key] = np.asarray(arr)
+    for key, arr in varm.items():
+        shell.varm[key] = np.asarray(arr)
+    copy_loom_attrs_to_uns(loom_file, shell, mapping)
+    require_feature_name_from_loom(shell)
+
+    if os.path.exists(h5ad_file):
+        os.remove(h5ad_file)
+
+    dataset_kwargs = {"compression": "gzip"}
+    with h5py.File(h5ad_file, "w") as f:
+        f.attrs["encoding-type"] = "anndata"
+        f.attrs["encoding-version"] = "0.1.0"
+        write_elem(f, "obs", shell.obs, dataset_kwargs=dataset_kwargs)
+        write_elem(f, "var", shell.var, dataset_kwargs=dataset_kwargs)
+        write_elem(f, "uns", dict(shell.uns), dataset_kwargs=dataset_kwargs)
+        if len(shell.obsm):
+            write_elem(f, "obsm", dict(shell.obsm), dataset_kwargs=dataset_kwargs)
+        if len(shell.varm):
+            write_elem(f, "varm", dict(shell.varm), dataset_kwargs=dataset_kwargs)
+        if has_raw:
+            raw_g = f.create_group("raw")
+            raw_g.attrs["encoding-type"] = "raw"
+            raw_g.attrs["encoding-version"] = "0.1.0"
+            # Match previous behavior: raw.var is a copy of var.
+            write_elem(raw_g, "var", shell.var, dataset_kwargs=dataset_kwargs)
+        if layer_names:
+            layers_g = f.create_group("layers")
+            layers_g.attrs["encoding-type"] = "dict"
+            layers_g.attrs["encoding-version"] = "0.1.0"
+
+    del shell
+    gc.collect()
+
+    with h5py.File(scratch_path, "r") as scratch:
+        print(f"Streaming CSR X -> {h5ad_file}", flush=True)
+        _stream_csr_group_from_scratch(
+            scratch["X"], h5ad_file, "X", n_cells, n_genes, compression="gzip"
         )
-    data = np.asarray(group["data"][:], dtype=np.float32)
-    indices = np.asarray(group["indices"][:], dtype=np.int32)
-    indptr = np.asarray(group["indptr"][: n_rows + 1], dtype=np.int64)
-    return sparse.csr_matrix((data, indices, indptr), shape=(n_rows, n_cols))
+        if has_raw:
+            print(f"Streaming CSR raw/X -> {h5ad_file}", flush=True)
+            _stream_csr_group_from_scratch(
+                scratch["extra___raw__"],
+                h5ad_file,
+                "raw/X",
+                n_cells,
+                n_genes,
+                compression="gzip",
+            )
+        for name in layer_names:
+            print(f"Streaming CSR layers[{name!r}] -> {h5ad_file}", flush=True)
+            _stream_csr_group_from_scratch(
+                scratch[f"extra_{name}"],
+                h5ad_file,
+                f"layers/{name}",
+                n_cells,
+                n_genes,
+                compression="gzip",
+            )
 
 
 def convert_chunked(
@@ -296,19 +460,15 @@ def convert_chunked(
     chunk_cells: int,
     tmp_parent: str,
 ) -> tuple[int, int, dict]:
-    import anndata as ad
     import h5py
-    import numpy as np
     from anndata_mapping_loom_export import (
         build_obs_var_obsm_varm,
-        copy_loom_attrs_to_uns,
         load_anndata_mapping,
         matrix_shape,
         read_matrix_csr_cells_by_genes,
         resolve_dataset,
     )
 
-    ad.settings.allow_write_nullable_strings = True
     install_loompy_none_attr_recovery()
 
     mapping = load_anndata_mapping(loom_file)
@@ -375,32 +535,25 @@ def convert_chunked(
                     del X
                     gc.collect()
 
-            print(f"Assembling CSR from scratch -> {h5ad_file}", flush=True)
-            if os.path.exists(h5ad_file):
-                os.remove(h5ad_file)
-            X = _csr_from_scratch(x_scratch, n_cells, n_genes)
-            merged = ad.AnnData(X=X, obs=obs, var=var)
-            del X
-            for key, arr in obsm.items():
-                merged.obsm[key] = np.asarray(arr)
-            for key, arr in varm.items():
-                merged.varm[key] = np.asarray(arr)
+        has_raw = "__raw__" in extra_scratches
+        layer_names = [name for name in extra_scratches if name != "__raw__"]
 
-            if "__raw__" in extra_scratches:
-                raw_X = _csr_from_scratch(extra_scratches["__raw__"], n_cells, n_genes)
-                merged.raw = ad.AnnData(X=raw_X, var=merged.var.copy())
-                del raw_X
-
-            for name, group in extra_scratches.items():
-                if name == "__raw__":
-                    continue
-                merged.layers[name] = _csr_from_scratch(group, n_cells, n_genes)
-
-            copy_loom_attrs_to_uns(loom_file, merged, mapping)
-            require_feature_name_from_loom(merged)
-            merged.write_h5ad(h5ad_file, compression="gzip")
-            del merged
-            gc.collect()
+        print(f"Writing h5ad (streamed CSR) -> {h5ad_file}", flush=True)
+        _write_h5ad_streamed_from_scratch(
+            h5ad_file,
+            scratch_path,
+            obs=obs,
+            var=var,
+            obsm=obsm,
+            varm=varm,
+            loom_file=loom_file,
+            mapping=mapping,
+            n_cells=n_cells,
+            n_genes=n_genes,
+            has_raw=has_raw,
+            layer_names=layer_names,
+        )
+        gc.collect()
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -441,8 +594,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         apply_numpy_compat()
-        import numpy as np  # noqa: F401 - used by convert_chunked assembly
-
         print(
             f"Converting {loom_file} -> {h5ad_file} "
             f"(chunk_cells={args.chunk_cells}, converter=chunked)",
@@ -468,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
         "n_obs": int(n_obs),
         "n_vars": int(n_vars),
         "chunk_cells": int(args.chunk_cells),
-        "converter": "chunked_anndata_mapping",
+        "converter": "chunked_anndata_mapping_streamed_csr",
         "anndata_mapping_x_path": mapping.get("x_path"),
         "anndata_mapping_raw_x_path": mapping.get("raw_x_path"),
     }
