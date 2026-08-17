@@ -403,7 +403,10 @@ def _write_h5ad_streamed_from_scratch(
     import h5py
     import numpy as np
     from anndata.io import write_elem
-    from anndata_mapping_loom_export import copy_loom_attrs_to_uns
+    from anndata_mapping_loom_export import (
+        copy_loom_attr_groups_to_h5ad_uns,
+        copy_loom_attrs_to_uns,
+    )
     from scipy import sparse
 
     ad.settings.allow_write_nullable_strings = True
@@ -432,6 +435,7 @@ def _write_h5ad_streamed_from_scratch(
             write_elem(f, "obs", shell.obs, dataset_kwargs=dataset_kwargs)
             write_elem(f, "var", shell.var, dataset_kwargs=dataset_kwargs)
             write_elem(f, "uns", dict(shell.uns), dataset_kwargs=dataset_kwargs)
+            copy_loom_attr_groups_to_h5ad_uns(loom_file, f, mapping)
             if len(shell.obsm):
                 write_elem(f, "obsm", dict(shell.obsm), dataset_kwargs=dataset_kwargs)
             if len(shell.varm):

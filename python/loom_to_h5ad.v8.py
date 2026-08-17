@@ -210,7 +210,11 @@ def main(argv: list[str] | None = None) -> int:
         import loompy  # noqa: F401 - load before patching AttributeManager
         import anndata as ad
         from anndata.io import read_loom
-        from anndata_mapping_loom_export import apply_anndata_mapping, load_anndata_mapping
+        from anndata_mapping_loom_export import (
+            apply_anndata_mapping,
+            copy_loom_attr_groups_to_h5ad_uns,
+            load_anndata_mapping,
+        )
 
         install_loompy_none_attr_recovery()
         ad.settings.allow_write_nullable_strings = True
@@ -230,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         require_feature_name_from_loom(adata)
         # gzip is HDF5-native (scFAIR-safe); shrinks CSR X/layers vs uncompressed default.
         adata.write_h5ad(h5ad_file, compression="gzip")
+        copy_loom_attr_groups_to_h5ad_uns(loom_file, h5ad_file, mapping)
     except Exception as exc:  # noqa: BLE001 - surface any convert failure in output.json
         fail(f"Loom to H5AD conversion failed: {exc}", output_json)
 

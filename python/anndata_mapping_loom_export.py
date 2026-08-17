@@ -2,7 +2,9 @@
 """Apply Loom /attrs/anndata_mapping when building AnnData / H5AD.
 
 The mapping is the single source of truth for matrix roles (X / raw / layers),
-index keys, and obsm/varm paths. Writers: ASAP AnndataMappingPersistService.
+index keys, obsm/varm paths, uns JSON strings (uns_json_keys), and uns HDF5
+groups (uns_groups, e.g. spatial -> /attrs/spatial copied into uns/spatial).
+Writers: ASAP AnndataMappingPersistService.
 Spec: docs/loom-creation-spec-for-h5ad-roundtrip.md
 """
 
@@ -255,8 +257,31 @@ def matrix_shape(hf: h5py.File, path: str) -> tuple[int, int]:
     return int(ds.shape[0]), int(ds.shape[1])
 
 
+def mapping_uns_groups(mapping: dict[str, Any] | None) -> dict[str, str]:
+    """uns key -> loom path from mapping['uns_groups'] (e.g. spatial -> /attrs/spatial)."""
+    if not isinstance(mapping, dict):
+        return {}
+    raw = mapping.get("uns_groups")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("anndata_mapping['uns_groups'] must be an object of uns_key -> loom path")
+    out: dict[str, str] = {}
+    for uns_key, loom_path in raw.items():
+        key = str(uns_key).strip()
+        path = str(loom_path).strip()
+        if not key or not path:
+            raise ValueError(
+                f"anndata_mapping['uns_groups'] has an empty entry {uns_key!r} -> {loom_path!r}"
+            )
+        if not path.startswith("/"):
+            path = f"/attrs/{path}"
+        out[key] = path
+    return out
+
+
 def copy_loom_attrs_to_uns(loom_file: str, adata, mapping: dict[str, Any] | None = None) -> int:
-    """Copy loom /attrs/* into adata.uns as decoded scalars / JSON text.
+    """Copy loom /attrs datasets into adata.uns as decoded scalars / JSON text.
 
     Keys listed in mapping['uns_json_keys'] (e.g. analysis_pipeline) stay as JSON
     strings. Expanding them to nested dicts breaks anndata write_elem on typical
@@ -264,21 +289,84 @@ def copy_loom_attrs_to_uns(loom_file: str, adata, mapping: dict[str, Any] | None
     "Can't implicitly convert non-string objects to strings"). Consumers that
     need structure should json.loads the string.
 
-    ``mapping`` is accepted for call-site compatibility; JSON keys are not expanded.
+    HDF5 groups under /attrs must be listed in mapping['uns_groups'] and are
+    copied later by copy_loom_attr_groups_to_h5ad_uns (scFAIR uns/spatial).
     """
-    _ = mapping
-
+    group_keys = set(mapping_uns_groups(mapping))
     n = 0
     with h5py.File(loom_file, "r") as hf:
         if "attrs" not in hf:
             return 0
         for key in hf["attrs"].keys():
-            raw = hf["attrs"][key][()]
+            if key in group_keys:
+                continue
+            node = hf["attrs"][key]
+            if isinstance(node, h5py.Group):
+                raise ValueError(
+                    f"Loom /attrs/{key} is an HDF5 group but is not listed in "
+                    "anndata_mapping['uns_groups']. Declare it there "
+                    "(e.g. spatial -> /attrs/spatial) so it is copied into uns "
+                    "as a group, not read as a scalar."
+                )
+            raw = node[()]
             adata.uns[key] = _decode_scalar(raw)
             n += 1
     if n:
         print(f"Copied {n} loom /attrs keys into uns", flush=True)
     return n
+
+
+def copy_loom_attr_groups_to_h5ad_uns(
+    loom_file: str,
+    h5ad,
+    mapping: dict[str, Any] | None = None,
+) -> int:
+    """Copy mapping['uns_groups'] loom HDF5 groups into h5ad uns.
+
+    scFAIR v7.1.0 stores Visium metadata as uns/spatial (is_single, library
+    images, scalefactors). That tree lives at /attrs/spatial on Loom and must
+    stay a group, not a JSON string.
+    """
+    groups = mapping_uns_groups(mapping)
+    if not groups:
+        return 0
+
+    close_dst = not isinstance(h5ad, h5py.File)
+    dst = h5ad if isinstance(h5ad, h5py.File) else h5py.File(h5ad, "a")
+    n = 0
+    try:
+        with h5py.File(loom_file, "r") as src:
+            if "uns" not in dst:
+                uns = dst.create_group("uns")
+                uns.attrs["encoding-type"] = "dict"
+                uns.attrs["encoding-version"] = "0.1.0"
+            else:
+                uns = dst["uns"]
+            for uns_key, loom_path in groups.items():
+                if loom_path not in src:
+                    raise ValueError(
+                        f"anndata_mapping['uns_groups'][{uns_key!r}]={loom_path!r} "
+                        "is missing in the loom"
+                    )
+                node = src[loom_path]
+                if not isinstance(node, h5py.Group):
+                    raise ValueError(
+                        f"anndata_mapping['uns_groups'][{uns_key!r}]={loom_path!r} "
+                        f"must be an HDF5 group (scFAIR uns/{uns_key}), not a dataset"
+                    )
+                if uns_key in uns:
+                    del uns[uns_key]
+                src.copy(node, uns, name=uns_key)
+                n += 1
+                print(
+                    f"Copied loom {loom_path} group into uns/{uns_key} "
+                    f"(anndata_mapping uns_groups)",
+                    flush=True,
+                )
+        return n
+    finally:
+        if close_dst:
+            dst.close()
 
 
 def apply_mapping_matrices_to_adata(adata, loom_file: str, mapping: dict[str, Any]) -> None:
