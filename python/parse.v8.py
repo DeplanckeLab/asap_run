@@ -261,6 +261,26 @@ class H5ADHandler:
         return inferred
 
     @staticmethod
+    def verify_sparse_readable(f, path, file_path):
+        if path not in f:
+            return
+        node = f[path]
+        if not (isinstance(node, h5py.Group) and "indptr" in node):
+            return
+        ds = node["indptr"]
+        n = int(ds.shape[0]) if ds.shape else 0
+        if n <= 0:
+            return
+        chunk = int(ds.chunks[0]) if ds.chunks else min(n, 1024)
+        try:
+            _ = ds[0]
+            start = max(0, n - chunk)
+            _ = ds[start:n]
+        except OSError as e:
+            msg = hdf5_io_error_message(e, file_path)
+            ErrorJSON(msg if msg else f"Cannot read {path}/indptr: {e}")
+
+    @staticmethod
     def _create_h5ad_block_reader(f: h5py.File, src_path: str, n_cells: int, n_genes: int):
         """
         Creates a block reader function for H5AD matrices.
@@ -281,8 +301,13 @@ class H5ADHandler:
         enc = H5ADHandler._detect_sparse_encoding(node, n_cells, n_genes)
         
         if enc == "csr_matrix":
-            # Hybrid loading - pre-load pointers, lazy-load data
-            indptr_full = node["indptr"][:]  # Small array (~200 KB)
+            # Pre-load CSR row pointers. For atlas-scale H5ADs this is tens of MB,
+            # not ~200 KB; still far smaller than indices/data.
+            try:
+                indptr_full = node["indptr"][:]
+            except OSError as e:
+                msg = hdf5_io_error_message(e)
+                ErrorJSON(msg if msg else f"Cannot read {src_path}/indptr: {e}")
             ds_indices = node["indices"]     # Keep as HDF5 reference (lazy)
             ds_data = node["data"]           # Keep as HDF5 reference (lazy)
             
@@ -302,8 +327,11 @@ class H5ADHandler:
                 return sp.csr_matrix((block_data.astype(DEFAULT_NP_DTYPE, copy=False), block_indices.astype(np.int64, copy=False), indptr_local), shape=(end - start, n_genes))
             return get_block
         elif enc == "csc_matrix":
-            # CSC: Loading entire matrix and converting to CSR...
-            X_csc = sp.csc_matrix((node["data"][:], node["indices"][:], node["indptr"][:]), shape=(n_cells, n_genes), dtype=DEFAULT_NP_DTYPE)
+            try:
+                X_csc = sp.csc_matrix((node["data"][:], node["indices"][:], node["indptr"][:]), shape=(n_cells, n_genes), dtype=DEFAULT_NP_DTYPE)
+            except OSError as e:
+                msg = hdf5_io_error_message(e)
+                ErrorJSON(msg if msg else f"Cannot read {src_path}: {e}")
             csr_view = X_csc.tocsr()
             
             def get_block(start, end):
@@ -828,7 +856,14 @@ class H5ADHandler:
     @staticmethod
     def parse(args, file_path: str, out_dir: Path, gene_db: MapGene, loom, result):
 
-        with h5py.File(file_path, "r") as f:
+        try:
+            h5_file = h5py.File(file_path, "r")
+        except OSError as e:
+            if "truncated file" in str(e).lower():
+                ErrorJSON(truncated_h5ad_error_message(e, file_path))
+            raise
+
+        with h5_file as f:
             if args.sel is not None:
                 if args.sel not in f:
                     ErrorJSON(f"--sel path {args.sel!r} not found")
@@ -886,6 +921,7 @@ class H5ADHandler:
             parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None), file_feature_cols=file_feature_cols, file_uns_keys=file_uns_keys)
 
             # Write Expression Matrix
+            H5ADHandler.verify_sparse_readable(f, input_group, file_path)
             block_reader = H5ADHandler._create_h5ad_block_reader(f=f, src_path=input_group, n_cells=n_cells, n_genes=n_genes)
             stats = loom.write_expression_matrix(get_block=block_reader, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
 
@@ -2391,15 +2427,55 @@ class TextHandler:
         return stats
 
 ## Error handling
+_OUTPUT_DIR = None
+
+def truncated_h5ad_error_message(exc, file_path=None):
+    text = str(exc)
+    match = re.search(r"eof = (\d+).*stored_eof = (\d+)", text, re.DOTALL)
+    size_bit = ""
+    if match:
+        size_bit = (
+            f" on-disk size is {match.group(1)} bytes, "
+            f"HDF5 header expects {match.group(2)} bytes."
+        )
+    name = f" {file_path}" if file_path else ""
+    return (
+        f"The H5AD file{name} is incomplete.{size_bit} "
+        "The download was interrupted or is still running. "
+        "Wait until the download finishes, then reset parsing."
+    )
+
+def corrupted_h5ad_error_message(file_path=None, detail=None):
+    name = f" {file_path}" if file_path else ""
+    extra = f" ({detail})" if detail else ""
+    return (
+        f"The H5AD file{name} is corrupted{extra}. "
+        "HDF5 gzip/B-tree data cannot be read. This happens when a download was "
+        "interrupted or two downloads wrote the same file. "
+        "Delete the upload and download the file again."
+    )
+
+def hdf5_io_error_message(exc, file_path=None):
+    text = str(exc).lower()
+    if "truncated file" in text:
+        return truncated_h5ad_error_message(exc, file_path)
+    if "inflate() failed" in text or "wrong b-tree signature" in text:
+        return corrupted_h5ad_error_message(file_path, detail=str(exc).strip())
+    return None
+
 class ErrorJSON(Exception):
     def __init__(self, message: str, output: str = None):
         # still call Exception init so tracebacks, etc. work if you ever raise()
         super().__init__(message)
         payload = {"displayed_error": message}
 
-        if output:
+        out_path = output
+        if out_path is None and _OUTPUT_DIR:
+            out_path = os.path.join(_OUTPUT_DIR, "output.json")
+
+        if out_path:
             # write JSON to the given file
-            with open(output, "w", encoding="utf-8") as f:
+            with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
         else:
             # or print it to stdout
@@ -3993,6 +4069,7 @@ Options:
 """
 
 def main():
+    global _OUTPUT_DIR
     if '--help' in sys.argv:
         print(custom_help)
         sys.exit(0)
@@ -4016,7 +4093,8 @@ def main():
     # Determine the output directory
     output_dir = Path(args.o).resolve() if args.o else input_path.parent
     # Ensure the directory exists (handles both cases)
-    output_dir.mkdir(parents=True, exist_ok=True) 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _OUTPUT_DIR = str(output_dir)
     # Set the final file path
     args.output_path = str(output_dir / LOOM_FILENAME)
     

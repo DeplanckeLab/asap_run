@@ -4,10 +4,47 @@ import os # Needed for pathjoin and path/create dirs
 import h5py # Needed for parsing hdf5 files
 import json # For writing output files
 import math
+import re
 import numpy as np # For diverse array calculations
 import tarfile # To check if file is a TAR archive
 from pathlib import Path # Needed for file extension manipulation
 import shutil # For moving files and removing directories
+
+_OUTPUT_DIR = None
+
+def truncated_h5ad_error_message(exc, file_path=None):
+    text = str(exc)
+    match = re.search(r"eof = (\d+).*stored_eof = (\d+)", text, re.DOTALL)
+    size_bit = ""
+    if match:
+        size_bit = (
+            f" on-disk size is {match.group(1)} bytes, "
+            f"HDF5 header expects {match.group(2)} bytes."
+        )
+    name = f" {file_path}" if file_path else ""
+    return (
+        f"The H5AD file{name} is incomplete.{size_bit} "
+        "The download was interrupted or is still running. "
+        "Wait until the download finishes, then run preparsing again."
+    )
+
+def corrupted_h5ad_error_message(file_path=None, detail=None):
+    name = f" {file_path}" if file_path else ""
+    extra = f" ({detail})" if detail else ""
+    return (
+        f"The H5AD file{name} is corrupted{extra}. "
+        "HDF5 gzip/B-tree data cannot be read. This happens when a download was "
+        "interrupted or two downloads wrote the same file. "
+        "Delete the upload and download the file again."
+    )
+
+def hdf5_io_error_message(exc, file_path=None):
+    text = str(exc).lower()
+    if "truncated file" in text:
+        return truncated_h5ad_error_message(exc, file_path)
+    if "inflate() failed" in text or "wrong b-tree signature" in text:
+        return corrupted_h5ad_error_message(file_path, detail=str(exc).strip())
+    return None
 
 def scrub_json_value(value):
     """Convert values to strict JSON types. Python allows NaN/Infinity in dumps; Ruby does not."""
@@ -657,8 +694,11 @@ def check_file_type(file_path):
             
             # We don't know what it is, but it's a HDF5 file
             return FileType.UNKNOWN
-    except (OSError, IOError, Exception):
-        # Not a valid HDF5 or unable to read; fall through
+    except OSError as e:
+        if "truncated file" in str(e).lower():
+            ErrorJSON(truncated_h5ad_error_message(e, file_path))
+        return FileType.UNKNOWN
+    except (IOError, Exception):
         return FileType.UNKNOWN
 
 def count_nonempty_lines(filepath):
@@ -846,6 +886,26 @@ class H5ADHandler:
         return True, library_id
 
     @staticmethod
+    def verify_sparse_readable(f, path, file_path):
+        if path not in f:
+            return
+        node = f[path]
+        if not (isinstance(node, h5py.Group) and "indptr" in node):
+            return
+        ds = node["indptr"]
+        n = int(ds.shape[0]) if ds.shape else 0
+        if n <= 0:
+            return
+        chunk = int(ds.chunks[0]) if ds.chunks else min(n, 1024)
+        try:
+            _ = ds[0]
+            start = max(0, n - chunk)
+            _ = ds[start:n]
+        except OSError as e:
+            msg = hdf5_io_error_message(e, file_path)
+            ErrorJSON(msg if msg else f"Cannot read {path}/indptr: {e}")
+
+    @staticmethod
     def extract_index(f, path, orientation="Item", n=10):
         if path not in f:
             return [f"{orientation}_{i+1}" for i in range(n)]
@@ -956,6 +1016,7 @@ class H5ADHandler:
                     matrix_paths.append((layer_path, lCells, lGenes))
 
             for path, nC, nG in matrix_paths:
+                H5ADHandler.verify_sparse_readable(f, path, file_path)
                 # For raw, genes may differ — re-extract from raw/var
                 if path.startswith('/raw/'):
                     g = H5ADHandler.extract_index(f, 'raw/var', orientation='Gene')
@@ -967,6 +1028,11 @@ class H5ADHandler:
                     matrix = H5ADHandler.extract_matrix(f, path, nC, nG)
                     arr = np.array(matrix)
                     is_count = int((arr % 1 == 0).all())
+                except OSError as e:
+                    msg = hdf5_io_error_message(e, file_path)
+                    if msg:
+                        ErrorJSON(msg)
+                    raise
                 except Exception as e:
                     matrix = []
                     is_count = -1
@@ -1397,9 +1463,13 @@ class ErrorJSON(Exception):
         super().__init__(message)
         payload = {"displayed_error": message}
 
-        if output:
+        out_path = output
+        if out_path is None and _OUTPUT_DIR:
+            out_path = os.path.join(_OUTPUT_DIR, "output.json")
+
+        if out_path:
             # write JSON to the given file
-            with open(output, "w", encoding="utf-8") as f:
+            with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
         else:
             # or print it to stdout
@@ -1409,6 +1479,7 @@ class ErrorJSON(Exception):
         sys.exit(1)
 
 def main():
+    global _OUTPUT_DIR
     if '--help' in sys.argv:
         print(custom_help)
         sys.exit(0)
@@ -1424,6 +1495,7 @@ def main():
 
     args = parser.parse_args()
 
+    _OUTPUT_DIR = args.o
     if not os.path.isfile(args.f):
         ErrorJSON(f"Input file not found: {args.f}")
     if args.o and not os.path.isdir(args.o):
