@@ -66,6 +66,61 @@ class ErrorJSON(Exception):
         print(json.dumps({"displayed_error": message}, ensure_ascii=False))
         os._exit(1)
 
+
+def _preview_parse_args(args: argparse.Namespace) -> tuple[bool, float | None, int, int, int]:
+    """Returns (active, cell_fraction_or_none, seed, min_cells, max_cells). Preview is on only when --preview-cell-fraction is set."""
+    fr = getattr(args, "preview_cell_fraction", None)
+    seed = int(getattr(args, "preview_seed", 42))
+    min_cells = int(getattr(args, "preview_min_cells", 1000))
+    max_cells = int(getattr(args, "preview_max_cells", 10000))
+    if min_cells < 1:
+        ErrorJSON("--preview-min-cells must be >= 1")
+    if max_cells < 1:
+        ErrorJSON("--preview-max-cells must be >= 1")
+    if max_cells < min_cells:
+        ErrorJSON("--preview-max-cells must be >= --preview-min-cells")
+    if fr is None:
+        return False, None, seed, min_cells, max_cells
+    if fr <= 0.0 or fr > 1.0:
+        ErrorJSON("--preview-cell-fraction must be in (0, 1] when set")
+    return True, fr, seed, min_cells, max_cells
+
+
+def _preview_cap_total_cells(cell_idx: np.ndarray, max_cells: int, rng: np.random.Generator) -> np.ndarray:
+    cell_idx = np.asarray(cell_idx, dtype=np.intp)
+    n = int(cell_idx.size)
+    if n <= max_cells:
+        return cell_idx
+    return np.sort(rng.choice(cell_idx, size=max_cells, replace=False))
+
+
+def _preview_stratified_cell_indices(
+    labels: np.ndarray,
+    fraction: float | None,
+    rng: np.random.Generator,
+    min_cells: int,
+    max_cells: int,
+) -> np.ndarray:
+    labels = np.asarray(labels)
+    n = int(labels.shape[0])
+    if fraction is None or fraction >= 1.0:
+        return np.arange(n, dtype=np.intp)
+    picked: list[np.ndarray] = []
+    for g in np.unique(labels):
+        ix = np.flatnonzero(labels == g)
+        ng = int(ix.size)
+        if ng < min_cells:
+            picked.append(ix)
+            continue
+        k_frac = int(min(ng, round(fraction * float(ng))))
+        k = int(min(ng, max(min_cells, min(max_cells, k_frac))))
+        if k >= ng:
+            picked.append(ix)
+        else:
+            picked.append(rng.choice(ix, size=k, replace=False))
+    return np.sort(np.concatenate(picked))
+
+
 ## Loom File I/O class
 class LoomHandler:
     """
@@ -733,6 +788,48 @@ def run(args: argparse.Namespace) -> None:
             batch_data  = None
             batch_names = []
 
+        universe = _load_cell_universe_mask(
+            getattr(args, "cell_universe_file", None),
+            getattr(args, "cell_universe_mode", None),
+            n_cells,
+        )
+        if not bool(np.all(universe)):
+            n_keep = int(universe.sum())
+            data_warnings.append(
+                f"Cell universe filter applied: kept {n_keep} of {n_cells} cells "
+                f"(mode={getattr(args, 'cell_universe_mode', None)!s})."
+            )
+            data_matrix = data_matrix[:, universe]
+            groups_1 = groups_1[universe]
+            if groups_2 is not None:
+                groups_2 = groups_2[universe]
+            if batch_data is not None:
+                batch_data = batch_data[universe, :]
+            n_genes, n_cells = data_matrix.shape
+            universe = np.ones(n_cells, dtype=bool)
+
+        preview_active, preview_fr, preview_seed, preview_min_cells, preview_max_cells = _preview_parse_args(args)
+        if preview_active:
+            rng = np.random.default_rng(preview_seed)
+            cell_idx = _preview_stratified_cell_indices(
+                groups_1, preview_fr, rng, preview_min_cells, preview_max_cells
+            )
+            if preview_fr is None or preview_fr >= 1.0:
+                cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
+            data_matrix = data_matrix[:, cell_idx]
+            groups_1 = groups_1[cell_idx]
+            if groups_2 is not None:
+                groups_2 = groups_2[cell_idx]
+            if batch_data is not None:
+                batch_data = batch_data[cell_idx, :]
+            n_genes, n_cells = data_matrix.shape
+            data_warnings.append(
+                f"Preview subsample enabled: kept {n_cells} cells "
+                f"(cell_fraction={preview_fr!s} min_cells={preview_min_cells} "
+                f"max_cells={preview_max_cells} seed={preview_seed})."
+            )
+            universe = np.ones(n_cells, dtype=bool)
+
     # Loom file is now closed
 
     list_cats_json_1 = _unique_categories_sorted(groups_1)
@@ -836,7 +933,7 @@ def run(args: argparse.Namespace) -> None:
 
         cell_group = np.zeros(n_cells, dtype=int)
         cell_group[candidates_1] = 1
-        cell_group[cell_group == 0] = 2  # all other cells become group 2
+        cell_group[(cell_group == 0) & universe] = 2  # other cells inside the analysis universe only
 
         group1_size = int((cell_group == 1).sum())
         group2_size = int((cell_group == 2).sum())
@@ -966,6 +1063,29 @@ def _null(s: str | None) -> bool:
     """Returns True if a string argument represents an absent/null value."""
     return s is None or s.strip().lower() in ("", "null", "na", "none")
 
+def _load_cell_universe_mask(path: str | None, mode: str | None, n_cells: int) -> np.ndarray:
+    """Bool mask length n_cells; True = cell is in the analysis universe."""
+    if _null(path):
+        return np.ones(n_cells, dtype=bool)
+    mode_s = (mode or "in").strip().lower()
+    if mode_s not in ("in", "out"):
+        ErrorJSON("--cell-universe-mode must be 'in' or 'out'")
+    file_path = Path(str(path).strip())
+    if not file_path.is_file():
+        ErrorJSON(f"Cell universe file not found: {path!r}")
+    raw = np.fromfile(file_path, dtype="<u4")
+    if raw.size:
+        if int(raw.min()) < 0 or int(raw.max()) >= n_cells:
+            ErrorJSON(f"Cell universe indices out of range for n_cells={n_cells}")
+    mask = np.zeros(n_cells, dtype=bool)
+    if raw.size:
+        mask[raw.astype(np.intp, copy=False)] = True
+    if mode_s == "out":
+        mask = ~mask
+    if not bool(mask.any()):
+        ErrorJSON("Cell universe is empty after applying filtered_in/out mask")
+    return mask
+
 def _parse_bool_string(value: str, parameter_name: str) -> bool:
     """Parses a string boolean argument."""
     raw_value = value.strip().lower()
@@ -1048,6 +1168,12 @@ def main() -> None:
     parser.add_argument("--write-volcano",     action="store_true",                       required=False,              dest="write_volcano")
     parser.add_argument("--write-metadata",    metavar="Output metadata dataset path",    required=False,              dest="write_metadata", default=None)
     parser.add_argument("--merge-files",       action="store_true",                       required=False,              dest="merge_files")
+    parser.add_argument("--preview-cell-fraction", type=float, default=None, required=False, dest="preview_cell_fraction", metavar="F")
+    parser.add_argument("--preview-max-cells", type=int, default=10000, required=False, dest="preview_max_cells", metavar="C")
+    parser.add_argument("--preview-min-cells", type=int, default=1000, required=False, dest="preview_min_cells", metavar="C")
+    parser.add_argument("--preview-seed", type=int, default=42, required=False, dest="preview_seed", metavar="S")
+    parser.add_argument("--cell-universe-file", metavar="filtered_in.bin|filtered_out.bin", required=False, dest="cell_universe_file", default=None)
+    parser.add_argument("--cell-universe-mode", metavar="in|out", required=False, dest="cell_universe_mode", default=None)
 
     args = parser.parse_args()
 

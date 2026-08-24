@@ -20,9 +20,11 @@ import pandas as pd # For matrix computation
 
 ## DE / stats (scanpy, anndata, pydeseq2 imported lazily where needed).
 ## t_test_approx: vectorized Welch t-test per gene (see _expression_matrix_for_test through run_t_test_approx_all_markers).
+## Large dense looms: de_t_test_approx_stream chunked_by_gene sidecar loom + gene-block GEMM (same Welch + BH-FDR).
 # scanpy, anndata  → run_scanpy_method() / run_scanpy_all_markers()
 # pydeseq2         → run_deseq2() / run_deseq2_all_markers()
 
+import de_t_test_approx_stream as de_stream
 ## Constants
 AVAILABLE_METHODS: Final[list] = [
     "wilcoxon",             # Wilcoxon rank-sum test           (scanpy)
@@ -1048,63 +1050,68 @@ def run_t_test_approx_all_markers(
             raw_sum_all = sum_all
 
     w_dtype = np.float32 if X.dtype == np.float32 else np.float64
-    results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-    loop_gemv = 0.0
-    loop_welch = 0.0
-    loop_bh = 0.0
-    loop_raw = 0.0
-    t_loop0 = time.perf_counter() if _perf_enabled() else 0.0
+    # One-hot W (n_cells, n_groups) -> one GEMM for all group sums instead of n_groups GEMVs.
+    W = np.zeros((n_cells, n_groups), dtype=w_dtype)
+    n_g_vec = np.zeros(n_groups, dtype=np.float64)
+    for gi in range(n_groups):
+        mask = inv == gi
+        W[mask, gi] = 1
+        n_g_vec[gi] = float(mask.sum())
 
+    results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    t_g0 = time.perf_counter() if _perf_enabled() else 0.0
+    # (n_genes, n_groups)
+    sum_g_mat = X @ W
+    sumsq_g_mat = X2 @ W
+    if R is not None:
+        raw_sum_g_mat = R @ W.astype(np.float64, copy=False)
+    else:
+        raw_sum_g_mat = None
+    if _perf_enabled():
+        _perf_log(f"[de_perf] t_test_approx_all_markers gemm_all_groups: {time.perf_counter() - t_g0:.3f}s")
+
+    t_loop0 = time.perf_counter() if _perf_enabled() else 0.0
     for gi in range(n_groups):
         grp = unique_groups[gi]
-        w = (inv == gi).astype(w_dtype)
-        n_g = float(np.sum(w))
-        t_g0 = time.perf_counter() if _perf_enabled() else 0.0
-        sum_g = X @ w
-        sumsq_g = X2 @ w
-        if _perf_enabled():
-            loop_gemv += time.perf_counter() - t_g0
-        # Rest = all cells minus group g: additive sums avoid X @ (1-w).
+        n_g = float(n_g_vec[gi])
+        sum_g = sum_g_mat[:, gi]
+        sumsq_g = sumsq_g_mat[:, gi]
         sum_r = sum_all - sum_g
         sumsq_r = sumsq_all - sumsq_g
         n_r = n_tot - n_g
-        t_w0 = time.perf_counter() if _perf_enabled() else 0.0
-        # Group g vs its complement: same Welch formulas as pairwise with (mean_g, n_g) and (mean_r, n_r).
         mean_g, var_g = _mean_var_from_sums(sum_g, sumsq_g, n_g)
         mean_r, var_r = _mean_var_from_sums(sum_r, sumsq_r, n_r)
         pvals, lfc = _welch_ttest_from_mean_var(mean_g, var_g, n_g, mean_r, var_r, n_r)
-        if _perf_enabled():
-            loop_welch += time.perf_counter() - t_w0
-        t_b0 = time.perf_counter() if _perf_enabled() else 0.0
         padj = _bh_fdr(pvals)
-        if _perf_enabled():
-            loop_bh += time.perf_counter() - t_b0
-        t_r0 = time.perf_counter() if _perf_enabled() else 0.0
-        if R is not None:
-            # Raw count means: one GEMV for group, rest from precomputed row total minus group sum.
-            wr = w.astype(np.float64, copy=False)
-            sum_raw_g = R @ wr
+        if raw_sum_g_mat is not None:
+            sum_raw_g = raw_sum_g_mat[:, gi]
             ave_g1 = sum_raw_g / n_g
             ave_g2 = (raw_sum_all - sum_raw_g) / n_r
         else:
-            # Non-count: working X is the expression layer; means match sum_g/n_g and complement.
             ave_g1 = sum_g / n_g
             ave_g2 = sum_r / n_r
-        if _perf_enabled():
-            loop_raw += time.perf_counter() - t_r0
         results[str(grp)] = (pvals, padj, lfc, ave_g1, ave_g2)
 
     if _perf_enabled():
         _perf_log(
-            f"[de_perf] t_test_approx_all_markers per_group_loop({n_groups}): "
-            f"gemv {loop_gemv:.3f}s, welch {loop_welch:.3f}s, bh_fdr {loop_bh:.3f}s, raw_means {loop_raw:.3f}s, "
-            f"total_loop {time.perf_counter() - t_loop0:.3f}s"
+            f"[de_perf] t_test_approx_all_markers welch_bh_loop({n_groups}): "
+            f"{time.perf_counter() - t_loop0:.3f}s"
         )
         _perf_log(
             f"[de_perf] t_test_approx_all_markers shape genes={n_genes} cells={n_cells} groups={n_groups}"
         )
 
     return results
+
+
+def _t_test_approx_stream_callables() -> dict:
+    """Bind in-memory Welch helpers for the streaming module (same statistics)."""
+    return {
+        "mean_var_from_sums": _mean_var_from_sums,
+        "welch_ttest_from_mean_var": _welch_ttest_from_mean_var,
+        "bh_fdr": _bh_fdr,
+    }
+
 
 def run_deseq2(
     data_matrix:  np.ndarray,         # (n_genes, n_cells), integer counts
@@ -1271,17 +1278,44 @@ def run(args: argparse.Namespace) -> None:
     # FindAllMarkers: default one cat_N.tsv per category; --merge-files writes a single output.tsv with a group column.
     write_fam_per_category_tsv = mode == "all_markers" and write_tsv_output and bool(args.o) and not merge_files
 
-    # Open the loom file for reading (close it afterwards to avoid locking during DE)
+    # Open the loom file for reading (close it afterwards to avoid locking during in-memory DE).
+    # t_test_approx on large dense matrices streams cell blocks and reopens the loom later.
+    use_t_test_approx_stream = False
     with LoomHandler(str(input_path), mode="r") as loom:
-        # Read count matrix from Loom file
-        _read_cm = _perf_span("expression matrix load (loom or npy cache)") if _perf_enabled() else nullcontext()
-        with _read_cm:
-            data_matrix = _load_expression_matrix_with_optional_npy_cache(
-                loom, str(input_path), args.input_dataset
-            )
-        if data_matrix is None:
+        matrix_shape = loom.read_matrix_shape(args.input_dataset)
+        if matrix_shape is None:
             ErrorJSON(f"Input dataset {args.input_dataset!r} does not exist in the Loom file")
-        n_genes, n_cells = data_matrix.shape
+        n_genes, n_cells = (int(matrix_shape[0]), int(matrix_shape[1]))
+
+        f = loom._require_open()
+        matrix_is_dense = de_stream.loom_path_is_dense_dataset(f, args.input_dataset)
+        itemsize = 4
+        if matrix_is_dense:
+            node = f[args.input_dataset]
+            itemsize = max(int(getattr(node.dtype, "itemsize", 4)), 4)
+        use_t_test_approx_stream = (
+            method == "t_test_approx"
+            and matrix_is_dense
+            and de_stream.should_stream_dense(n_genes, n_cells, itemsize)
+        )
+
+        data_matrix = None
+        if not use_t_test_approx_stream:
+            # Read count matrix from Loom file (scanpy / deseq2 / small t_test_approx)
+            _read_cm = _perf_span("expression matrix load (loom or npy cache)") if _perf_enabled() else nullcontext()
+            with _read_cm:
+                data_matrix = _load_expression_matrix_with_optional_npy_cache(
+                    loom, str(input_path), args.input_dataset
+                )
+            if data_matrix is None:
+                ErrorJSON(f"Input dataset {args.input_dataset!r} does not exist in the Loom file")
+            n_genes, n_cells = data_matrix.shape
+        else:
+            data_warnings.append(
+                f"t_test_approx streaming mode: dense matrix {n_genes}x{n_cells} "
+                f"(~{de_stream.dense_matrix_nbytes(n_genes, n_cells, itemsize) / (1024**3):.1f} GiB uncompressed); "
+                "using compressed gene-chunked sidecar loom + gene-block GEMM (no full densify)."
+            )
 
         # Gene annotations (used for volcano plot and output labeling)
         ens_raw  = loom.read_vector("/row_attrs/Accession")
@@ -1337,11 +1371,49 @@ def run(args: argparse.Namespace) -> None:
             batch_data  = None
             batch_names = []
 
+        universe = _load_cell_universe_mask(
+            getattr(args, "cell_universe_file", None),
+            getattr(args, "cell_universe_mode", None),
+            n_cells,
+        )
+        if not bool(np.all(universe)):
+            n_keep = int(universe.sum())
+            data_warnings.append(
+                f"Cell universe filter applied: kept {n_keep} of {n_cells} cells "
+                f"(mode={getattr(args, 'cell_universe_mode', None)!s})."
+            )
+            if data_matrix is not None:
+                data_matrix = data_matrix[:, universe]
+                groups_1 = groups_1[universe]
+                if groups_2 is not None:
+                    groups_2 = groups_2[universe]
+                if batch_data is not None:
+                    batch_data = batch_data[universe, :] if batch_data.ndim == 2 else batch_data[universe]
+                n_genes, n_cells = data_matrix.shape
+                universe = np.ones(n_cells, dtype=bool)
+            else:
+                # Streaming path: keep full matrix axis, blank labels outside the universe.
+                sentinel = "\x00__asap_out_of_universe__\x00"
+                groups_1 = np.array(groups_1, copy=True)
+                groups_1[~universe] = sentinel
+                if groups_2 is not None:
+                    groups_2 = np.array(groups_2, copy=True)
+                    groups_2[~universe] = sentinel
+
     # Loom file is now closed
 
-    list_cats_json_1 = _unique_categories_sorted(groups_1)
+    list_cats_json_1 = [
+        c for c in _unique_categories_sorted(groups_1)
+        if c != "\x00__asap_out_of_universe__\x00"
+    ]
     if mode == "all_markers" and groups_2 is not None:
-        list_cats_json_1 = sorted(set(list_cats_json_1) | set(_unique_categories_sorted(groups_2)))
+        list_cats_json_1 = sorted(
+            set(list_cats_json_1)
+            | {
+                c for c in _unique_categories_sorted(groups_2)
+                if c != "\x00__asap_out_of_universe__\x00"
+            }
+        )
 
     if write_fam_per_category_tsv:
         all_categories = list_cats_json_1
@@ -1370,6 +1442,7 @@ def run(args: argparse.Namespace) -> None:
                 ErrorJSON(f"Group {grp!r} contains only {cnt} cell(s); at least 3 are required.")
 
         n_cells_full_am = int(n_cells)
+        cell_keep_am: np.ndarray | None = None
         if preview_active:
             cell_idx = _preview_stratified_cell_indices(groups_1, preview_fr, rng, preview_min_cells, preview_max_cells)
             if preview_fr is None or preview_fr >= 1.0:
@@ -1381,25 +1454,47 @@ def run(args: argparse.Namespace) -> None:
                         f"After preview subsampling, group {grp!r} has fewer than 3 cells; "
                         "increase --preview-cell-fraction or disable preview."
                     )
-            data_matrix = data_matrix[:, cell_idx]
-            groups_1 = groups_1[cell_idx]
-            if groups_2 is not None:
-                groups_2 = groups_2[cell_idx]
-            if batch_data is not None:
-                batch_data = batch_data[cell_idx]
-            n_genes, n_cells = data_matrix.shape
-            data_warnings.append(
-                f"Preview DE: cells {n_cells}/{n_cells_full_am} (stratified). cell_fraction={preview_fr!s} "
-                f"min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
-            )
-            group_sizes = {grp: int((groups_1 == grp).sum()) for grp in unique_groups}
+            if use_t_test_approx_stream:
+                cell_keep_am = np.zeros(n_cells_full_am, dtype=bool)
+                cell_keep_am[cell_idx] = True
+                n_cells_preview = int(cell_idx.size)
+                data_warnings.append(
+                    f"Preview DE: cells {n_cells_preview}/{n_cells_full_am} (stratified). cell_fraction={preview_fr!s} "
+                    f"min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
+                )
+                group_sizes = {grp: int((g1_sub == grp).sum()) for grp in unique_groups}
+            else:
+                data_matrix = data_matrix[:, cell_idx]
+                groups_1 = groups_1[cell_idx]
+                if groups_2 is not None:
+                    groups_2 = groups_2[cell_idx]
+                if batch_data is not None:
+                    batch_data = batch_data[cell_idx]
+                n_genes, n_cells = data_matrix.shape
+                data_warnings.append(
+                    f"Preview DE: cells {n_cells}/{n_cells_full_am} (stratified). cell_fraction={preview_fr!s} "
+                    f"min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
+                )
+                group_sizes = {grp: int((groups_1 == grp).sum()) for grp in unique_groups}
 
         if method == "deseq2":
             all_results = run_deseq2_all_markers(data_matrix, groups_1, batch_data, batch_names, gene_names)
         elif method == "t_test_approx":
-            # One Welch+BHFDR run per category vs all other cells (vectorized; see module block above).
             with _perf_span("t_test_approx FindAllMarkers total (includes inner timings)"):
-                all_results = run_t_test_approx_all_markers(data_matrix, groups_1, is_count=is_count_table)
+                if use_t_test_approx_stream:
+                    try:
+                        all_results = de_stream.run_t_test_approx_all_markers_stream(
+                            str(input_path),
+                            args.input_dataset,
+                            groups_1,
+                            is_count=is_count_table,
+                            cell_keep=cell_keep_am,
+                            **_t_test_approx_stream_callables(),
+                        )
+                    except ValueError as exc:
+                        ErrorJSON(str(exc))
+                else:
+                    all_results = run_t_test_approx_all_markers(data_matrix, groups_1, is_count=is_count_table)
         else:
             all_results = run_scanpy_all_markers(data_matrix, groups_1, gene_names, method, is_count=is_count_table)
 
@@ -1498,7 +1593,7 @@ def run(args: argparse.Namespace) -> None:
 
         cell_group = np.zeros(n_cells, dtype=int)
         cell_group[candidates_1] = 1
-        cell_group[cell_group == 0] = 2  # all other cells become group 2
+        cell_group[(cell_group == 0) & universe] = 2  # other cells inside the analysis universe only
 
         group1_size = int((cell_group == 1).sum())
         group2_size = int((cell_group == 2).sum())
@@ -1520,28 +1615,52 @@ def run(args: argparse.Namespace) -> None:
                         "After preview subsampling, one of the cell groups has fewer than 3 cells; "
                         "increase --preview-cell-fraction or disable preview."
                     )
-            data_matrix = data_matrix[:, cell_idx]
-            cell_group = cg_sub
-            if batch_data is not None:
-                batch_data = batch_data[cell_idx]
-            n_genes, n_cells = data_matrix.shape
-            group1_size = int((cell_group == 1).sum())
-            group2_size = int((cell_group == 2).sum())
-            data_warnings.append(
-                f"Preview DE: cells {n_cells}/{n_cells_full_sm} (stratified by marker vs rest). "
-                f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
-            )
+            if use_t_test_approx_stream:
+                # Keep full-length masks; zero out non-preview cells
+                keep = np.zeros(n_cells_full_sm, dtype=bool)
+                keep[cell_idx] = True
+                cell_group = np.where(keep, cell_group, 0)
+                group1_size = int((cell_group == 1).sum())
+                group2_size = int((cell_group == 2).sum())
+                data_warnings.append(
+                    f"Preview DE: cells {int(keep.sum())}/{n_cells_full_sm} (stratified by marker vs rest). "
+                    f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
+                )
+            else:
+                data_matrix = data_matrix[:, cell_idx]
+                cell_group = cg_sub
+                if batch_data is not None:
+                    batch_data = batch_data[cell_idx]
+                n_genes, n_cells = data_matrix.shape
+                group1_size = int((cell_group == 1).sum())
+                group2_size = int((cell_group == 2).sum())
+                data_warnings.append(
+                    f"Preview DE: cells {n_cells}/{n_cells_full_sm} (stratified by marker vs rest). "
+                    f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
+                )
 
         if method == "deseq2":
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix, cell_group, batch_data, batch_names, gene_names)
         elif method == "t_test_approx":
-            # Marker cells vs rest: same two-sample Welch as two_group (boolean masks along cell_group).
             m1 = cell_group == 1
             m2 = cell_group == 2
             with _perf_span("t_test_approx single_marker total"):
-                out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_t_test_approx_pairwise(
-                    data_matrix, m1, m2, is_count=is_count_table
-                )
+                if use_t_test_approx_stream:
+                    try:
+                        out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = de_stream.run_t_test_approx_pairwise_stream(
+                            str(input_path),
+                            args.input_dataset,
+                            m1,
+                            m2,
+                            is_count=is_count_table,
+                            **_t_test_approx_stream_callables(),
+                        )
+                    except ValueError as exc:
+                        ErrorJSON(str(exc))
+                else:
+                    out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_t_test_approx_pairwise(
+                        data_matrix, m1, m2, is_count=is_count_table
+                    )
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix, cell_group, gene_names, method, is_count=is_count_table)
 
@@ -1620,53 +1739,98 @@ def run(args: argparse.Namespace) -> None:
         cell_group[candidates_1]  = 1
         cell_group[non_overlap_2] = 2
 
-        # Keep only assigned cells
-        keep_idx        = np.where(cell_group > 0)[0]
-        data_matrix_sub = data_matrix[:, keep_idx]
-        cell_group_sub  = cell_group[keep_idx]
-        batch_data_sub  = batch_data[keep_idx] if batch_data is not None else None
-
-        group1_size = int((cell_group_sub == 1).sum())
-        group2_size = int((cell_group_sub == 2).sum())
+        group1_size = int((cell_group == 1).sum())
+        group2_size = int((cell_group == 2).sum())
 
         if group1_size < 3:
             ErrorJSON(f"Group 1 ({group1!r}) contains fewer than 3 cells.")
         if group2_size < 3:
             ErrorJSON(f"Group 2 ({group2!r}) contains fewer than 3 cells after removing overlapping cells.")
 
-        n_cells_sub_full = int(data_matrix_sub.shape[1])
+        n_cells_sub_full = group1_size + group2_size
+        data_matrix_sub = None
+        cell_group_sub = None
+        batch_data_sub = None
+
+        if not use_t_test_approx_stream:
+            # Keep only assigned cells (in-memory path)
+            keep_idx        = np.where(cell_group > 0)[0]
+            data_matrix_sub = data_matrix[:, keep_idx]
+            cell_group_sub  = cell_group[keep_idx]
+            batch_data_sub  = batch_data[keep_idx] if batch_data is not None else None
+            n_cells_sub_full = int(data_matrix_sub.shape[1])
+
         if preview_active:
-            cell_idx = _preview_stratified_cell_indices(cell_group_sub, preview_fr, rng, preview_min_cells, preview_max_cells)
-            if preview_fr is None or preview_fr >= 1.0:
-                cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
-            cg2 = cell_group_sub[cell_idx]
-            for lab in (1, 2):
-                if int((cg2 == lab).sum()) < 3:
-                    ErrorJSON(
-                        "After preview subsampling, one of the cell groups has fewer than 3 cells; "
-                        "increase --preview-cell-fraction or disable preview."
-                    )
-            data_matrix_sub = data_matrix_sub[:, cell_idx]
-            cell_group_sub = cg2
-            if batch_data_sub is not None:
-                batch_data_sub = batch_data_sub[cell_idx]
-            group1_size = int((cell_group_sub == 1).sum())
-            group2_size = int((cell_group_sub == 2).sum())
-            data_warnings.append(
-                f"Preview DE: cells {data_matrix_sub.shape[1]}/{n_cells_sub_full} (stratified by two groups). "
-                f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
-            )
+            if use_t_test_approx_stream:
+                # Stratify on the two-group subset only
+                keep_idx = np.where(cell_group > 0)[0]
+                cg_sub = cell_group[keep_idx]
+                cell_idx_local = _preview_stratified_cell_indices(cg_sub, preview_fr, rng, preview_min_cells, preview_max_cells)
+                if preview_fr is None or preview_fr >= 1.0:
+                    cell_idx_local = _preview_cap_total_cells(cell_idx_local, preview_max_cells, rng)
+                cg2 = cg_sub[cell_idx_local]
+                for lab in (1, 2):
+                    if int((cg2 == lab).sum()) < 3:
+                        ErrorJSON(
+                            "After preview subsampling, one of the cell groups has fewer than 3 cells; "
+                            "increase --preview-cell-fraction or disable preview."
+                        )
+                selected = keep_idx[cell_idx_local]
+                cell_group_preview = np.zeros(n_cells, dtype=int)
+                cell_group_preview[selected] = cell_group[selected]
+                cell_group = cell_group_preview
+                group1_size = int((cell_group == 1).sum())
+                group2_size = int((cell_group == 2).sum())
+                data_warnings.append(
+                    f"Preview DE: cells {int((cell_group > 0).sum())}/{n_cells_sub_full} (stratified by two groups). "
+                    f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
+                )
+            else:
+                cell_idx = _preview_stratified_cell_indices(cell_group_sub, preview_fr, rng, preview_min_cells, preview_max_cells)
+                if preview_fr is None or preview_fr >= 1.0:
+                    cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
+                cg2 = cell_group_sub[cell_idx]
+                for lab in (1, 2):
+                    if int((cg2 == lab).sum()) < 3:
+                        ErrorJSON(
+                            "After preview subsampling, one of the cell groups has fewer than 3 cells; "
+                            "increase --preview-cell-fraction or disable preview."
+                        )
+                data_matrix_sub = data_matrix_sub[:, cell_idx]
+                cell_group_sub = cg2
+                if batch_data_sub is not None:
+                    batch_data_sub = batch_data_sub[cell_idx]
+                group1_size = int((cell_group_sub == 1).sum())
+                group2_size = int((cell_group_sub == 2).sum())
+                data_warnings.append(
+                    f"Preview DE: cells {data_matrix_sub.shape[1]}/{n_cells_sub_full} (stratified by two groups). "
+                    f"cell_fraction={preview_fr!s} min_cells={preview_min_cells} max_cells={preview_max_cells} seed={preview_seed}"
+                )
 
         if method == "deseq2":
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_deseq2(data_matrix_sub, cell_group_sub, batch_data_sub, batch_names, gene_names)
         elif method == "t_test_approx":
-            # Explicit two labels: subset matrix already contains only G1 and G2 cells; masks pick columns.
-            m1 = cell_group_sub == 1
-            m2 = cell_group_sub == 2
             with _perf_span("t_test_approx two_group total"):
-                out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_t_test_approx_pairwise(
-                    data_matrix_sub, m1, m2, is_count=is_count_table
-                )
+                if use_t_test_approx_stream:
+                    m1 = cell_group == 1
+                    m2 = cell_group == 2
+                    try:
+                        out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = de_stream.run_t_test_approx_pairwise_stream(
+                            str(input_path),
+                            args.input_dataset,
+                            m1,
+                            m2,
+                            is_count=is_count_table,
+                            **_t_test_approx_stream_callables(),
+                        )
+                    except ValueError as exc:
+                        ErrorJSON(str(exc))
+                else:
+                    m1 = cell_group_sub == 1
+                    m2 = cell_group_sub == 2
+                    out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_t_test_approx_pairwise(
+                        data_matrix_sub, m1, m2, is_count=is_count_table
+                    )
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix_sub, cell_group_sub, gene_names, method, is_count=is_count_table)
 
@@ -1768,6 +1932,29 @@ def _null(s: str | None) -> bool:
     """Returns True if a string argument represents an absent/null value."""
     return s is None or s.strip().lower() in ("", "null", "na", "none")
 
+def _load_cell_universe_mask(path: str | None, mode: str | None, n_cells: int) -> np.ndarray:
+    """Bool mask length n_cells; True = cell is in the analysis universe."""
+    if _null(path):
+        return np.ones(n_cells, dtype=bool)
+    mode_s = (mode or "in").strip().lower()
+    if mode_s not in ("in", "out"):
+        ErrorJSON("--cell-universe-mode must be 'in' or 'out'")
+    file_path = Path(str(path).strip())
+    if not file_path.is_file():
+        ErrorJSON(f"Cell universe file not found: {path!r}")
+    raw = np.fromfile(file_path, dtype="<u4")
+    if raw.size:
+        if int(raw.min()) < 0 or int(raw.max()) >= n_cells:
+            ErrorJSON(f"Cell universe indices out of range for n_cells={n_cells}")
+    mask = np.zeros(n_cells, dtype=bool)
+    if raw.size:
+        mask[raw.astype(np.intp, copy=False)] = True
+    if mode_s == "out":
+        mask = ~mask
+    if not bool(mask.any()):
+        ErrorJSON("Cell universe is empty after applying filtered_in/out mask")
+    return mask
+
 def _parse_bool_string(value: str, parameter_name: str) -> bool:
     """Parses a string boolean argument."""
     raw_value = value.strip().lower()
@@ -1810,6 +1997,9 @@ Options:
                              of X and X^2 over cells), Benjamini-Hochberg across genes per contrast. Counts:
                              normalize each cell to 10k then log1p for the test; Avg. Exp. columns use raw counts.
                              Non-count: test and Avg. Exp. use the loaded matrix values (e.g. normalized from loom).
+                             Large dense looms (>=2 GiB float32 footprint) stream via a float32 .npy
+                             sidecar (built once next to the loom, same as the in-memory cache name),
+                             memmap'd in gene blocks with BLAS GEMM. ASAP_DE_FORCE_STREAM=1 forces that path.
   --input-dataset            Loom path to the expression matrix (e.g. /layers/norm_data). On first use,
                              a float32 .npy sidecar is written next to the loom (slashes in the path
                              replaced by underscores, e.g. _layers_norm_1_seurat.npy). If that file
@@ -1895,6 +2085,8 @@ def main() -> None:
     parser.add_argument("--preview-min-cells", type=int, default=1000, required=False, dest="preview_min_cells", metavar="M")
     parser.add_argument("--preview-max-cells", type=int, default=10000, required=False, dest="preview_max_cells", metavar="C")
     parser.add_argument("--preview-seed",      type=int,   default=42,   required=False, dest="preview_seed", metavar="SEED")
+    parser.add_argument("--cell-universe-file", metavar="filtered_in.bin|filtered_out.bin", required=False, dest="cell_universe_file", default=None)
+    parser.add_argument("--cell-universe-mode", metavar="in|out", required=False, dest="cell_universe_mode", default=None)
 
     args = parser.parse_args()
 
