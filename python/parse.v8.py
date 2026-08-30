@@ -60,7 +60,7 @@ from ensembl_release_names import (  # noqa: E402
     DEFAULT_ENSEMBL_DATA_DIR,
     ENSEMBL_DB_LABELS,
     compute_feature_names as _compute_feature_names_shared,
-    load_ensembl_release_gene_names as _load_ensembl_release_gene_names_shared,
+    resolve_ensembl_release_gene_names as _resolve_ensembl_release_gene_names_shared,
     normalize_ensembl_stable_id,
     normalize_ercc_id,
 )
@@ -71,9 +71,13 @@ FEW_MISSING_PCT: Final[float] = 5.0  # genes missing but <= this % -> probably a
 
 
 def load_ensembl_release_gene_names(**kwargs):
-    """Parse wrapper: surface dump/resolution failures via ErrorJSON."""
+    """Parse wrapper: surface dump/resolution failures via ErrorJSON.
+
+    Returns (names, used_release). used_release may differ from the requested
+    release when gene.txt/xref.txt are missing or empty locally.
+    """
     try:
-        return _load_ensembl_release_gene_names_shared(**kwargs)
+        return _resolve_ensembl_release_gene_names_shared(**kwargs)
     except ValueError as e:
         ErrorJSON(str(e))
 
@@ -2856,15 +2860,21 @@ class LoomFile:
                     "Cannot resolve feature_name: ensembl_release could not be determined "
                     "from gene coverage or organism.latest_ensembl_release"
                 )
-            release_names = load_ensembl_release_gene_names(
+            release_names, names_release = load_ensembl_release_gene_names(
                 ensembl_subdomain=organism_info.get("ensembl_subdomain") or "",
                 ensembl_db_name=organism_info.get("ensembl_db_name") or "",
                 release=int(ensembl_release),
                 ensembl_ids=[i for i in gene_ids_for_lookup if i],
             )
+            fallback_note = (
+                f" (fallback from release {int(ensembl_release)})"
+                if int(names_release) != int(ensembl_release)
+                else ""
+            )
             result.setdefault("messages", []).append(
                 f"Resolved feature_name from Ensembl {organism_info.get('ensembl_subdomain')}/"
-                f"{int(ensembl_release)}/{organism_info.get('ensembl_db_name')} "
+                f"{int(names_release)}/{organism_info.get('ensembl_db_name')}"
+                f"{fallback_note} "
                 f"({len(release_names)} genes with dump rows)."
             )
 

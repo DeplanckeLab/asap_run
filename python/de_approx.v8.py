@@ -74,6 +74,19 @@ class ErrorJSON(Exception):
         print(json.dumps({"displayed_error": message}, ensure_ascii=False))
         os._exit(1)
 
+
+CELL_UNIVERSE_FILTER_HINT = (
+    " A cell-universe filter was applied; this is likely due to too stringent filtering "
+    "that removed all cells for this group. Relax or clear the cell filter and retry."
+)
+
+
+def _with_cell_universe_hint(message: str, cell_universe_applied: bool) -> str:
+    if not cell_universe_applied:
+        return message
+    return message + CELL_UNIVERSE_FILTER_HINT
+
+
 ## Loom File I/O class
 class LoomHandler:
     """
@@ -1371,12 +1384,14 @@ def run(args: argparse.Namespace) -> None:
             batch_data  = None
             batch_names = []
 
+        cell_universe_filter_applied = False
         universe = _load_cell_universe_mask(
             getattr(args, "cell_universe_file", None),
             getattr(args, "cell_universe_mode", None),
             n_cells,
         )
         if not bool(np.all(universe)):
+            cell_universe_filter_applied = True
             n_keep = int(universe.sum())
             data_warnings.append(
                 f"Cell universe filter applied: kept {n_keep} of {n_cells} cells "
@@ -1589,7 +1604,10 @@ def run(args: argparse.Namespace) -> None:
     elif mode == "single_marker":
         candidates_1 = np.where(groups_1 == group1)[0]
         if len(candidates_1) == 0:
-            ErrorJSON(f"Group 1 label {group1!r} was not found in {group_dataset_path!r}.")
+            ErrorJSON(_with_cell_universe_hint(
+                f"Group 1 label {group1!r} was not found in {group_dataset_path!r}.",
+                cell_universe_filter_applied,
+            ))
 
         cell_group = np.zeros(n_cells, dtype=int)
         cell_group[candidates_1] = 1
@@ -1725,9 +1743,15 @@ def run(args: argparse.Namespace) -> None:
         candidates_2 = np.where(groups_2 == group2)[0]
 
         if len(candidates_1) == 0:
-            ErrorJSON(f"Group 1 label {group1!r} was not found in {group_dataset_path!r}.")
+            ErrorJSON(_with_cell_universe_hint(
+                f"Group 1 label {group1!r} was not found in {group_dataset_path!r}.",
+                cell_universe_filter_applied,
+            ))
         if len(candidates_2) == 0:
-            ErrorJSON(f"Group 2 label {group2!r} was not found in {group_dataset_2_path!r}.")
+            ErrorJSON(_with_cell_universe_hint(
+                f"Group 2 label {group2!r} was not found in {group_dataset_2_path!r}.",
+                cell_universe_filter_applied,
+            ))
 
         # Remove cells that appear in both groups from group 2
         overlap = np.intersect1d(candidates_1, candidates_2)

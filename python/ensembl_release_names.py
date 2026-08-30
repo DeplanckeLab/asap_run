@@ -3,11 +3,18 @@
 
 Mirrors ASAP EnsemblReleaseGeneNameResolver / update_genes.rake:
 display_xref name when assigned, otherwise the Ensembl stable_id.
+
+When gene.txt/xref.txt are missing or empty for the requested release
+(e.g. Ensembl published empty xref dumps), the nearest available next or
+previous release under ENSEMBL_DATA_DIR is used for name resolution.
+Tables are read in-memory (or from existing files); the Ensembl tree is
+never written — asap_run mounts it read-only.
 """
 
 from __future__ import annotations
 
 import gzip
+import io
 import os
 import re
 import tarfile
@@ -83,26 +90,59 @@ def _ensembl_gene_name_from_display_xref(
     return cleaned or stable_id
 
 
-def _ensembl_ensure_table_file(
+def _available_releases(subdomain: str) -> list[int]:
+    releases: set[int] = set()
+    for base in ensembl_data_base_dirs():
+        sub_dir = base / subdomain
+        if not sub_dir.is_dir():
+            continue
+        for child in sub_dir.iterdir():
+            if child.is_dir() and child.name.isdigit():
+                releases.add(int(child.name))
+    return sorted(releases)
+
+
+def _releases_by_distance(preferred: int, available: list[int]) -> list[int]:
+    """Preferred first, then nearest neighbors; on ties prefer next over previous."""
+    if not available:
+        return []
+    ordered = sorted(
+        available,
+        key=lambda release: (
+            abs(release - preferred),
+            0 if release >= preferred else 1,
+            release,
+        ),
+    )
+    return ordered
+
+
+def _resolve_release_dir(subdomain: str, release: int) -> Path | None:
+    for base in ensembl_data_base_dirs():
+        candidate = base / subdomain / str(int(release))
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _read_table_bytes(
     organism_dir: Path, release_dir: Path, ensembl_db_name: str, table_name: str
-) -> Path | None:
+) -> bytes | None:
+    """Return non-empty table contents without writing into the Ensembl tree."""
     path = organism_dir / table_name
     if path.is_file() and path.stat().st_size > 0:
-        return path
+        return path.read_bytes()
 
     gz_path = organism_dir / f"{table_name}.gz"
-    if gz_path.is_file():
-        organism_dir.mkdir(parents=True, exist_ok=True)
-        with gzip.open(gz_path, "rb") as src, open(path, "wb") as dst:
-            dst.write(src.read())
-        if path.is_file() and path.stat().st_size > 0:
-            return path
+    if gz_path.is_file() and gz_path.stat().st_size > 0:
+        with gzip.open(gz_path, "rb") as src:
+            raw = src.read()
+        return raw if raw else None
 
     archive = release_dir / f"{ensembl_db_name}.tgz"
     if not archive.is_file():
         return None
 
-    organism_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
         members = [
             m
@@ -122,58 +162,25 @@ def _ensembl_ensure_table_file(
         raw = extracted.read()
         if member.name.endswith(".gz"):
             raw = gzip.decompress(raw)
-        out_path = organism_dir / table_name
-        with open(out_path, "wb") as dst:
-            dst.write(raw)
-        return out_path if out_path.is_file() and out_path.stat().st_size > 0 else None
+        return raw if raw else None
 
 
-def load_ensembl_release_gene_names(
+def _load_names_from_release_dir(
     *,
-    ensembl_subdomain: str,
+    release_dir: Path,
     ensembl_db_name: str,
-    release: int,
-    ensembl_ids: list[str],
-) -> dict[str, str]:
-    """Map Ensembl stable_id -> display gene_name for one release (else stable_id)."""
-    subdomain = (ensembl_subdomain or "").strip().lower()
-    db_name = (ensembl_db_name or "").strip()
-    if not subdomain or not db_name or int(release) <= 0:
-        raise ValueError(
-            "Cannot resolve feature_name: ensembl_subdomain, ensembl_db_name, "
-            "and ensembl_release are required"
-        )
-
-    target_ids = {normalize_ensembl_stable_id(i) for i in ensembl_ids}
-    target_ids.discard(None)
-    if not target_ids:
-        return {}
-
-    release_dir = None
-    for base in ensembl_data_base_dirs():
-        candidate = base / subdomain / str(int(release))
-        if candidate.is_dir():
-            release_dir = candidate
-            break
-    if release_dir is None:
-        searched = ", ".join(str(p) for p in ensembl_data_base_dirs()) or "(none)"
-        raise ValueError(
-            f"Cannot resolve feature_name: Ensembl release directory not found for "
-            f"{subdomain}/{int(release)} under {searched}. "
-            f"Set ENSEMBL_DATA_DIR (default {DEFAULT_ENSEMBL_DATA_DIR})."
-        )
-
-    organism_dir = release_dir / db_name
-    gene_path = _ensembl_ensure_table_file(organism_dir, release_dir, db_name, "gene.txt")
-    xref_path = _ensembl_ensure_table_file(organism_dir, release_dir, db_name, "xref.txt")
-    if gene_path is None or xref_path is None:
-        raise ValueError(
-            f"Cannot resolve feature_name: gene.txt/xref.txt missing for "
-            f"{subdomain}/{int(release)}/{db_name} under {release_dir}"
-        )
+    target_ids: set[str],
+) -> dict[str, str] | None:
+    organism_dir = release_dir / ensembl_db_name
+    gene_raw = _read_table_bytes(organism_dir, release_dir, ensembl_db_name, "gene.txt")
+    xref_raw = _read_table_bytes(organism_dir, release_dir, ensembl_db_name, "xref.txt")
+    if gene_raw is None or xref_raw is None:
+        return None
 
     xref_names: dict[str, str] = {}
-    with open(xref_path, "r", encoding="iso-8859-1", errors="replace") as fh:
+    with io.TextIOWrapper(
+        io.BytesIO(xref_raw), encoding="iso-8859-1", errors="replace"
+    ) as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             if len(parts) <= ENSEMBL_XREF_NAME_COLUMN:
@@ -181,7 +188,9 @@ def load_ensembl_release_gene_names(
             xref_names[parts[ENSEMBL_XREF_ID_COLUMN]] = parts[ENSEMBL_XREF_NAME_COLUMN]
 
     names: dict[str, str] = {}
-    with open(gene_path, "r", encoding="iso-8859-1", errors="replace") as fh:
+    with io.TextIOWrapper(
+        io.BytesIO(gene_raw), encoding="iso-8859-1", errors="replace"
+    ) as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             if len(parts) <= ENSEMBL_GENE_STABLE_ID_COLUMN:
@@ -193,6 +202,79 @@ def load_ensembl_release_gene_names(
             names[stable_id] = _ensembl_gene_name_from_display_xref(
                 display_xref_id, xref_names, stable_id
             )
+    return names
+
+
+def resolve_ensembl_release_gene_names(
+    *,
+    ensembl_subdomain: str,
+    ensembl_db_name: str,
+    release: int,
+    ensembl_ids: list[str],
+) -> tuple[dict[str, str], int]:
+    """Map stable_id -> display name; may use a neighbor release if dumps are empty.
+
+    Returns (names, used_release).
+    """
+    subdomain = (ensembl_subdomain or "").strip().lower()
+    db_name = (ensembl_db_name or "").strip()
+    preferred = int(release)
+    if not subdomain or not db_name or preferred <= 0:
+        raise ValueError(
+            "Cannot resolve feature_name: ensembl_subdomain, ensembl_db_name, "
+            "and ensembl_release are required"
+        )
+
+    target_ids = {normalize_ensembl_stable_id(i) for i in ensembl_ids}
+    target_ids.discard(None)
+    if not target_ids:
+        return {}, preferred
+
+    available = _available_releases(subdomain)
+    candidates = _releases_by_distance(preferred, available)
+    if not candidates:
+        searched = ", ".join(str(p) for p in ensembl_data_base_dirs()) or "(none)"
+        raise ValueError(
+            f"Cannot resolve feature_name: no Ensembl release directories for "
+            f"{subdomain} under {searched}. "
+            f"Set ENSEMBL_DATA_DIR (default {DEFAULT_ENSEMBL_DATA_DIR})."
+        )
+
+    tried: list[int] = []
+    for candidate in candidates:
+        release_dir = _resolve_release_dir(subdomain, candidate)
+        if release_dir is None:
+            continue
+        tried.append(candidate)
+        names = _load_names_from_release_dir(
+            release_dir=release_dir,
+            ensembl_db_name=db_name,
+            target_ids=target_ids,
+        )
+        if names is not None:
+            return names, candidate
+
+    raise ValueError(
+        f"Cannot resolve feature_name: gene.txt/xref.txt missing or empty for "
+        f"{subdomain}/{db_name} at release {preferred} and neighbors "
+        f"(tried {tried})"
+    )
+
+
+def load_ensembl_release_gene_names(
+    *,
+    ensembl_subdomain: str,
+    ensembl_db_name: str,
+    release: int,
+    ensembl_ids: list[str],
+) -> dict[str, str]:
+    """Map Ensembl stable_id -> display gene_name (neighbor fallback if needed)."""
+    names, _used_release = resolve_ensembl_release_gene_names(
+        ensembl_subdomain=ensembl_subdomain,
+        ensembl_db_name=ensembl_db_name,
+        release=release,
+        ensembl_ids=ensembl_ids,
+    )
     return names
 
 
