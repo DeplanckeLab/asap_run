@@ -43,10 +43,10 @@ METHOD_NAME_MAP: Final[dict[str, str]] = {
 }
 COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
 BATCH_SUPPORT:      Final[set] = {"deseq2"}
-DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2"]
+DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2", "Tau", "Specificity"]
 DE_NB_COLS: Final[int] = len(DE_HEADERS)  # Number of DE statistic columns per comparison
 
-# FindAllMarkers (each group vs. rest): 8 columns — tested group label, ids, gene name, then five stats
+# FindAllMarkers (each group vs. rest): 10 columns — tested group label, ids, gene name, then seven stats
 FIND_ALL_MARKERS_GROUP_HEADER: Final[str] = "Compared group"
 DE_HEADERS_FIND_ALL: Final[list[str]] = [
     "log Fold-Change",
@@ -54,7 +54,22 @@ DE_HEADERS_FIND_ALL: Final[list[str]] = [
     "FDR",
     "Avg. exp. (tested group)",
     "Avg. exp. (other cells)",
+    "Tau",
+    "Specificity",
 ]
+
+## Gene specificity metrics
+# Specificity = pct.1 / (pct.2 + SPECIFICITY_PSEUDOCOUNT), the Seurat-style ratio of detection rates.
+SPECIFICITY_PSEUDOCOUNT: Final[float] = 1e-3
+# A cell counts as expressing a gene when its value is strictly above this threshold.
+DETECTION_THRESHOLD: Final[float] = 0.0
+# Tau is computed either over every category of --group-dataset ("all-groups", default) or over the
+# two compared cell sets only ("comparison").
+TAU_SCOPES: Final[tuple] = ("all-groups", "comparison")
+
+# Streaming mode keeps the full cell axis, so cells outside the analysis universe are relabelled
+# with this sentinel instead of being dropped. It is excluded from category lists and from tau.
+OUT_OF_UNIVERSE_SENTINEL: Final[str] = "\x00__asap_out_of_universe__\x00"
 
 # Column layout written to /attrs (must match nber_cols / headers in output.json)
 DE_METADATA_HEADERS_PAIRWISE: Final[list[str]] = ["ensembl_id", "gene_name"] + DE_HEADERS
@@ -405,13 +420,14 @@ def _de_table_gene_order_pairwise(
 
 def _fam_table_row_count(
     unique_groups: list[str],
-    all_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    all_results: dict[str, tuple[np.ndarray, ...]],
     pool: np.ndarray,
     n_top_per_direction: int | None,
 ) -> int:
     n = 0
     for grp in unique_groups:
-        pvals, _padj, lfc, _a1, _a2 = all_results[grp]
+        res = all_results[grp]
+        pvals, lfc = res[0], res[2]
         n += int(_de_table_gene_order_pairwise(lfc, pvals, pool, n_top_per_direction).size)
     return n
 
@@ -426,7 +442,7 @@ def write_tsv(
 ) -> str:
     """
     Write DE results to a TSV file.
-    rows is a list of (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2).
+    rows is a list of (group_label | None, lfc, pvals, fdr, ave_g1, ave_g2, tau, specificity).
     If group_label is not None for the first entry, a leading 'group' column is included.
     table_top_de_per_direction: if set, only top N up- and top N down-regulated genes by p-value (see _de_table_gene_order_pairwise).
     """
@@ -436,7 +452,7 @@ def write_tsv(
     sub = np.arange(n_genes, dtype=np.intp)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\t".join(headers) + "\n")
-        for grp, lfc, pvals, fdr, ave_g1, ave_g2 in rows:
+        for grp, lfc, pvals, fdr, ave_g1, ave_g2, tau, spec in rows:
             sort_idx = _de_table_gene_order_pairwise(lfc, pvals, sub, table_top_de_per_direction)
             for i in sort_idx:
                 row = []
@@ -450,6 +466,8 @@ def write_tsv(
                     f"{fdr[i]}"   if not np.isnan(fdr[i])   else "NA",
                     f"{ave_g1[i]}",
                     f"{ave_g2[i]}",
+                    f"{tau[i]}"   if not np.isnan(tau[i])   else "NA",
+                    f"{spec[i]}"  if not np.isnan(spec[i])  else "NA",
                 ]
                 fh.write("\t".join(row) + "\n")
     return out_path
@@ -506,7 +524,7 @@ def build_result_json(
     column_names on the HDF5 node). Uses key "headers" (plural) for Rails finish_run.
     """
     if unique_groups is not None:
-        # FindAllMarkers: 8 columns — compared group, ids, gene name, then five vs-rest statistics
+        # FindAllMarkers: 10 columns — compared group, ids, gene name, then seven vs-rest statistics
         return {
             "metadata": [
                 {
@@ -542,6 +560,8 @@ def build_metadata_matrix_single(
     fdr: np.ndarray,
     ave_g1: np.ndarray,
     ave_g2: np.ndarray,
+    tau: np.ndarray,
+    specificity: np.ndarray,
     table_top_de_per_direction: int | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     headers = list(DE_METADATA_HEADERS_PAIRWISE)
@@ -552,6 +572,7 @@ def build_metadata_matrix_single(
     gene_names_s = [gene_names[i] for i in sort_idx]
     lfc_s   = lfc[sort_idx];   pvals_s = pvals[sort_idx]
     fdr_s   = fdr[sort_idx];   ave_g1_s = ave_g1[sort_idx];  ave_g2_s = ave_g2[sort_idx]
+    tau_s   = tau[sort_idx];   spec_s   = specificity[sort_idx]
     data = np.column_stack([
         np.array(ens_ids_s, dtype=object),
         np.array(gene_names_s, dtype=object),
@@ -560,6 +581,8 @@ def build_metadata_matrix_single(
         np.array([f"{v}" if not np.isnan(v) else "NA" for v in fdr_s], dtype=object),
         np.array([f"{v}" for v in ave_g1_s], dtype=object),
         np.array([f"{v}" for v in ave_g2_s], dtype=object),
+        np.array([f"{v}" if not np.isnan(v) else "NA" for v in tau_s], dtype=object),
+        np.array([f"{v}" if not np.isnan(v) else "NA" for v in spec_s], dtype=object),
     ])
     return data, headers
 
@@ -567,7 +590,7 @@ def build_metadata_matrix_all_markers(
     ens_ids: list[str],
     gene_names: list[str],
     unique_groups: list[str],
-    all_results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    all_results: dict[str, tuple[np.ndarray, ...]],
     table_top_de_per_direction: int | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """
@@ -580,7 +603,7 @@ def build_metadata_matrix_all_markers(
     sub = np.arange(n_genes, dtype=np.intp)
     rows = []
     for grp in unique_groups:
-        pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
+        pvals, padj, lfc, ave_g1, ave_g2, tau, spec = all_results[grp]
         sort_idx = _de_table_gene_order_pairwise(lfc, pvals, sub, table_top_de_per_direction)
         for i in sort_idx:
             rows.append([
@@ -592,6 +615,8 @@ def build_metadata_matrix_all_markers(
                 f"{padj[i]}"  if not np.isnan(padj[i])  else "NA",
                 f"{ave_g1[i]}",
                 f"{ave_g2[i]}",
+                f"{tau[i]}"   if not np.isnan(tau[i])   else "NA",
+                f"{spec[i]}"  if not np.isnan(spec[i])  else "NA",
             ])
     return np.array(rows, dtype=object), headers
 
@@ -647,6 +672,271 @@ def _perf_span(label: str):
     t0 = time.perf_counter()
     yield
     _perf_log(f"[de_perf] {label}: {time.perf_counter() - t0:.3f}s")
+
+## Gene specificity metrics (tau + pct-based specificity score)
+def _gene_block_rows(n_cells: int) -> int:
+    """Gene rows per blocked read; reuses the streaming block size so reads align with the sidecar chunking."""
+    return int(de_stream.gene_block_size(max(int(n_cells), 1)))
+
+@contextmanager
+def _specificity_matrix(
+    data_matrix: np.ndarray | None,
+    loom_path: str,
+    input_dataset: str,
+    use_stream: bool,
+):
+    """
+    Yield the matrix used for the specificity metrics: the in-memory array, or the gene-chunked
+    sidecar dataset in streaming mode (already built by the DE pass, so this is a cache hit).
+    """
+    if not use_stream:
+        if data_matrix is None:
+            ErrorJSON("Internal error: no expression matrix available for the specificity metrics.")
+        yield data_matrix
+    else:
+        with de_stream.open_chunked_by_gene_matrix(loom_path, input_dataset) as matrix:
+            yield matrix
+
+def _column_sums_blocked(matrix, gblock: int | None = None) -> np.ndarray:
+    """Per-cell library sizes (sum over genes). Works on an ndarray or an h5py Dataset."""
+    n_genes, n_cells = int(matrix.shape[0]), int(matrix.shape[1])
+    gblock = gblock or _gene_block_rows(n_cells)
+    out = np.zeros(n_cells, dtype=np.float64)
+    for g0 in range(0, n_genes, gblock):
+        g1 = min(n_genes, g0 + gblock)
+        out += np.asarray(matrix[g0:g1, :], dtype=np.float64).sum(axis=0)
+    return out
+
+def _library_sizes_for_specificity(matrix, loom_path: str, n_cells: int) -> np.ndarray:
+    """Library sizes from /col_attrs/_Depth when usable, else summed from the matrix (one extra pass)."""
+    try:
+        with h5py.File(loom_path, "r") as f:
+            if "/col_attrs/_Depth" in f:
+                depth = np.asarray(f["/col_attrs/_Depth"][:], dtype=np.float64).ravel()
+                if int(depth.shape[0]) == int(n_cells):
+                    return depth
+    except OSError:
+        pass
+    return _column_sums_blocked(matrix)
+
+def _count_scale_from_library_sizes(lib_sizes: np.ndarray) -> np.ndarray:
+    """Per-cell factor that normalizes counts to 10 000 per cell (0 for empty cells)."""
+    lib = np.asarray(lib_sizes, dtype=np.float64).ravel()
+    scale = np.zeros(lib.shape[0], dtype=np.float64)
+    np.divide(1e4, lib, out=scale, where=lib > 0)
+    return scale
+
+def _blocked_detection_and_means(
+    matrix,
+    masks: list[np.ndarray],
+    scale: np.ndarray | None = None,
+    log1p: bool = False,
+    gblock: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    One blocked pass over genes computing, for each mask:
+      - detection fraction: share of cells in the mask with value > DETECTION_THRESHOLD (Seurat's pct.x)
+      - mean expression:    mean over the cells in the mask
+
+    matrix : (n_genes, n_cells) ndarray or h5py Dataset (streaming path).
+    masks  : list of boolean arrays of length n_cells; they need not be disjoint.
+    scale / log1p : optional per-cell scaling then log1p applied before the means only
+                    (counts -> 10k + log1p, same scale the DE tests use). Detection is always
+                    computed on the input values — a positive monotone transform cannot change it.
+
+    Membership is a one-hot (n_cells, n_masks) matrix, so both quantities come out of two GEMMs per
+    gene block: no gene loop in Python, and peak memory stays at one block even for looms that are
+    too large to densify.
+
+    Returns (pct, means, n_per_mask): pct/means shape (n_masks, n_genes), n_per_mask shape (n_masks,).
+    NaN for masks that contain no cell.
+    """
+    if not masks:
+        ErrorJSON("Internal error: no cell mask given for the specificity metrics.")
+    n_genes, n_cells = int(matrix.shape[0]), int(matrix.shape[1])
+    gblock = gblock or _gene_block_rows(n_cells)
+    n_masks = len(masks)
+
+    M = np.zeros((n_cells, n_masks), dtype=np.float32)  # one-hot membership, one column per mask
+    for k, m in enumerate(masks):
+        mm = np.asarray(m, dtype=bool).ravel()
+        if mm.shape[0] != n_cells:
+            ErrorJSON("Internal error: specificity mask length does not match the number of cells.")
+        M[mm, k] = 1.0
+    n_per = M.sum(axis=0, dtype=np.float64)
+
+    det = np.zeros((n_masks, n_genes), dtype=np.float64)
+    tot = np.zeros((n_masks, n_genes), dtype=np.float64)
+    scale32 = None if scale is None else np.asarray(scale, dtype=np.float32).ravel()
+
+    t0 = time.perf_counter() if _perf_enabled() else 0.0
+    for g0 in range(0, n_genes, gblock):
+        g1 = min(n_genes, g0 + gblock)
+        block = np.asarray(matrix[g0:g1, :], dtype=np.float32, order="C")
+        det[:, g0:g1] = ((block > DETECTION_THRESHOLD).astype(np.float32) @ M).T
+        if scale32 is not None:
+            block = block * scale32
+        if log1p:
+            np.log1p(block, out=block)
+        tot[:, g0:g1] = (block @ M).T
+    _perf_log(
+        f"[de_perf] specificity detection+means: {time.perf_counter() - t0:.3f}s "
+        f"genes={n_genes} cells={n_cells} masks={n_masks} gene_block={gblock}"
+    )
+
+    denom = n_per[:, None]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pct   = np.where(denom > 0, det / denom, np.nan)
+        means = np.where(denom > 0, tot / denom, np.nan)
+    return pct, means, n_per
+
+def compute_tau(group_means: np.ndarray) -> np.ndarray:
+    """
+    Tau specificity index (Yanai et al. 2005), per gene, from mean expression per group:
+
+        tau = sum_i (1 - x_i / max_i(x_i)) / (n_groups - 1)
+
+    tau = 0 -> the gene is expressed at the same level in every group (housekeeping-like);
+    tau = 1 -> the gene is expressed in a single group only (perfect marker).
+    Negative means are clipped to 0. NaN when fewer than 2 groups are available or when the
+    gene is not detected anywhere (max = 0).
+
+    group_means : (n_groups, n_genes)
+    """
+    x = np.asarray(group_means, dtype=np.float64)
+    if x.ndim != 2:
+        ErrorJSON("Internal error: compute_tau expects a (n_groups, n_genes) matrix.")
+    n_groups, n_genes = x.shape
+    tau = np.full(n_genes, np.nan)
+    if n_groups < 2:
+        return tau
+    x = np.clip(np.where(np.isfinite(x), x, 0.0), 0.0, None)
+    xmax = x.max(axis=0)
+    ok = xmax > 0
+    if np.any(ok):
+        tau[ok] = np.sum(1.0 - (x[:, ok] / xmax[ok]), axis=0) / float(n_groups - 1)
+    return tau
+
+def compute_specificity(pct1: np.ndarray, pct2: np.ndarray, pseudocount: float = SPECIFICITY_PSEUDOCOUNT) -> np.ndarray:
+    """
+    Seurat-style specificity score: pct.1 / (pct.2 + pseudocount), where pct.x is the fraction of
+    cells expressing the gene in each compared set. The pseudocount (1e-3) keeps the score finite
+    when the gene is undetected in group 2; high values flag genes restricted to group 1.
+    """
+    p1 = np.asarray(pct1, dtype=np.float64)
+    p2 = np.asarray(pct2, dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return p1 / (p2 + float(pseudocount))
+
+def _tau_category_masks(
+    group_labels: np.ndarray,
+    universe_mask: np.ndarray | None = None,
+    exclude_labels: tuple = (),
+) -> list[np.ndarray]:
+    """One boolean mask per category present in group_labels (restricted to universe_mask)."""
+    labels = np.asarray(group_labels).astype(str)
+    universe = np.ones(labels.shape[0], dtype=bool) if universe_mask is None else np.asarray(universe_mask, dtype=bool)
+    excluded = set(exclude_labels)
+    masks: list[np.ndarray] = []
+    for cat in sorted({str(v) for v in labels[universe].tolist()} - excluded):
+        m = (labels == cat) & universe
+        if bool(m.any()):
+            masks.append(m)
+    return masks
+
+def specificity_metrics_pairwise(
+    matrix,
+    mask1: np.ndarray,
+    mask2: np.ndarray,
+    group_labels: np.ndarray | None = None,
+    tau_universe_mask: np.ndarray | None = None,
+    tau_scope: str = "all-groups",
+    is_count: bool = False,
+    exclude_labels: tuple = (),
+    loom_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Tau and specificity for a single comparison (single-marker or two-group mode).
+
+    Specificity always uses the two compared cell sets: pct(mask1) / (pct(mask2) + 1e-3).
+    Tau uses every category of group_labels inside tau_universe_mask when tau_scope is
+    "all-groups" (a gene-level specificity independent of the contrast), or the two compared
+    sets only when tau_scope is "comparison".
+
+    masks and group_labels are full-length (n_cells of matrix); cells outside both masks are
+    ignored for the specificity score.
+    Returns (tau, specificity), each shape (n_genes,).
+    """
+    masks = [np.asarray(mask1, dtype=bool), np.asarray(mask2, dtype=bool)]
+    n_comparison_masks = len(masks)
+    if tau_scope == "all-groups" and group_labels is not None:
+        masks += _tau_category_masks(group_labels, tau_universe_mask, exclude_labels)
+
+    scale = None
+    log1p = False
+    if is_count:
+        # Tau on counts is computed on 10k-normalized log1p values, i.e. the scale the DE tests use,
+        # so that uneven sequencing depth between groups does not drive the score.
+        lib = _library_sizes_for_specificity(matrix, loom_path, int(matrix.shape[1])) if loom_path else _column_sums_blocked(matrix)
+        scale = _count_scale_from_library_sizes(lib)
+        log1p = True
+
+    pct, means, n_per = _blocked_detection_and_means(matrix, masks, scale=scale, log1p=log1p)
+    specificity = compute_specificity(pct[0], pct[1])
+
+    if len(masks) > n_comparison_masks:  # tau over the categories of the annotation column
+        tau_means, tau_n = means[n_comparison_masks:], n_per[n_comparison_masks:]
+    else:                                # tau over the two compared cell sets
+        tau_means, tau_n = means[:n_comparison_masks], n_per[:n_comparison_masks]
+    tau = compute_tau(tau_means[tau_n > 0])
+    return tau, specificity
+
+def specificity_metrics_all_markers(
+    matrix,
+    group_labels: np.ndarray,
+    unique_groups: list[str],
+    keep_mask: np.ndarray | None = None,
+    is_count: bool = False,
+    loom_path: str | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """
+    Tau and per-group specificity for FindAllMarkers, in one pass over the matrix.
+
+    Tau is a single per-gene vector over all groups in unique_groups (it does not depend on which
+    group is being tested). Specificity for group g is pct(g) / (pct(rest) + 1e-3) where "rest" is
+    every kept cell outside g — derived exactly from the per-group detection counts, so no extra
+    pass over the matrix is needed.
+
+    Returns (tau, {group: specificity}).
+    """
+    labels = np.asarray(group_labels).astype(str)
+    keep = np.ones(labels.shape[0], dtype=bool) if keep_mask is None else np.asarray(keep_mask, dtype=bool)
+    masks = [(labels == str(grp)) & keep for grp in unique_groups]
+
+    scale = None
+    log1p = False
+    if is_count:
+        lib = _library_sizes_for_specificity(matrix, loom_path, int(matrix.shape[1])) if loom_path else _column_sums_blocked(matrix)
+        scale = _count_scale_from_library_sizes(lib)
+        log1p = True
+
+    pct, means, n_per = _blocked_detection_and_means(matrix, masks, scale=scale, log1p=log1p)
+
+    det = np.where(np.isnan(pct), 0.0, pct) * n_per[:, None]  # back to detected-cell counts
+    det_total = det.sum(axis=0)
+    n_total = float(n_per.sum())
+
+    specificity: dict[str, np.ndarray] = {}
+    for i, grp in enumerate(unique_groups):
+        n_rest = n_total - float(n_per[i])
+        if n_rest <= 0:
+            pct_rest = np.full(det_total.shape[0], np.nan)
+        else:
+            pct_rest = (det_total - det[i]) / n_rest
+        specificity[str(grp)] = compute_specificity(pct[i], pct_rest)
+
+    tau = compute_tau(means[n_per > 0])
+    return tau, specificity
 
 ## DE method runners
 def run_scanpy_method(
@@ -1230,6 +1520,10 @@ def run(args: argparse.Namespace) -> None:
         if not args.write_metadata.startswith("/attrs/"):
             ErrorJSON("--write-metadata path should refer to the /attrs/ path (e.g. /attrs/_de_2_wilcoxon)")
 
+    tau_scope = str(getattr(args, "tau_scope", "all-groups")).strip().lower()
+    if tau_scope not in TAU_SCOPES:
+        ErrorJSON(f"--tau-scope must be one of: {', '.join(TAU_SCOPES)}")
+
     tt_raw = getattr(args, "table_top_de_per_direction", None)
     if tt_raw is not None and int(tt_raw) < 1:
         ErrorJSON("--table-top-de-per-direction must be >= 1 when set")
@@ -1408,7 +1702,7 @@ def run(args: argparse.Namespace) -> None:
                 universe = np.ones(n_cells, dtype=bool)
             else:
                 # Streaming path: keep full matrix axis, blank labels outside the universe.
-                sentinel = "\x00__asap_out_of_universe__\x00"
+                sentinel = OUT_OF_UNIVERSE_SENTINEL
                 groups_1 = np.array(groups_1, copy=True)
                 groups_1[~universe] = sentinel
                 if groups_2 is not None:
@@ -1419,14 +1713,14 @@ def run(args: argparse.Namespace) -> None:
 
     list_cats_json_1 = [
         c for c in _unique_categories_sorted(groups_1)
-        if c != "\x00__asap_out_of_universe__\x00"
+        if c != OUT_OF_UNIVERSE_SENTINEL
     ]
     if mode == "all_markers" and groups_2 is not None:
         list_cats_json_1 = sorted(
             set(list_cats_json_1)
             | {
                 c for c in _unique_categories_sorted(groups_2)
-                if c != "\x00__asap_out_of_universe__\x00"
+                if c != OUT_OF_UNIVERSE_SENTINEL
             }
         )
 
@@ -1513,16 +1807,32 @@ def run(args: argparse.Namespace) -> None:
         else:
             all_results = run_scanpy_all_markers(data_matrix, groups_1, gene_names, method, is_count=is_count_table)
 
-        # Stack results as (5 * n_groups, n_genes) in DE_HEADERS order [lfc, pvals, fdr, ave_g1, ave_g2] per group.
+        # Tau (one vector for all groups) + per-group specificity, from a single pass over the matrix
+        # (the gene-chunked sidecar in streaming mode, so no full densify).
+        with _perf_span("specificity metrics FindAllMarkers"):
+            with _specificity_matrix(data_matrix, str(input_path), args.input_dataset, use_t_test_approx_stream) as spec_matrix:
+                tau_all, spec_by_group = specificity_metrics_all_markers(
+                    spec_matrix,
+                    groups_1,
+                    unique_groups,
+                    keep_mask=cell_keep_am,
+                    is_count=is_count_table,
+                    loom_path=str(input_path),
+                )
+        for grp in unique_groups:
+            all_results[grp] = tuple(all_results[grp]) + (tau_all, spec_by_group[grp])
+
+        # Stack results as (7 * n_groups, n_genes) in DE_HEADERS order
+        # [lfc, pvals, fdr, ave_g1, ave_g2, tau, specificity] per group.
         blocks = []
         n_genes_tested = 0
         n_genes_fdr_le_5pct = 0
         for grp in unique_groups:
-            pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
-            blocks.append(np.vstack([lfc, pvals, padj, ave_g1, ave_g2]))
+            pvals, padj, lfc, ave_g1, ave_g2, tau, spec = all_results[grp]
+            blocks.append(np.vstack([lfc, pvals, padj, ave_g1, ave_g2, tau, spec]))
             n_genes_tested += _count_tested(pvals)
             n_genes_fdr_le_5pct += _count_significant(padj)
-        data_out = np.vstack(blocks)  # shape: (5 * n_groups, n_genes)
+        data_out = np.vstack(blocks)  # shape: (7 * n_groups, n_genes)
 
         # TSV output — Extra leading column "group" to identify which group each row belongs to.
         if write_tsv_output:
@@ -1532,7 +1842,7 @@ def run(args: argparse.Namespace) -> None:
                     ErrorJSON("FindAllMarkers per-category TSV requires a category list; internal error (all_categories unset).")
                 cat_index_map = {cat: i + 1 for i, cat in enumerate(all_categories)}
                 for grp in unique_groups:
-                    pvals_g, padj_g, lfc_g, ave_g1_g, ave_g2_g = all_results[grp]
+                    pvals_g, padj_g, lfc_g, ave_g1_g, ave_g2_g, tau_g, spec_g = all_results[grp]
                     grp_idx = cat_index_map.get(grp)
                     if grp_idx is None:
                         ErrorJSON(
@@ -1544,12 +1854,13 @@ def run(args: argparse.Namespace) -> None:
                         out_tsv,
                         ens_ids,
                         gene_names,
-                        [(None, lfc_g, pvals_g, padj_g, ave_g1_g, ave_g2_g)],
+                        [(None, lfc_g, pvals_g, padj_g, ave_g1_g, ave_g2_g, tau_g, spec_g)],
                         table_top_de_per_direction=table_top_de_per_direction,
                     )
                     split_tsv_paths.append(out_tsv)
             else:
-                tsv_rows = [(grp, all_results[grp][2], all_results[grp][0], all_results[grp][1], all_results[grp][3], all_results[grp][4]) for grp in unique_groups]  # (grp, lfc, pvals, fdr, ave_g1, ave_g2)
+                # (grp, lfc, pvals, fdr, ave_g1, ave_g2, tau, specificity)
+                tsv_rows = [(grp, all_results[grp][2], all_results[grp][0], all_results[grp][1], all_results[grp][3], all_results[grp][4], all_results[grp][5], all_results[grp][6]) for grp in unique_groups]
                 out_tsv = os.path.join(output_dir, "output.tsv")
                 tsv_path = write_tsv(
                     out_tsv,
@@ -1583,6 +1894,7 @@ def run(args: argparse.Namespace) -> None:
             unique_groups,
         )
         result["mode"] = "FindAllMarkers"
+        result["tau_scope"] = "all-groups"  # tau always spans every tested group in this mode
         result["number_of_groups"] = len(unique_groups)
         result["group_sizes"] = group_sizes
         result["number_of_genes_tested"] = n_genes_tested
@@ -1647,6 +1959,7 @@ def run(args: argparse.Namespace) -> None:
             else:
                 data_matrix = data_matrix[:, cell_idx]
                 cell_group = cg_sub
+                groups_1 = groups_1[cell_idx]  # keep the annotation aligned with the matrix (used by tau)
                 if batch_data is not None:
                     batch_data = batch_data[cell_idx]
                 n_genes, n_cells = data_matrix.shape
@@ -1682,7 +1995,23 @@ def run(args: argparse.Namespace) -> None:
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix, cell_group, gene_names, method, is_count=is_count_table)
 
-        data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
+        # Specificity: group 1 vs. the other cells. Tau: across every category of --group-dataset
+        # inside the analysis universe (or across the two compared sets with --tau-scope comparison).
+        with _perf_span("specificity metrics single_marker"):
+            with _specificity_matrix(data_matrix, str(input_path), args.input_dataset, use_t_test_approx_stream) as spec_matrix:
+                out_tau, out_spec = specificity_metrics_pairwise(
+                    spec_matrix,
+                    cell_group == 1,
+                    cell_group == 2,
+                    group_labels=groups_1,
+                    tau_universe_mask=cell_group > 0,
+                    tau_scope=tau_scope,
+                    is_count=is_count_table,
+                    exclude_labels=(OUT_OF_UNIVERSE_SENTINEL,),
+                    loom_path=str(input_path),
+                )
+
+        data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2, out_tau, out_spec])  # (7, n_genes)
 
         # TSV — no extra "group" column
         if write_tsv_output:
@@ -1691,7 +2020,7 @@ def run(args: argparse.Namespace) -> None:
                 out_tsv,
                 ens_ids,
                 gene_names,
-                [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)],
+                [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2, out_tau, out_spec)],
                 table_top_de_per_direction=table_top_de_per_direction,
             )
 
@@ -1709,6 +2038,8 @@ def run(args: argparse.Namespace) -> None:
                 out_fdr,
                 ave_g1,
                 ave_g2,
+                out_tau,
+                out_spec,
                 table_top_de_per_direction=table_top_de_per_direction,
             )
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
@@ -1718,6 +2049,7 @@ def run(args: argparse.Namespace) -> None:
         nber_rows_sm = int(_de_table_gene_order_pairwise(out_lfc, out_pvals, pool_sm, table_top_de_per_direction).size)
         result = build_result_json(args.write_metadata if write_metadata_output else None, nber_rows_sm)
         result["mode"] = "Single marker"
+        result["tau_scope"] = tau_scope
         result["group_name"] = group1
         result["group2_name"] = None
         result["group_size"] = group1_size
@@ -1822,6 +2154,11 @@ def run(args: argparse.Namespace) -> None:
                         )
                 data_matrix_sub = data_matrix_sub[:, cell_idx]
                 cell_group_sub = cg2
+                # Mirror the preview selection onto the full-length labels (used by the metrics below).
+                selected_full = keep_idx[cell_idx]
+                cell_group_preview = np.zeros(n_cells, dtype=int)
+                cell_group_preview[selected_full] = cell_group[selected_full]
+                cell_group = cell_group_preview
                 if batch_data_sub is not None:
                     batch_data_sub = batch_data_sub[cell_idx]
                 group1_size = int((cell_group_sub == 1).sum())
@@ -1858,7 +2195,25 @@ def run(args: argparse.Namespace) -> None:
         else:
             out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_scanpy_method(data_matrix_sub, cell_group_sub, gene_names, method, is_count=is_count_table)
 
-        data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2])  # (5, n_genes)
+        # Specificity: group 1 vs. group 2 (overlapping cells already removed from group 2), i.e. the
+        # exact contrast that was tested. Tau: over all categories of --group-dataset by default, so it
+        # stays comparable between comparisons; use --tau-scope comparison to restrict it to group 1 vs 2.
+        # Full matrix + full-length masks — equivalent to using the tested subset.
+        with _perf_span("specificity metrics two_group"):
+            with _specificity_matrix(data_matrix, str(input_path), args.input_dataset, use_t_test_approx_stream) as spec_matrix:
+                out_tau, out_spec = specificity_metrics_pairwise(
+                    spec_matrix,
+                    cell_group == 1,
+                    cell_group == 2,
+                    group_labels=groups_1,
+                    tau_universe_mask=universe,
+                    tau_scope=tau_scope,
+                    is_count=is_count_table,
+                    exclude_labels=(OUT_OF_UNIVERSE_SENTINEL,),
+                    loom_path=str(input_path),
+                )
+
+        data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2, out_tau, out_spec])  # (7, n_genes)
 
         if write_tsv_output:
             out_tsv = os.path.join(output_dir, "output.tsv")
@@ -1866,7 +2221,7 @@ def run(args: argparse.Namespace) -> None:
                 out_tsv,
                 ens_ids,
                 gene_names,
-                [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2)],
+                [(None, out_lfc, out_pvals, out_fdr, ave_g1, ave_g2, out_tau, out_spec)],
                 table_top_de_per_direction=table_top_de_per_direction,
             )
 
@@ -1882,6 +2237,8 @@ def run(args: argparse.Namespace) -> None:
                 out_fdr,
                 ave_g1,
                 ave_g2,
+                out_tau,
+                out_spec,
                 table_top_de_per_direction=table_top_de_per_direction,
             )
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
@@ -1890,6 +2247,7 @@ def run(args: argparse.Namespace) -> None:
         nber_rows_tg = int(_de_table_gene_order_pairwise(out_lfc, out_pvals, pool_tg, table_top_de_per_direction).size)
         result = build_result_json(args.write_metadata if write_metadata_output else None, nber_rows_tg)
         result["mode"] = "Two-group DE"
+        result["tau_scope"] = tau_scope
         result["group_name"] = group1
         result["group2_name"] = group2
         result["group_size"] = group1_size
@@ -1937,6 +2295,8 @@ def run(args: argparse.Namespace) -> None:
                 out_fdr,
                 ave_g1,
                 ave_g2,
+                out_tau,
+                out_spec,
                 table_top_de_per_direction=table_top_de_per_direction,
             )
         result["de_table"] = _de_table_for_json(md, mh)
@@ -2046,6 +2406,7 @@ Options:
   --merge-files              FindAllMarkers + -o + --write-tsv only: write a single output.tsv with a leading
                              group column (all categories in one file). Default without this flag is one cat_N.tsv
                              per category (N = 1-based index in sorted unique categories from the loom).
+  --tau-scope                all-groups (default) | comparison. Which cell sets tau spans (see below).
 
   --table-top-de-per-direction  Optional. Limits TSV, stdout de_table, and --write-metadata rows to at most N
                              genes with log FC > 0 and N with log FC < 0, each side ranked by ascending p-value
@@ -2063,10 +2424,36 @@ Options:
                              then total cells are capped to this many by a uniform subsample.
   --preview-seed             RNG seed for preview subsampling (default 42).
 
+Specificity columns
+───────────────────
+Every output table carries two extra columns after the average-expression columns:
+
+  Tau          Yanai et al. (2005) specificity index of the gene, per gene:
+                   tau = sum_i (1 - x_i / max_i(x_i)) / (n_groups - 1)
+               with x_i the mean expression in group i. 0 = expressed evenly everywhere,
+               1 = expressed in a single group. With --tau-scope all-groups (default) the groups
+               are all categories of --group-dataset inside the analysis universe, so tau does not
+               depend on the contrast being tested and is comparable across runs; --tau-scope
+               comparison instead uses only the two compared cell sets. NA when the gene is
+               detected nowhere or fewer than 2 groups are available. On count data tau is computed
+               on 10k-normalized log1p values (the scale the tests use), not on raw counts.
+
+  Specificity  pct.1 / (pct.2 + 1e-3), where pct.1 / pct.2 are the fractions of cells expressing the
+               gene (value > 0) in group 1 and group 2 of the tested contrast — the Seurat
+               FindMarkers convention. In FindAllMarkers mode group 2 is "all other cells". High
+               values flag genes detected in group 1 and (almost) nowhere else; with pct.2 = 0 the
+               score saturates at pct.1 * 1000.
+
+Both come from one extra pass over the matrix (detection counts and per-group sums as two GEMMs per
+gene block). In streaming mode that pass reads the gene-chunked sidecar the DE run already built, so
+the matrix is never densified. Rows stay sorted by ascending p-value then descending log
+fold-change; sort by Specificity or Tau downstream if you want the marker-first ordering.
+
 Environment:
   ASAP_DE_PERF_LOG          If set to 1, true, or yes: print [de_perf] timings on stderr for
                              t_test_approx (prep_X, X squared + GEMV, mean/var + Welch + BH-FDR, raw means;
-                             FindAllMarkers also logs per-group loop breakdown).
+                             FindAllMarkers also logs per-group loop breakdown) and for the
+                             specificity detection/means pass.
 
   --help                     Show this help message and exit.
 """
@@ -2097,6 +2484,7 @@ def main() -> None:
     parser.add_argument("--write-volcano",     action="store_true",                       required=False,              dest="write_volcano")
     parser.add_argument("--write-metadata",    metavar="Output metadata dataset path",    required=False,              dest="write_metadata", default=None)
     parser.add_argument("--merge-files",       action="store_true",                       required=False,              dest="merge_files")
+    parser.add_argument("--tau-scope",         metavar="all-groups|comparison",           default="all-groups",        required=False, dest="tau_scope", choices=list(TAU_SCOPES))
     parser.add_argument(
         "--table-top-de-per-direction",
         type=int,
