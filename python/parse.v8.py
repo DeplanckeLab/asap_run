@@ -126,7 +126,30 @@ class H5ADHandler:
             full_path = f"{path.rstrip('/')}/{index_col_name.lstrip('/')}"
             if full_path not in f:
                 full_path = f"{path.rstrip('/')}/_index"
-            return [v.decode() if isinstance(v, bytes) else str(v) for v in f[full_path][:]]
+            item = f[full_path]
+            # Dataset index (classic AnnData string/_index column)
+            if isinstance(item, h5py.Dataset):
+                return [v.decode() if isinstance(v, bytes) else str(v) for v in item[:]]
+            if isinstance(item, h5py.Group):
+                # Nullable string/integer/boolean: {values, mask}
+                if "values" in item and "mask" in item:
+                    decoded = H5ADHandler._decode_nullable_group(item)
+                    if decoded is None:
+                        ErrorJSON(f"Could not decode nullable index group at {full_path}")
+                    return [str(v) for v in decoded.ravel()]
+                # Categorical index: {categories, codes}
+                if "categories" in item and "codes" in item:
+                    cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item["categories"][:]]
+                    codes = item["codes"][:]
+                    return [cats[c] if c != -1 else "nan" for c in codes]
+                enc = item.attrs.get("encoding-type", None)
+                if isinstance(enc, bytes):
+                    enc = enc.decode()
+                ErrorJSON(
+                    f"Unsupported Group index column at {full_path} "
+                    f"(keys={list(item.keys())}, encoding-type={enc!r})"
+                )
+            ErrorJSON(f"Unsupported index node type at {full_path}: {type(item)}")
         if _is_compound_dataset(node):
             raw = node.attrs.get("_index", None)
             index_field = raw.decode() if isinstance(raw, bytes) else raw

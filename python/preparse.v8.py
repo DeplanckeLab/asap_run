@@ -911,15 +911,37 @@ class H5ADHandler:
             return [f"{orientation}_{i+1}" for i in range(n)]
         grp = f[path]
         try:
-            # _index is an ATTRIBUTE naming which dataset holds the index
+            # _index is an ATTRIBUTE naming which column holds the index
             if '_index' in grp.attrs:
                 idx_col = grp.attrs['_index']
-                idx_data = grp[idx_col][:]
+                if isinstance(idx_col, bytes):
+                    idx_col = idx_col.decode()
+                item = grp[idx_col]
             elif '_index' in grp:
-                # fallback: stored as a dataset directly
-                idx_data = grp['_index'][:]
+                # fallback: stored as a dataset/group directly
+                item = grp['_index']
             else:
                 return [f"{orientation}_{i+1}" for i in range(n)]
+
+            if isinstance(item, h5py.Dataset):
+                idx_data = item[:]
+            elif isinstance(item, h5py.Group) and 'values' in item and 'mask' in item:
+                # AnnData nullable-string-array (and related): {values, mask}
+                values = item['values'][:]
+                mask = np.asarray(item['mask'][:], dtype=bool)
+                idx_data = []
+                for v, m in zip(values.flat, mask.flat):
+                    if m:
+                        idx_data.append('nan')
+                    else:
+                        idx_data.append(v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else str(v))
+            elif isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
+                cats = [v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else str(v) for v in item['categories'][:]]
+                codes = item['codes'][:]
+                idx_data = [cats[c] if c != -1 else 'nan' for c in codes]
+            else:
+                return [f"{orientation}_{i+1}" for i in range(n)]
+
             if len(idx_data) > 0 and isinstance(idx_data[0], (bytes, np.bytes_)):
                 return [x.decode('utf-8') for x in idx_data[:n]]
             return [str(x) for x in idx_data[:n]]
