@@ -192,9 +192,10 @@ def doublet_score(args):
         size_score = _write_1d_float(f_rw, args.output_score_meta, doublet_scores)
         size_call  = _write_1d_int(f_rw,   args.output_call_meta,  calls)
 
+    # ASAP CELL vectors are 1 x n_cells (cells are columns).
     result["metadata"] = [
-        {"name": args.output_score_meta, "on": "CELL", "type": "NUMERIC",  "nber_rows": n_cells, "nber_cols": 1, "dataset_size": size_score, "imported": 0},
-        {"name": args.output_call_meta,  "on": "CELL", "type": "INTEGER",  "nber_rows": n_cells, "nber_cols": 1, "dataset_size": size_call,  "imported": 0},
+        {"name": args.output_score_meta, "on": "CELL", "type": "NUMERIC",  "nber_rows": 1, "nber_cols": n_cells, "dataset_size": size_score, "imported": 0},
+        {"name": args.output_call_meta,  "on": "CELL", "type": "INTEGER",  "nber_rows": 1, "nber_cols": n_cells, "dataset_size": size_call,  "imported": 0},
     ]
 
     if warnings: result["warnings"] = warnings

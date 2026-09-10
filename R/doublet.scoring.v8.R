@@ -391,9 +391,10 @@ size_score <- write_1d_float(h5_loom,   sub("^/", "", args$output_score_meta), p
 size_call  <- write_1d_integer(h5_loom, sub("^/", "", args$output_call_meta),  df_calls)
 h5_loom$close_all()
 
+# ASAP CELL vectors are 1 x n_cells (cells are columns).
 result$metadata <- list(
-  list(name = args$output_score_meta, on = "CELL", type = "NUMERIC",  nber_rows = as.integer(n_cells), nber_cols = 1L, dataset_size = as.integer(size_score), imported = 0L),
-  list(name = args$output_call_meta,  on = "CELL", type = "INTEGER",  nber_rows = as.integer(n_cells), nber_cols = 1L, dataset_size = as.integer(size_call),  imported = 0L)
+  list(name = args$output_score_meta, on = "CELL", type = "NUMERIC",  nber_rows = 1L, nber_cols = as.integer(n_cells), dataset_size = as.integer(size_score), imported = 0L),
+  list(name = args$output_call_meta,  on = "CELL", type = "INTEGER",  nber_rows = 1L, nber_cols = as.integer(n_cells), dataset_size = as.integer(size_call),  imported = 0L)
 )
 
 if (length(warn_env$w) > 0) result$warnings <- as.list(warn_env$w)

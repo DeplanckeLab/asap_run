@@ -161,8 +161,9 @@ def doublet_call(args):
             warnings.append(f"Path '{out_path}' already exists and will be overwritten.")
         size_call = _write_dataset_1d_int(f_rw, out_path, calls)
 
+    # ASAP CELL vectors are 1 x n_cells (cells are columns).
     result["metadata"] = [{"name": args.output_call_meta, "on": "CELL", "type": "INTEGER",
-                            "nber_rows": n_cells, "nber_cols": 1,
+                            "nber_rows": 1, "nber_cols": n_cells,
                             "dataset_size": size_call, "imported": 0}]
 
     if warnings:
