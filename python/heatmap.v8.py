@@ -310,6 +310,13 @@ def run(args):
     # Value transform (genes x cols).
     M = cols_matrix.astype(np.float64)
     diverging = False
+    input_matrix_step_name = str(cfg.get("input_matrix_step_name") or "").strip()
+    if value_transform == "zscore" and input_matrix_step_name == "scaling":
+        ErrorJSON(
+            "Row z-score is not allowed when the input matrix comes from the scaling step "
+            "(already scaled). Use value transform 'none', or select a normalized matrix.",
+            output_json_path,
+        )
     if value_transform == "zscore":
         mean = np.nanmean(M, axis=1, keepdims=True)
         std = np.nanstd(M, axis=1, keepdims=True)
