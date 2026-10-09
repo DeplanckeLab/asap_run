@@ -460,6 +460,7 @@ def _write_h5ad_streamed_from_scratch(
     from anndata_mapping_loom_export import (
         copy_loom_attr_groups_to_h5ad_uns,
         copy_loom_attrs_to_uns,
+        index_only_var_frame,
     )
     from scipy import sparse
 
@@ -499,8 +500,13 @@ def _write_h5ad_streamed_from_scratch(
                 raw_g = f.create_group("raw")
                 raw_g.attrs["encoding-type"] = "raw"
                 raw_g.attrs["encoding-version"] = "0.1.0"
-                # Match previous behavior: raw.var is a copy of var.
-                write_elem(raw_g, "var", shell.var, dataset_kwargs=dataset_kwargs)
+                # scFAIR: raw.var index matches var; do not duplicate feature metadata.
+                write_elem(
+                    raw_g,
+                    "var",
+                    index_only_var_frame(shell.var),
+                    dataset_kwargs=dataset_kwargs,
+                )
             if layer_names:
                 layers_g = f.create_group("layers")
                 layers_g.attrs["encoding-type"] = "dict"

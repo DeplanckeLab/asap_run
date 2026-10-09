@@ -370,6 +370,19 @@ def copy_loom_attr_groups_to_h5ad_uns(
             dst.close()
 
 
+
+def index_only_var_frame(var_df):
+    """Build a var DataFrame that keeps only the gene index (no column metadata).
+
+    scFAIR requires raw.var index to match var when raw is present; feature_* and
+    other gene metadata live on var only. Duplicating columns into raw.var is
+    redundant when X and raw share the same genes.
+    """
+    import pandas as pd
+
+    return pd.DataFrame(index=var_df.index.copy())
+
+
 def apply_mapping_matrices_to_adata(adata, loom_file: str, mapping: dict[str, Any]) -> None:
     """Replace adata.X / raw / layers according to anndata_mapping (after a naive read_loom)."""
     import anndata as ad
@@ -412,7 +425,8 @@ def apply_mapping_matrices_to_adata(adata, loom_file: str, mapping: dict[str, An
                 raise ValueError(
                     f"raw_x_path {raw_x_path} shape {raw_X.shape} != X shape {adata.X.shape}"
                 )
-            adata.raw = ad.AnnData(X=raw_X, var=adata.var.copy())
+            # Index-only raw.var (same genes as var); avoid duplicating feature metadata.
+            adata.raw = ad.AnnData(X=raw_X, var=index_only_var_frame(adata.var))
 
         for layer_name, layer_path in layers_map.items():
             layer_path = str(layer_path)
