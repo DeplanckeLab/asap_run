@@ -181,15 +181,30 @@ def drop_loom_index_columns(adata) -> list[str]:
     """Drop loom ``_index`` attrs that collide with AnnData's reserved index name.
 
     Legacy looms often store redundant /row_attrs/_index and /col_attrs/_index.
-    anndata.write_h5ad rejects a dataframe column named ``_index``.
+    anndata.write_h5ad rejects a dataframe column named ``_index`` (including on
+    ``adata.raw.var`` if raw was built before the drop).
     """
     dropped: list[str] = []
-    for axis_name in ("obs", "var"):
-        frame = getattr(adata, axis_name)
-        if "_index" not in frame.columns:
-            continue
+
+    def _drop_from(frame, label: str) -> None:
+        if frame is None or "_index" not in getattr(frame, "columns", []):
+            return
         frame.drop(columns=["_index"], inplace=True)
-        dropped.append(f"{axis_name}/_index")
+        dropped.append(label)
+
+    _drop_from(adata.obs, "obs/_index")
+    _drop_from(adata.var, "var/_index")
+    raw = getattr(adata, "raw", None)
+    if raw is not None and getattr(raw, "var", None) is not None:
+        # raw.var may be a view/copy; assign back if drop mutates a copy.
+        raw_var = raw.var
+        if "_index" in raw_var.columns:
+            raw_var = raw_var.drop(columns=["_index"])
+            # AnnData.raw is immutable-ish; rebuild raw without the column.
+            import anndata as ad
+
+            adata.raw = ad.AnnData(X=raw.X, var=raw_var)
+            dropped.append("raw.var/_index")
     if dropped:
         print(f"Dropped reserved loom index columns: {', '.join(dropped)}", flush=True)
     return dropped
@@ -277,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
         adata = read_loom(
             loom_file, obs_names=obs_names, var_names=var_names, validate=False
         )
+        # Before apply_anndata_mapping: mapping copies var into adata.raw and would
+        # otherwise re-embed _index into raw.var for write_h5ad to reject later.
+        drop_loom_index_columns(adata)
         apply_anndata_mapping(adata, loom_file, mapping)
         ensure_feature_name_from_loom(adata)
         drop_loom_index_columns(adata)
