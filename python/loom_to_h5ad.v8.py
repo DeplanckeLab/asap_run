@@ -6,6 +6,10 @@ loompy still references (np.string_, np.unicode_).
 
 Also recovers loom row/col attrs that loompy materializes as None (non-ASCII
 UTF-8 such as U+00A0) by re-reading the same HDF5 datasets with UTF-8 decode.
+
+Legacy ASAP looms may store some row/col string attrs as fixed-length ``|S*``
+HDF5 datasets. loompy's Loom 3.0.0 validator rejects those; we open with
+``validate=False`` so conversion can still proceed (attrs still decode fine).
 """
 
 from __future__ import annotations
@@ -172,13 +176,52 @@ def copy_loom_attrs_to_uns(loom_file: str, adata) -> int:
     return n
 
 
-def require_feature_name_from_loom(adata) -> None:
-    """feature_name must come from parse (Ensembl-release display rules), not genes.name."""
-    if "feature_name" not in adata.var.columns:
-        raise ValueError(
-            "Loom is missing row_attrs/feature_name. Re-parse with a current parse.v8.py "
-            "so feature_name is written from the Ensembl release dumps."
+
+def drop_loom_index_columns(adata) -> list[str]:
+    """Drop loom ``_index`` attrs that collide with AnnData's reserved index name.
+
+    Legacy looms often store redundant /row_attrs/_index and /col_attrs/_index.
+    anndata.write_h5ad rejects a dataframe column named ``_index``.
+    """
+    dropped: list[str] = []
+    for axis_name in ("obs", "var"):
+        frame = getattr(adata, axis_name)
+        if "_index" not in frame.columns:
+            continue
+        frame.drop(columns=["_index"], inplace=True)
+        dropped.append(f"{axis_name}/_index")
+    if dropped:
+        print(f"Dropped reserved loom index columns: {', '.join(dropped)}", flush=True)
+    return dropped
+
+def ensure_feature_name_from_loom(adata) -> str | None:
+    """Ensure var feature_name exists for H5AD / scFAIR.
+
+    Current parse writes feature_name from Ensembl display rules. Legacy ASAP
+    looms often only have Gene (or similar); map those instead of failing.
+    Returns the source column used when synthesized, else None.
+    """
+    if "feature_name" in adata.var.columns:
+        return None
+
+    # Prefer scFAIR var_legacy_sources.feature_name order, then common ASAP variants.
+    legacy_sources = ("Gene", "gene_name", "GeneSymbol", "Name", "gene", "Original_Gene")
+    for src in legacy_sources:
+        if src not in adata.var.columns:
+            continue
+        values = decode_loom_attr_values(adata.var[src].to_numpy())
+        adata.var["feature_name"] = values
+        print(
+            f"Legacy loom: synthesized feature_name from var/{src}",
+            flush=True,
         )
+        return src
+
+    raise ValueError(
+        "Loom is missing row_attrs/feature_name and no legacy gene-name column "
+        f"({', '.join(legacy_sources)}) to synthesize it from. Re-parse with a "
+        "current parse.v8.py so feature_name is written from Ensembl dumps."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -229,9 +272,14 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         # Initial load; matrix roles / embeddings / uns are corrected from mapping next.
-        adata = read_loom(loom_file, obs_names=obs_names, var_names=var_names)
+        # validate=False: loompy Loom 3.0.0 rejects fixed-length |S* string attrs that
+        # older ASAP looms still carry; anndata/loompy still materialize them correctly.
+        adata = read_loom(
+            loom_file, obs_names=obs_names, var_names=var_names, validate=False
+        )
         apply_anndata_mapping(adata, loom_file, mapping)
-        require_feature_name_from_loom(adata)
+        ensure_feature_name_from_loom(adata)
+        drop_loom_index_columns(adata)
         # gzip is HDF5-native (scFAIR-safe); shrinks CSR X/layers vs uncompressed default.
         adata.write_h5ad(h5ad_file, compression="gzip")
         copy_loom_attr_groups_to_h5ad_uns(loom_file, h5ad_file, mapping)

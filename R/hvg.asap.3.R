@@ -83,7 +83,7 @@ variableFeatures <- VariableFeatures(data.seurat)
 
 # Plot variable gene graphics
 p <- VariableFeaturePlot(data.seurat, raster = F)
-ggsave(plot = p, bg = "white", filename = paste0(output_dir,"hvg.seurat.png"), width = 8, height = 5, create.dir = TRUE)
+ggsave(plot = p, bg = "white", filename = paste0(output_dir,"hvg.seurat.png"), width = 8, height = 5)
 ggsave(plot = p, bg = "white", filename = paste0(output_dir,"hvg.seurat.pdf"), width = 8, height = 5)
 write(serialize(ggplotly(p)), file = paste0(output_dir,"hvg.seurat.json"), append = FALSE)
 
