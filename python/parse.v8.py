@@ -126,6 +126,8 @@ class H5ADHandler:
             full_path = f"{path.rstrip('/')}/{index_col_name.lstrip('/')}"
             if full_path not in f:
                 full_path = f"{path.rstrip('/')}/_index"
+            if full_path not in f:
+                ErrorJSON(f"Could not find the index column of {path} (looked for {index_col_name!r} and '_index').")
             item = f[full_path]
             # Dataset index (classic AnnData string/_index column)
             if isinstance(item, h5py.Dataset):
@@ -141,7 +143,7 @@ class H5ADHandler:
                 if "categories" in item and "codes" in item:
                     cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item["categories"][:]]
                     codes = item["codes"][:]
-                    return [cats[c] if c != -1 else "nan" for c in codes]
+                    return [cats[c] if 0 <= c < len(cats) else "nan" for c in codes] # -1 = missing; out-of-range = corrupted
                 enc = item.attrs.get("encoding-type", None)
                 if isinstance(enc, bytes):
                     enc = enc.decode()
@@ -275,11 +277,21 @@ class H5ADHandler:
     
     @staticmethod
     def _detect_sparse_encoding(node: h5py.Group, n_cells: int, n_genes: int) -> str:
+        # Declared encoding first (AnnData "encoding-type", h5sparse "h5sparse_format"): the indptr length alone
+        # cannot tell CSR from CSC when n_cells == n_genes, and a wrong guess silently transposes the matrix.
         enc = node.attrs.get("encoding-type", None)
+        if enc is None:
+            enc = node.attrs.get("h5sparse_format", None)
         if isinstance(enc, bytes): enc = enc.decode()
-        enc = str(enc) if enc is not None else None
+        enc = {"csr": "csr_matrix", "csc": "csc_matrix"}.get(str(enc), str(enc)) if enc is not None else None
 
         indptr_len = int(node["indptr"].shape[0])
+        if enc in ("csr_matrix", "csc_matrix"):
+            expected = n_cells + 1 if enc == "csr_matrix" else n_genes + 1
+            if indptr_len != expected:
+                ErrorJSON(f"Sparse matrix declared as {enc} but len(indptr)={indptr_len}, expected {expected}.")
+            return enc
+
         if indptr_len == n_cells + 1: inferred = "csr_matrix"
         elif indptr_len == n_genes + 1: inferred = "csc_matrix"
         else:
@@ -298,14 +310,16 @@ class H5ADHandler:
         n = int(ds.shape[0]) if ds.shape else 0
         if n <= 0:
             return
-        chunk = int(ds.chunks[0]) if ds.chunks else min(n, 1024)
         try:
-            _ = ds[0]
-            start = max(0, n - chunk)
-            _ = ds[start:n]
+            indptr = ds[:] # n_cells+1 (or n_genes+1) integers: small next to data/indices
         except OSError as e:
             msg = hdf5_io_error_message(e, file_path)
             ErrorJSON(msg if msg else f"Cannot read {path}/indptr: {e}")
+        # A valid indptr starts at 0, never decreases, and ends at the number of stored values
+        nnz = int(node["data"].shape[0]) if "data" in node and node["data"].shape else None
+        if int(indptr[0]) != 0 or (nnz is not None and int(indptr[-1]) != nnz) or np.any(np.diff(indptr) < 0):
+            ErrorJSON(f"The sparse matrix at {path} is corrupted: invalid indptr (first={int(indptr[0])}, last={int(indptr[-1])}, "
+                      f"stored values={nnz}, non-decreasing={bool(np.all(np.diff(indptr) >= 0))}).")
 
     @staticmethod
     def _create_h5ad_block_reader(f: h5py.File, src_path: str, n_cells: int, n_genes: int):
@@ -428,7 +442,7 @@ class H5ADHandler:
                 if isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
                     cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item['categories'][:]]
                     codes = item['codes'][:]
-                    values = np.array([cats[c] if c != -1 else "nan" for c in codes], dtype=object)
+                    values = np.array([cats[c] if 0 <= c < len(cats) else "nan" for c in codes], dtype=object) # -1 = missing; out-of-range = corrupted
 
                 # Nullable integer/boolean/string: {values, mask}
                 elif isinstance(item, h5py.Group) and 'values' in item and 'mask' in item:
@@ -1061,7 +1075,8 @@ class LoomHandler:
             if s is None:
                 return True
             ss = str(s).strip()
-            return (ss == "" or ss.lower() in {"nan", "null", "0"})
+            # "__unknown" is what ASAP writes in Accession for genes not found in the DB: fall through to the next candidate
+            return (ss == "" or ss.lower() in {"nan", "null", "0", "__unknown"})
         
         # Per-gene fallback: first non-empty across loaded candidates
         out: list[str] = []
@@ -1163,6 +1178,18 @@ class LoomHandler:
                 if _is_compound_dataset(obj):
                     write_compound_as_regular(obj, full_path)
                     return
+                if full_path.startswith("/layers/") and tuple(obj.shape) == (n_genes, n_cells) and np.issubdtype(obj.dtype, np.number):
+                    # Expression layer: copy block by block (velocyto spliced/unspliced layers can exceed RAM if read at once)
+                    block_reader = LoomHandler._create_loom_block_reader(f=src_f, src_path=full_path, n_cells=n_cells, n_genes=n_genes)
+                    layer_stats = loom.write_expression_matrix(get_block=block_reader, n_cells=n_cells, n_genes=n_genes, gene_metadata=None, dest_path=full_path)
+                    result["metadata"].append(Metadata(name=full_path, on="EXPRESSION_MATRIX", type="NUMERIC", nber_rows=n_genes, nber_cols=n_cells, dataset_size=loom.get_dataset_size(full_path), nber_zeros=layer_stats["total_zeros"], is_count_table=layer_stats["is_count_table"], imported=1))
+                    existing_paths.add(full_path)
+                    return
+                if full_path.startswith(("/col_graphs/", "/row_graphs/")):
+                    # Graph edge lists (a, b, w) have one entry per edge, not per cell/gene: keep them in the loom, but not as metadata
+                    loom.write_raw(obj[()], full_path)
+                    existing_paths.add(full_path)
+                    return
                 val = obj[()]
                 meta = loom.write_metadata(val, full_path, n_cells=n_cells, n_genes=n_genes, imported=1)
                 result["metadata"].append(meta)
@@ -1191,7 +1218,15 @@ class LoomHandler:
             cell_ids = LoomHandler._infer_cell_ids(f, n_cells)
             gene_names = LoomHandler._infer_gene_names(f, n_genes)
 
-            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
+            # Re-import of an ASAP loom: keep its Original_Gene (the user's identifiers) instead of overwriting it
+            # with the inferred names, which prefer Accession and are only used as DB queries
+            original_gene_names = gene_names
+            if "/row_attrs/Original_Gene" in f and isinstance(f["/row_attrs/Original_Gene"], h5py.Dataset):
+                orig = LoomHandler._as_str_list(f["/row_attrs/Original_Gene"][:])
+                if len(orig) == n_genes:
+                    original_gene_names = [o if o.strip() else g for o, g in zip(orig, gene_names)]
+
+            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=original_gene_names, gene_db=gene_db, gene_db_queries=gene_names, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
 
             block_reader = LoomHandler._create_loom_block_reader(f=f, src_path=matrix_path, n_cells=n_cells, n_genes=n_genes)
             stats = loom.write_expression_matrix(get_block=block_reader, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
@@ -1244,23 +1279,21 @@ class H510xHandler:
         return out
 
     @staticmethod
-    def _read_feature_names(grp: h5py.Group, n_genes: int) -> list[str]:
-        if "gene_names" in grp:
-            vec = H510xHandler._decode_list(grp["gene_names"][:])
+    def _read_feature_ids_and_names(grp: h5py.Group, n_genes: int) -> tuple[list[str], list[str] | None]:
+        """
+        Returns (ids, symbols). ids are the unique feature IDs (Ensembl for Cell Ranger references), used as the
+        gene identifiers like the MEX path does; symbols (possibly duplicated) are returned separately, or None.
+        Cell Ranger v2: genes (IDs) + gene_names (symbols). Cell Ranger v3+: features/id + features/name.
+        """
+        def read(ds) -> list[str]:
+            vec = H510xHandler._decode_list(ds[:])
             return (vec + [f"Gene_{i+1}" for i in range(len(vec), n_genes)])[:n_genes]
-        if "genes" in grp:
-            vec = H510xHandler._decode_list(grp["genes"][:])
-            return (vec + [f"Gene_{i+1}" for i in range(len(vec), n_genes)])[:n_genes]
-        if "features" in grp and isinstance(grp["features"], h5py.Group):
-            fg = grp["features"]
-            if "name" in fg:
-                vec = H510xHandler._decode_list(fg["name"][:])
-            elif "id" in fg:
-                vec = H510xHandler._decode_list(fg["id"][:])
-            else:
-                vec = []
-            return (vec + [f"Gene_{i+1}" for i in range(len(vec), n_genes)])[:n_genes]
-        return [f"Gene_{i+1}" for i in range(n_genes)]
+        fg = grp["features"] if "features" in grp and isinstance(grp["features"], h5py.Group) else None
+        ids = read(grp["genes"]) if "genes" in grp else (read(fg["id"]) if fg is not None and "id" in fg else None)
+        names = read(grp["gene_names"]) if "gene_names" in grp else (read(fg["name"]) if fg is not None and "name" in fg else None)
+        if ids is None:
+            return (names if names is not None else [f"Gene_{i+1}" for i in range(n_genes)]), None
+        return ids, names
 
     @staticmethod
     def _create_10x_block_reader(grp: h5py.Group, n_cells: int, n_genes: int):
@@ -1357,9 +1390,19 @@ class H510xHandler:
 
             cell_ids = H510xHandler._decode_list(grp["barcodes"][:])
             cell_ids = (cell_ids + [f"Cell_{i+1}" for i in range(len(cell_ids), n_cells)])[:n_cells]
-            gene_names = H510xHandler._read_feature_names(grp, n_genes)
+            gene_ids, gene_symbols = H510xHandler._read_feature_ids_and_names(grp, n_genes)
 
-            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_names, gene_db=gene_db, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
+            # Map genes by their IDs (unique, unambiguous), like the MEX path. Symbols are only a fallback query for IDs
+            # the DB does not know (e.g. custom references), and are kept as /row_attrs/gene_name below.
+            queries = list(gene_ids)
+            if gene_symbols is not None:
+                for i, (gid, sym) in enumerate(zip(gene_ids, gene_symbols)):
+                    if gene_db.parse_gene(gid, i).biotype == "__unknown" and sym.strip():
+                        queries[i] = sym
+
+            parsed_genes, _ = loom.write_names_and_gene_db(cell_ids=cell_ids, original_gene_names=gene_ids, gene_db=gene_db, gene_db_queries=queries, output_dir=out_dir, result=result, n_cells=n_cells, n_genes=n_genes, organism_info=getattr(loom, "organism_info", None))
+            if gene_symbols is not None and "/row_attrs/gene_name" not in {m.name for m in result["metadata"]}:
+                result["metadata"].append(loom.write_metadata(gene_symbols, "/row_attrs/gene_name", n_cells=n_cells, n_genes=n_genes, imported=1, is_categorical=False))
 
             #stats = loom.write_expression_from_h510x(grp=grp, n_cells=n_cells, n_genes=n_genes, gene_metadata=parsed_genes, dest_path="/matrix")
             block_reader = H510xHandler._create_10x_block_reader(grp=grp, n_cells=n_cells, n_genes=n_genes)
@@ -2052,22 +2095,27 @@ class MexHandler:
         return matrix_path, barcodes_path, features_path
 
     @staticmethod
-    def _read_barcodes(file_path: str) -> list[str]:
+    def _read_barcodes(file_path: str, n_cells: int | None = None) -> list[str]:
         """
         Read cell barcodes from barcodes file.
         Supports TSV (one barcode per line) and CSV (with optional headers).
         """
         import csv
-        
+
         try:
             if file_path.endswith('.tsv'):
                 with open(file_path, 'r') as f:
                     lines = [line.strip() for line in f if line.strip()]
-                    
-                    # Check if first line has multiple columns (likely a header)
-                    has_header = lines and lines[0].count('\t') > 0
+
+                    # Header detection (same rule as preparse): the line count vs the matrix decides when it can,
+                    # otherwise a first line with a comma or more than 2 tabs is a header. A header-less
+                    # 2-column barcodes.tsv (barcode<TAB>sample) must not lose its first barcode.
+                    if n_cells is not None and len(lines) in (n_cells, n_cells + 1):
+                        has_header = len(lines) == n_cells + 1
+                    else:
+                        has_header = bool(lines) and (',' in lines[0] or lines[0].count('\t') > 2)
                     start_idx = 1 if has_header else 0
-                    
+
                     # Extract first tab-delimited field from each line
                     return [line.split('\t')[0].strip('"') for line in lines[start_idx:]]
                     
@@ -2198,6 +2246,9 @@ class MexHandler:
         # Every declared entry must have been read: unfilled slots would silently become (gene 1, cell 1) entries
         if idx != nnz:
             ErrorJSON(f"MTX file {matrix_path} is truncated or malformed: header declares {nnz} entries but {idx} valid data lines were read.")
+        if nnz > 0 and (rows.min() < 0 or rows.max() >= n_genes or cols.min() < 0 or cols.max() >= n_cells):
+            ErrorJSON(f"MTX file {matrix_path} has entries outside the declared {n_genes} x {n_cells} matrix "
+                      f"(rows {int(rows.min()) + 1}..{int(rows.max()) + 1}, columns {int(cols.min()) + 1}..{int(cols.max()) + 1}).")
 
         # Create COO matrix (genes x cells)
         coo = sp.coo_matrix((data, (rows, cols)), shape=(n_genes, n_cells), dtype=DEFAULT_NP_DTYPE)
@@ -2238,7 +2289,7 @@ class MexHandler:
         
         # Read cell barcodes
         if barcodes_path:
-            cells = MexHandler._read_barcodes(barcodes_path)
+            cells = MexHandler._read_barcodes(barcodes_path, n_cells)
             if len(cells) != n_cells:
                 ErrorJSON(f"Barcodes file has {len(cells)} entries but matrix has {n_cells} cells.")
         else:
@@ -2337,6 +2388,15 @@ class TextHandler:
             ErrorJSON(f"Failed to read text file. {str(e)}")
         
         df = TextHandler._drop_fully_empty_rows_polars(df)
+
+        # A trailing delimiter on data lines makes polars add a fully-empty last column, while the header's trailing
+        # empty fields were dropped above: drop that column too, otherwise every cell label shifts by one and the
+        # last cell is all NaN. With a header, only when the header has fewer fields than the data rows.
+        while df.width > 1 and (header_fields is None or len(header_fields) < df.width):
+            last = df.columns[-1]
+            if not df.select(pl.col(last).cast(pl.Utf8, strict=False).fill_null("").str.strip_chars().eq("").all()).item():
+                break
+            df = df.drop(last)
 
         if df.height == 0:
             ErrorJSON("Input text file contains no data rows (after removing empty lines).")
@@ -4038,6 +4098,7 @@ def parse(args):
 
     # Create Loom file
     loom = None
+    completed = False
     try:
         loom = LoomFile(args.output_path)
         result["wait_time"] = loom.open_wait_time
@@ -4065,8 +4126,13 @@ def parse(args):
         
         # Finalize by writing stats
         loom.finalize(result, stats, result["nber_cols"], result["nber_rows"])
+        completed = True
     finally:
-        if loom is not None: loom.close()
+        if loom is not None:
+            loom.close()
+            # Never leave a partially written output.loom behind (ErrorJSON exit or unexpected exception)
+            if not completed:
+                Path(args.output_path).unlink(missing_ok=True)
     
     # Clean empty warnings
     if "warnings" in result and not result["warnings"]:
@@ -4139,8 +4205,14 @@ def main():
     _OUTPUT_DIR = str(output_dir)
     # Set the final file path
     args.output_path = str(output_dir / LOOM_FILENAME)
-    
-    parse(args)
+
+    try:
+        parse(args)
+    except Exception as e:
+        # Catch-all: unexpected errors still produce a displayed_error (the traceback goes to stderr for debugging)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error while parsing the file ({type(e).__name__}: {e})")
 
 if __name__ == '__main__':
     main()

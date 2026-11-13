@@ -707,17 +707,23 @@ def count_nonempty_lines(filepath):
     return int(result.stdout.strip().split()[0])
 
 def is_rds_file(file_path):
+    # saveRDS() compresses with gzip (default), bzip2 or xz; readRDS() reads all three directly
     try:
         with open(file_path, 'rb') as f:
-            magic = f.read(5)
-            is_gzip = magic.startswith(b'\x1f\x8b')
-        if is_gzip:
+            magic = f.read(6)
+        if magic.startswith(b'\x1f\x8b'):
             import gzip
-            with gzip.open(file_path, 'rb') as f:
-                header = f.read(5)
+            opener = gzip.open
+        elif magic.startswith(b'BZh'):
+            import bz2
+            opener = bz2.open
+        elif magic.startswith(b'\xfd7zXZ\x00'):
+            import lzma
+            opener = lzma.open
         else:
-            with open(file_path, 'rb') as f:
-                header = f.read(5)
+            opener = open
+        with opener(file_path, 'rb') as f:
+            header = f.read(5)
         return header.startswith(b'RDX') or header.startswith(b'X\n') or header.startswith(b'A\n')
     except Exception as e:
         return False
@@ -736,6 +742,10 @@ def preparse(args):
             ArchiveHandler.write_listing_json(args, archive_path, list_files)
         else: # Unique file, decompressed if needed
             file_path = list_files[0]
+            # An RDS extracted from a zip/tar archive is not HDF5 and would otherwise be read as text
+            if is_rds_file(file_path):
+                RdsHandler.preparse(args, file_path)
+                return
             # Detect file type from magic bytes or hdf5 reader
             file_type = check_file_type(file_path)
             # Call appropriate handler
@@ -780,23 +790,22 @@ class H510xHandler:
                     nGenes = int(grp["shape"][0]);
                     nCells = int(grp["shape"][1])
 
-                    # Get genes
-                    try:
-                        genes = [g.decode() for g in grp["gene_names"][:min(10,nGenes)]] # scRNA-seq
-                    except KeyError:
-                        genes = [g.decode() for g in grp["features/id"][:min(10,nGenes)]] # scATAC-seq
+                    # Get genes: feature IDs (what parse maps and stores as Original_Gene), else symbols
+                    def _dec(v): return v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v)
+                    gene_ds = next((p for p in ("genes", "features/id", "gene_names", "features/name") if p in grp), None)
+                    genes = [_dec(g) for g in grp[gene_ds][:min(10, nGenes)]] if gene_ds else [f"Gene_{i+1}" for i in range(min(10, nGenes))]
 
-                    # Extract 10x10 matrix
-                    indptr = grp["indptr"][:min(10, nCells) + 1] # 10 first rows + beginning of 11th
-                    data = grp["data"][:indptr[-1]] # All values for 10 first rows
-                    indices = grp["indices"][:indptr[-1]] # All values for 10 first rows
-                    matrix = [[0 for _ in range(min(10, nGenes))] for _ in range(min(10, nCells))]
-                    for row in range(min(10, nCells)):
-                       start, end = indptr[row], indptr[row+1]
+                    # Extract 10x10 matrix, genes x cells like the other formats (10x is CSC: one indptr entry per cell)
+                    indptr = grp["indptr"][:min(10, nCells) + 1] # 10 first cells + beginning of 11th
+                    data = grp["data"][:indptr[-1]] # All values for 10 first cells
+                    indices = grp["indices"][:indptr[-1]] # Gene indices for 10 first cells
+                    matrix = [[0.0 for _ in range(min(10, nCells))] for _ in range(min(10, nGenes))]
+                    for cell in range(min(10, nCells)):
+                       start, end = indptr[cell], indptr[cell+1]
                        for idx_pos in range(start, end):
-                           col = indices[idx_pos]
-                           if col < min(10, nGenes):
-                               matrix[row][col] = int(data[idx_pos])
+                           gene = indices[idx_pos]
+                           if gene < min(10, nGenes):
+                               matrix[gene][cell] = float(data[idx_pos]) # keep decimals so is_count is meaningful
                   
                     # Valid group
                     entry = {
@@ -805,7 +814,7 @@ class H510xHandler:
                         "nber_rows": nGenes,
                         "is_count": int((np.array(matrix) % 1 == 0).all()),
                         "genes": genes,
-                        "cells": [b.decode() for b in grp["barcodes"][:min(10,nCells)]],
+                        "cells": [_dec(b) for b in grp["barcodes"][:min(10,nCells)]],
                         "matrix": matrix
                     }
                     result["list_groups"].append(entry)
@@ -896,14 +905,16 @@ class H5ADHandler:
         n = int(ds.shape[0]) if ds.shape else 0
         if n <= 0:
             return
-        chunk = int(ds.chunks[0]) if ds.chunks else min(n, 1024)
         try:
-            _ = ds[0]
-            start = max(0, n - chunk)
-            _ = ds[start:n]
+            indptr = ds[:] # n_cells+1 (or n_genes+1) integers: small next to data/indices
         except OSError as e:
             msg = hdf5_io_error_message(e, file_path)
             ErrorJSON(msg if msg else f"Cannot read {path}/indptr: {e}")
+        # A valid indptr starts at 0, never decreases, and ends at the number of stored values
+        nnz = int(node["data"].shape[0]) if "data" in node and node["data"].shape else None
+        if int(indptr[0]) != 0 or (nnz is not None and int(indptr[-1]) != nnz) or np.any(np.diff(indptr) < 0):
+            ErrorJSON(f"The sparse matrix at {path} is corrupted: invalid indptr (first={int(indptr[0])}, last={int(indptr[-1])}, "
+                      f"stored values={nnz}, non-decreasing={bool(np.all(np.diff(indptr) >= 0))}).")
 
     @staticmethod
     def extract_index(f, path, orientation="Item", n=10):
@@ -938,7 +949,7 @@ class H5ADHandler:
             elif isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
                 cats = [v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else str(v) for v in item['categories'][:]]
                 codes = item['codes'][:]
-                idx_data = [cats[c] if c != -1 else 'nan' for c in codes]
+                idx_data = [cats[c] if 0 <= c < len(cats) else 'nan' for c in codes] # -1 = missing; out-of-range = corrupted
             else:
                 return [f"{orientation}_{i+1}" for i in range(n)]
 
@@ -950,10 +961,13 @@ class H5ADHandler:
 
     @staticmethod
     def extract_matrix(f, path, nCells, nGenes, n=10):
-        """Extract top-left n x n submatrix from a sparse or dense dataset."""
+        """Extract the top-left n x n submatrix from a sparse or dense dataset, as genes x cells (like the other formats)."""
         nr, nc = min(n, nCells), min(n, nGenes)
         grp = f[path]
-        encoding = grp.attrs.get('encoding-type', '')
+        encoding = grp.attrs.get('encoding-type', None)
+        if encoding is None:
+            encoding = grp.attrs.get('h5sparse_format', '')
+        encoding = encoding.decode() if isinstance(encoding, bytes) else str(encoding)
         matrix = [[0.0] * nc for _ in range(nr)]
 
         if isinstance(grp, h5py.Dataset):
@@ -984,7 +998,8 @@ class H5ADHandler:
                             matrix[row][col] = float(data[k])
         else:
             raise ValueError(f"Unrecognized matrix format at {path}")
-        return matrix
+        # H5AD stores cells x genes; the preview contract (Loom, MEX, text, RDS, legacy Java) is genes x cells
+        return [[matrix[r][c] for r in range(nr)] for c in range(nc)]
 
     @staticmethod
     def preparse(args, file_path):
@@ -1105,11 +1120,17 @@ class LoomHandler:
                         result["spatial_library_id"] = k
                         break
             
-            # Get gene and cell names
-            genes = [g.decode('utf-8') if isinstance(g, bytes) else str(g) 
-                    for g in f['row_attrs']['Gene'][:min(10, nGenes)]]
-            cells = [c.decode('utf-8') if isinstance(c, bytes) else str(c)
-                    for c in f['col_attrs']['CellID'][:min(10, nCells)]]
+            # Get gene and cell names: ASAP / loompy attributes first, then the same fallbacks parse uses
+            # (looms written by anndata/scanpy have var_names/obs_names); generic names if none exist
+            def first_names(candidates, n, prefix):
+                for p in candidates:
+                    if p in f and isinstance(f[p], h5py.Dataset) and f[p].ndim == 1 and f[p].shape[0] == n:
+                        return [v.decode('utf-8', errors='ignore') if isinstance(v, (bytes, np.bytes_)) else str(v) for v in f[p][:min(10, n)]]
+                return [f"{prefix}_{i+1}" for i in range(min(10, n))]
+            genes = first_names(["/row_attrs/Gene", "/row_attrs/Accession", "/row_attrs/Name", "/row_attrs/Original_Gene",
+                                 "/row_attrs/gene", "/row_attrs/gene_name", "/row_attrs/var_names", "/row_attrs/index", "/row_attrs/_index"], nGenes, "Gene")
+            cells = first_names(["/col_attrs/CellID", "/col_attrs/cell_id", "/col_attrs/cell_ids", "/col_attrs/barcode", "/col_attrs/barcodes",
+                                 "/col_attrs/Barcode", "/col_attrs/obs_names", "/col_attrs/index", "/col_attrs/_index"], nCells, "Cell")
             
             # Extract 10x10 matrix
             matrix = f['/matrix'][:min(10, nGenes), :min(10, nCells)].tolist()
@@ -1219,8 +1240,11 @@ class RdsHandler:
                     result["warnings"].append(f"WARNING: Skipping assay '{assay}' due to error: {e}")
         elif obj_class == "data.frame":
             from rpy2.robjects import pandas2ri
-            pandas2ri.activate()
-            df = pandas2ri.rpy2py(obj)
+            from rpy2.robjects.conversion import localconverter
+            # rpy2 >= 3.6 removed pandas2ri.activate(): convert through an explicit local context (as parse does)
+            _cv = ro.default_converter + pandas2ri.converter
+            with localconverter(_cv):
+                df = _cv.rpy2py(obj)
             n_rows = len(df)
             entry = {
                 "group": "data_frame",
@@ -1271,20 +1295,37 @@ class MexHandler:
         cells = [f"Cell_{i+1}" for i in range(10)]
         # Look for barcodes.tsv or barcodes.csv
         barcode_path = next((p for p in file_paths if Path(p).name in ["barcodes.tsv", "barcodes.csv"]), None)
-        
+
+        # Number of cells declared by the MTX dimension line (decides whether the barcodes file has a header)
+        n_cells_mtx = None
+        mtx_path = next((p for p in file_paths if Path(p).name.lower().endswith(".mtx")), None)
+        if mtx_path:
+            try:
+                with open(mtx_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.startswith('%'):
+                            parts = line.split()
+                            if len(parts) == 3 and parts[1].isdigit():
+                                n_cells_mtx = int(parts[1])
+                            break
+            except OSError:
+                n_cells_mtx = None # fall back to the first-line heuristic below
+
         if barcode_path:
             # Standard TSV format (one barcode per line)
             with open(barcode_path, "r") as f:
-                lines = [line.strip() for _, line in zip(range(11), f)]  # Read 11 lines
-                
-                # Check if first line is a header (contains commas or many tabs suggesting metadata columns)
-                if lines and (',' in lines[0] or lines[0].count('\t') > 2):
-                    # Skip header row, extract first column from remaining lines
-                    cells = [line.split('\t')[0].split(',')[0].strip('"') for line in lines[1:] if line]
+                lines = [line.strip() for line in f if line.strip()]
+
+                # Header detection, same rule as parse: the line count vs the matrix decides when it can,
+                # otherwise a first line with commas or many tabs (metadata columns) is a header
+                if n_cells_mtx is not None and len(lines) in (n_cells_mtx, n_cells_mtx + 1):
+                    has_header = len(lines) == n_cells_mtx + 1
                 else:
-                    # No header, just barcode per line
-                    cells = [line.split('\t')[0] for line in lines if line]
-                
+                    has_header = bool(lines) and (',' in lines[0] or lines[0].count('\t') > 2)
+                # First field of each line (as parse reads it: tab-delimited for .tsv, comma-delimited for .csv)
+                is_csv = barcode_path.endswith('.csv')
+                cells = [(line.split(',')[0] if is_csv else line.split('\t')[0]).strip('"') for line in lines[(1 if has_header else 0):]]
+
                 cells = cells[:10]  # Keep only first 10
         else:
             # Try CSV format with metadata (cell_metadata*.csv)
@@ -1537,7 +1578,13 @@ def main():
     if args.o and not os.path.isdir(args.o):
         os.makedirs(args.o, exist_ok=True)
 
-    preparse(args)
+    try:
+        preparse(args)
+    except Exception as e:
+        # Catch-all: unexpected errors still produce a displayed_error (the traceback goes to stderr for debugging)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error while reading the file ({type(e).__name__}: {e})")
 
 if __name__ == '__main__':
     main()
