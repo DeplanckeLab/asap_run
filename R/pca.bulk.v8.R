@@ -120,7 +120,7 @@ h5_in$close_all()
 # Apply filter mask before top-var-gene selection
 if (!is.null(filter_mask)) {
   n_before   <- n_genes
-  matrix_gxc <- matrix_gxc[filter_mask, ]
+  matrix_gxc <- matrix_gxc[filter_mask, , drop = FALSE]
   n_genes    <- nrow(matrix_gxc)
   warn_env$w <- c(warn_env$w, paste0("Filter mask applied: ", n_genes, "/", n_before, " genes used for PCA."))
 }
@@ -133,14 +133,22 @@ n_top <- if (args$top_var_genes > 0 && args$top_var_genes < n_genes) as.integer(
 if (n_top < n_genes) {
   gene_vars  <- rowVars_fast(matrix_gxc)
   top_idx    <- order(gene_vars, decreasing = TRUE)[seq_len(n_top)]
-  matrix_sub <- matrix_gxc[top_idx, ]
+  matrix_sub <- matrix_gxc[top_idx, , drop = FALSE]
 } else {
   matrix_sub <- matrix_gxc
 }
 
+# Constant genes (e.g. all-zero after VST) carry no variance and make prcomp(scale. = TRUE) fail
+is_const <- rowSums(matrix_sub != matrix_sub[, 1], na.rm = TRUE) == 0
+if (any(is_const)) {
+  warn_env$w <- c(warn_env$w, paste0(sum(is_const), " constant gene(s) excluded from PCA."))
+  matrix_sub <- matrix_sub[!is_const, , drop = FALSE]
+  if (nrow(matrix_sub) == 0) ErrorJSON("All selected genes are constant across samples; cannot run PCA.")
+}
+
 ## ── Compute PCA ───────────────────────────────────────────────────────────────
 
-n_pcs_req  <- min(args$n_pcs, n_samples - 1L, n_top)
+n_pcs_req  <- min(args$n_pcs, n_samples - 1L, nrow(matrix_sub))
 pca_res    <- tryCatch(
   prcomp(t(matrix_sub), center = TRUE, scale. = args$scale_data, rank. = n_pcs_req),
   error = function(e) ErrorJSON(paste0("prcomp failed: ", conditionMessage(e)))

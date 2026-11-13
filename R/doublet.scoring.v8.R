@@ -270,12 +270,21 @@ old_assay_version <- getOption("Seurat.object.assay.version")
 options(Seurat.object.assay.version = "v3")
 on.exit(options(Seurat.object.assay.version = old_assay_version), add = TRUE)
 
+# RunPCA fails when npcs >= min(n_features, n_cells): cap n_dims (used for RunPCA, paramSweep and doubletFinder PCs)
+n_dims_max <- min(n_cells, min(args$n_features, n_genes)) - 1L
+if (n_dims > n_dims_max) {
+  warn_env$w <- c(warn_env$w, paste0("n_dims capped from ", n_dims, " to ", n_dims_max, " (min(n_features, n_cells) - 1)."))
+  n_dims <- n_dims_max
+}
+if (n_dims < 2L) ErrorJSON(paste0("Too few cells (", n_cells, ") or genes (", n_genes, ") to run DoubletFinder."))
+
 seurat_obj <- .silence(suppressMessages({
   seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
   seurat_obj <- FindVariableFeatures(seurat_obj, nfeatures = min(args$n_features, n_genes), verbose = FALSE)
   seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj), verbose = FALSE)
   RunPCA(seurat_obj, npcs = n_dims, verbose = FALSE)
 }))
+n_dims <- min(n_dims, ncol(Embeddings(seurat_obj, reduction = "pca")))
 
 ## ── pK estimation (auto) ──────────────────────────────────────────────────────
 

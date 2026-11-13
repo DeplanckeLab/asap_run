@@ -27,33 +27,43 @@ close_file <- function(handle) {
 }
 
 # Open the Loom file while handling potential locking
-open_with_lock <- function(loom_filename, mode) {
+# rhdf5 reports a lock and a corrupt file with the same "Unable to open file" error, so missing/unreadable files
+# fail at once and the lock retry gives up after max_wait seconds (as the v8 scripts do) instead of hanging forever.
+open_with_lock <- function(loom_filename, mode, max_wait = 600) {
+  if(!file.exists(loom_filename)) error.json(paste0("File not found: ", loom_filename))
+  if(file.access(loom_filename, if(mode == "r") 4 else 6) != 0) error.json(paste0("Permission denied for '", loom_filename, "' (mode ", mode, ")"))
   if(mode == "r") mode <- "H5F_ACC_RDONLY"
   if(mode == "r+") mode <- "H5F_ACC_RDWR"
+  waited <- 0
   repeat{ # Handle the lock of the file
     tryCatch({
       return(H5Fopen(name = loom_filename, flags = mode))
     }, error = function(err) {
       if(!grepl("Unable to open file", err$message)) error.json(err$message)
+      if(waited >= max_wait) error.json(paste0("Could not open '", loom_filename, "' after ", max_wait, "s (locked by another job, or not a valid HDF5/Loom file): ", err$message))
     })
     message("Sleeping 1sec for file lock....")
     time_idle <<- time_idle + 1
+    waited <- waited + 1
     Sys.sleep(1)
   }
 }
 
 # Open the Loom file while handling potential locking
-create_with_lock <- function(loom_filename) {
-  if(file.exists(loom_filename)) file.remove(output_loom)
+create_with_lock <- function(loom_filename, max_wait = 600) {
+  if(file.exists(loom_filename)) file.remove(loom_filename)
   mode <- "H5F_ACC_EXCL" # Fail if file already exists
+  waited <- 0
   repeat{ # Handle the lock of the file
     tryCatch({
       return(H5Fcreate(name = loom_filename, flags = mode))
     }, error = function(err) {
       if(!grepl("Unable to open file", err$message)) error.json(err$message)
+      if(waited >= max_wait) error.json(paste0("Could not create '", loom_filename, "' after ", max_wait, "s: ", err$message))
     })
     message("Sleeping 1sec for file lock....")
     time_idle <<- time_idle + 1
+    waited <- waited + 1
     Sys.sleep(1)
   }
 }

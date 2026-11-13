@@ -58,6 +58,7 @@ Options:
 
   -- Multiple testing correction -----------------------------------------------
   --padj_method          Adjustment: BH | bonferroni | none.             [default: BH]
+  --seed                 Random seed for fgsea (reproducible p-values).  [default: 42]
 
   --help  Show this message and exit.
 
@@ -112,7 +113,8 @@ option_list <- list(
   make_option("--lfc_threshold",         type = "double",    default = 1.0,    help = "Abs log FC threshold for foreground (ORA, if --top_n unset). [default: 1.0]"),
   make_option("--min_geneset_size",      type = "integer",   default = 5L,     help = "Min gene set size (in background). [default: 5]"),
   make_option("--max_geneset_size",      type = "integer",   default = 500L,   help = "Max gene set size (in background). [default: 500]"),
-  make_option("--padj_method",           type = "character", default = "BH",   help = "P-value adjustment: BH | bonferroni | none. [default: BH]")
+  make_option("--padj_method",           type = "character", default = "BH",   help = "P-value adjustment: BH | bonferroni | none. [default: BH]"),
+  make_option("--seed",                  type = "integer",   default = 42L,    help = "Random seed for fgsea permutations. [default: 42]")
 )
 
 parser <- OptionParser(option_list = option_list, add_help_option = FALSE)
@@ -420,12 +422,15 @@ if (args$method %in% ORA_METHODS) {
   }
   if (length(pathways) == 0) ErrorJSON("No gene sets passed size filters for fgsea. Try --min_geneset_size / --max_geneset_size.")
 
+  # fgsea p-values come from random permutations: fix the seed and run serially so re-runs give the same results
+  set.seed(args$seed)
   fgsea_res <- capture_warnings(suppressMessages(fgsea::fgsea(
     pathways    = pathways,
     stats       = ranked_stats,
     minSize     = args$min_geneset_size,
     maxSize     = args$max_geneset_size,
-    nPermSimple = 10000L
+    nPermSimple = 10000L,
+    BPPARAM     = BiocParallel::SerialParam()
   )))
 
   enrich_results <- lapply(seq_len(nrow(fgsea_res)), function(i) list(
@@ -544,7 +549,8 @@ result <- list(
     fdr_threshold    = if (args$method %in% ORA_METHODS && is.null(args$top_n)) args$fdr_threshold else NULL,
     lfc_threshold    = if (args$method %in% ORA_METHODS && is.null(args$top_n)) args$lfc_threshold else NULL,
     min_geneset_size = args$min_geneset_size,
-    max_geneset_size = args$max_geneset_size
+    max_geneset_size = args$max_geneset_size,
+    seed             = if (args$method %in% GSEA_METHODS) args$seed else NULL
   ),
   n_genes_total               = n_genes_total,
   n_genes_background          = n_background,

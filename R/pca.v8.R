@@ -146,6 +146,7 @@ write_2d_dataset <- function(h5, path, mat, dim1, dim2) {
   }
   ds <- h5$create_dataset(name = path, dtype = dtype, dims = c(dim2, dim1),
                            chunk_dims = c(chunk2, chunk1), gzip_level = LOOM_GZIP_LEVEL)
+  if (!identical(dim(mat), c(as.integer(dim1), as.integer(dim2)))) stop("write_2d_dataset: matrix is ", paste(dim(mat), collapse = " x "), ", expected ", dim1, " x ", dim2)
   ds[1:dim2, 1:dim1] <- matrix(as.numeric(t(mat)), nrow = dim2, ncol = dim1)
   invisible(ds$get_storage_size())
 }
@@ -262,9 +263,19 @@ seurat_obj <- capture_warnings(suppressMessages(RunPCA(
 )))
 
 cell_embeddings <- Embeddings(seurat_obj, reduction = "pca")   # (n_cells x n_pcs)
-stdev           <- seurat_obj[["pca"]]@stdev
+# RunPCA can return fewer PCs than requested (zero-variance features are dropped, npcs is capped)
+if (ncol(cell_embeddings) < n_pcs_actual) {
+  warn_env$w <- c(warn_env$w, paste0("RunPCA returned ", ncol(cell_embeddings), " PCs instead of ", n_pcs_actual, "."))
+  n_pcs_actual <- ncol(cell_embeddings)
+  result$parameters$n_pcs <- n_pcs_actual
+  result$pca_sc$n_pcs     <- n_pcs_actual
+}
+stdev           <- seurat_obj[["pca"]]@stdev[seq_len(n_pcs_actual)]
 variance        <- stdev^2
-variance_ratio  <- variance / sum(variance)
+# Fraction of the total variance of the input features (as scanpy's variance_ratio), not of the computed PCs only
+total_variance  <- seurat_obj[["pca"]]@misc$total.variance
+if (is.null(total_variance) || !is.finite(total_variance) || total_variance <= 0) total_variance <- sum(variance)
+variance_ratio  <- variance / total_variance
 
 result$pca_sc$variance       <- as.numeric(variance)
 result$pca_sc$variance_ratio <- as.numeric(variance_ratio)

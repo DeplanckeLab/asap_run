@@ -140,8 +140,9 @@ if (is_embedding_input) {
   # Orientation: detect which axis matches n_samples.
   raw <- h5_in[[src_path]][,]
   if (is.null(dim(raw))) raw <- matrix(raw, ncol = 1L)
-  if (nrow(raw) == n_samples)      data_obs <- raw          # already samples x dims
-  else if (ncol(raw) == n_samples) data_obs <- t(raw)       # transpose to samples x dims
+  # Test the (n_dims x n_samples) layout first so a square embedding (n_dims == n_samples) is not used transposed.
+  if (ncol(raw) == n_samples)      data_obs <- t(raw)       # transpose to samples x dims
+  else if (nrow(raw) == n_samples) data_obs <- raw          # already samples x dims
   else ErrorJSON(paste0("Embedding dims (", nrow(raw), " x ", ncol(raw), ") do not match n_samples (", n_samples, ")."))
   n_feat_total <- ncol(data_obs)
   # Restrict to leading n_dims if requested

@@ -270,7 +270,7 @@ avg_ref_full  <- rowMeans(matrix_sub[, cond_sub == args$reference,  drop = FALSE
 # Apply filter mask if provided
 n_genes_before_filter <- nrow(matrix_sub)
 if (!is.null(filter_mask)) {
-  matrix_sub <- matrix_sub[filter_mask, ]
+  matrix_sub <- matrix_sub[filter_mask, , drop = FALSE]
   warn_env$w <- c(warn_env$w, paste0("Filter mask applied: ", nrow(matrix_sub), "/", n_genes_before_filter, " genes retained for DEA."))
 }
 if (nrow(matrix_sub) == 0) ErrorJSON("No genes remain after applying the filter mask.")

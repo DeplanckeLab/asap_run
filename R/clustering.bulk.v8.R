@@ -144,7 +144,7 @@ if (args$k >= n_samples) ErrorJSON(paste0("-k (", args$k, ") must be less than t
 # Apply filter mask before any gene selection
 if (!is.null(filter_mask)) {
   n_before   <- n_genes
-  matrix_gxc <- matrix_gxc[filter_mask, ]
+  matrix_gxc <- matrix_gxc[filter_mask, , drop = FALSE]
   n_genes    <- nrow(matrix_gxc)
   warn_env$w <- c(warn_env$w, paste0("Filter mask applied: ", n_genes, "/", n_before, " genes used for clustering."))
 }
@@ -155,7 +155,7 @@ rowVars_fast <- function(m) { rowMeans(m^2) - rowMeans(m)^2 }
 n_top <- if (args$top_var_genes > 0 && args$top_var_genes < n_genes) as.integer(args$top_var_genes) else n_genes
 if (n_top < n_genes) {
   top_idx    <- order(rowVars_fast(matrix_gxc), decreasing = TRUE)[seq_len(n_top)]
-  matrix_sub <- matrix_gxc[top_idx, ]
+  matrix_sub <- matrix_gxc[top_idx, , drop = FALSE]
 } else {
   matrix_sub <- matrix_gxc
 }

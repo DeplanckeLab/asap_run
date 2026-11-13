@@ -393,6 +393,15 @@ build_seurat <- function(counts, batch) {
   obj
 }
 
+# RunPCA fails when npcs >= min(n_features, n_cells): cap it (like pca.v8.R), and use that many PCs downstream
+n_pcs_used <- args$n_pcs
+capped_npcs <- function(obj) {
+  n <- min(args$n_pcs, ncol(obj) - 1L, length(VariableFeatures(obj)) - 1L)
+  if (n < 2L) ErrorJSON(paste0("Too few cells (", ncol(obj), ") or variable genes (", length(VariableFeatures(obj)), ") to run PCA for integration."))
+  if (n < args$n_pcs) add_warning(paste0("--n_pcs capped from ", args$n_pcs, " to ", n, " (min(n_variable_genes, n_cells) - 1)."))
+  n
+}
+
 invisible(if (args$method == "uncorrected") {
   embedding_path <- "/matrix"   # no low-dimensional embedding; advertise raw integrated matrix in JSON
   NULL   # no integration; matrix is written as-is below
@@ -401,13 +410,14 @@ invisible(if (args$method == "uncorrected") {
   seurat <- capture_warnings(NormalizeData(seurat, normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE))
   seurat <- capture_warnings(FindVariableFeatures(seurat, selection.method = "vst", nfeatures = args$n_top_genes, verbose = FALSE))
   seurat <- capture_warnings(ScaleData(seurat, features = rownames(seurat), verbose = FALSE))
-  seurat <- capture_warnings(RunPCA(seurat, features = VariableFeatures(seurat), npcs = args$n_pcs, verbose = FALSE))
+  n_pcs_used <- capped_npcs(seurat)
+  seurat <- capture_warnings(RunPCA(seurat, features = VariableFeatures(seurat), npcs = n_pcs_used, verbose = FALSE))
   if (!is.null(args$convergence_plot)) {
     grDevices::png(args$convergence_plot, width = 800, height = 800, type = "cairo")
-    seurat <- capture_warnings(harmony::RunHarmony(object = seurat, group.by.vars = "orig.ident", plot_convergence = TRUE, early_stop = TRUE, reduction.use = "pca", dims.use = 1:args$n_pcs, verbose = FALSE))
+    seurat <- capture_warnings(harmony::RunHarmony(object = seurat, group.by.vars = "orig.ident", plot_convergence = TRUE, early_stop = TRUE, reduction.use = "pca", dims.use = seq_len(n_pcs_used), verbose = FALSE))
     grDevices::dev.off()
   } else {
-    seurat <- capture_warnings(harmony::RunHarmony(object = seurat, group.by.vars = "orig.ident", plot_convergence = FALSE, early_stop = TRUE, reduction.use = "pca", dims.use = 1:args$n_pcs, verbose = FALSE))
+    seurat <- capture_warnings(harmony::RunHarmony(object = seurat, group.by.vars = "orig.ident", plot_convergence = FALSE, early_stop = TRUE, reduction.use = "pca", dims.use = seq_len(n_pcs_used), verbose = FALSE))
   }
   pca_emb        <- Seurat::Embeddings(seurat, reduction = "pca")
   embedding      <- Seurat::Embeddings(seurat, reduction = "harmony")
@@ -420,10 +430,14 @@ invisible(if (args$method == "uncorrected") {
   seurat <- capture_warnings(NormalizeData(seurat, normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE))
   seurat <- capture_warnings(FindVariableFeatures(seurat, selection.method = "vst", nfeatures = args$n_top_genes, verbose = FALSE))
   seurat <- capture_warnings(ScaleData(seurat, verbose = FALSE))
-  seurat <- capture_warnings(RunPCA(seurat, npcs = args$n_pcs, verbose = FALSE))
+  n_pcs_used <- capped_npcs(seurat)
+  seurat <- capture_warnings(RunPCA(seurat, npcs = n_pcs_used, verbose = FALSE))
   integ_method <- if (args$method == "cca") Seurat::CCAIntegration else Seurat::RPCAIntegration
   new_red <- paste0("integrated.", args$method)
-  seurat <- capture_warnings(Seurat::IntegrateLayers(object = seurat, method = integ_method, orig.reduction = "pca", new.reduction = new_red, verbose = FALSE))
+  # 1:30 is the CCA/RPCA default (they compute their own CCs / per-batch PCs); dims must stay below the smallest batch size
+  integ_dims <- seq_len(max(1L, min(30L, min(table(seurat$orig.ident)) - 1L)))
+  seurat <- tryCatch(capture_warnings(Seurat::IntegrateLayers(object = seurat, method = integ_method, orig.reduction = "pca", new.reduction = new_red, dims = integ_dims, verbose = FALSE)),
+                     error = function(e) ErrorJSON(paste0(toupper(args$method), " integration failed: ", conditionMessage(e))))
   seurat[["RNA"]] <- JoinLayers(seurat[["RNA"]])
   pca_emb        <- Seurat::Embeddings(seurat, reduction = "pca")
   embedding      <- Seurat::Embeddings(seurat, reduction = new_red)
@@ -534,9 +548,10 @@ for (k in transfer_row_keys) {
   write_dataset(h5_out, paste0("/row_attrs/", k), vals[keep_idx])
 }
 
-# Embedding(s)
-if (!is.null(pca_emb))   write_dataset(h5_out, "/col_attrs/_pca", pca_emb)
-if (!is.null(embedding)) write_dataset(h5_out, embedding_path, embedding)
+# Embedding(s): (n_cells x k) in R. Write t() because hdf5r reverses dims, so the file holds
+# (n_cells x k) in h5py terms, like every other v8 writer (pca/tsne/umap).
+if (!is.null(pca_emb))   write_dataset(h5_out, "/col_attrs/_pca", t(pca_emb))
+if (!is.null(embedding)) write_dataset(h5_out, embedding_path, t(embedding))
 
 # Matrix
 write_matrix(h5_out, X_cxg, n_cells, n_genes)
@@ -554,7 +569,7 @@ result <- list(
 )
 if (!is.null(embedding_path)) result$output_embedding <- embedding_path
 if (args$method %in% c("harmony", "cca", "rpca")) {
-  result$n_pcs       <- as.integer(args$n_pcs)
+  result$n_pcs       <- as.integer(n_pcs_used)
   result$n_top_genes <- as.integer(args$n_top_genes)
 }
 if (length(warn_env$w) > 0) result$warnings <- as.list(warn_env$w)

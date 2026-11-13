@@ -4,10 +4,16 @@
 if (!nzchar(Sys.getenv("MAKEFLAGS"))) Sys.setenv(MAKEFLAGS = "-j2")
 
 # Functions
-install_and_verify <- function(pkgfile, package) {
+install_and_verify <- function(pkgfile, package, version) {
   install.packages(pkgfile, repos = NULL, type = "source", verbose = FALSE, quiet = T)
   if (!requireNamespace(package, quietly = TRUE)) {
 	message("Package ",package," failed installation")
+	quit(status = 1)
+  }
+  # A failed build only warns and can leave another copy in place (e.g. Matrix/MASS bundled with R): check the version
+  installed <- as.character(utils::packageVersion(package))
+  if (package_version(installed) != package_version(version)) {
+	message("Package ", package, " v", version, " failed installation (found v", installed, " instead)")
 	quit(status = 1)
   }
 }
@@ -21,14 +27,14 @@ install.cran <- function(package, version, host="cran.r-project.org") {
   tryCatch({
       message("Installing ", package," v", version," from main CRAN repository...", appendLF = FALSE)
       suppressWarnings(download.file(main_url, tmp_file, mode = "wb", quiet = TRUE))
-      install_and_verify(tmp_file, package)
+      install_and_verify(tmp_file, package, version)
       unlink(tmp_file)
     }, error = function(e) {
       message("\t[FAILED - RETRY] ", e$message)
       message("Trying to install ", package," v", version," from CRAN archive...", appendLF = FALSE)
       tryCatch({
           suppressWarnings(download.file(archive_url, tmp_file, mode = "wb", quiet = TRUE))
-          install_and_verify(tmp_file, package)
+          install_and_verify(tmp_file, package, version)
           unlink(tmp_file)
         }, error = function(e) {
           message("\t[FAILED - EXIT] ", e$message)
@@ -48,21 +54,21 @@ install.bioconductor <- function(package, version, bioconductor_version, source 
   tryCatch({
       message("Installing ", package, " v", version, " from Bioconductor archive...", appendLF = FALSE)
       suppressWarnings(download.file(archive_url, tmp_file, mode = "wb", quiet = TRUE))
-      install_and_verify(tmp_file, package)
+      install_and_verify(tmp_file, package, version)
       unlink(tmp_file)
     }, error = function(e) {
       message("\t[FAILED - RETRY] ", e$message)
       message("Trying to install ", package, " v", version, " from main Bioconductor repository...", appendLF = FALSE)
       tryCatch({
           suppressWarnings(download.file(main_url, tmp_file, mode = "wb", quiet = TRUE))
-          install_and_verify(tmp_file, package)
+          install_and_verify(tmp_file, package, version)
           unlink(tmp_file)
         }, error = function(e) {
           message("\t[FAILED - RETRY] ", e$message)
           message("Trying to install ", package, " v", version, " from Bioconductor archive 2...", appendLF = FALSE)
           tryCatch({
               suppressWarnings(download.file(archive_url_2, tmp_file, mode = "wb", quiet = TRUE))
-              install_and_verify(tmp_file, package)
+              install_and_verify(tmp_file, package, version)
               unlink(tmp_file)
             }, error = function(e) {
               message("\t[FAILED - EXIT] ", e$message)
@@ -79,7 +85,7 @@ install.github <- function(package, version, bioconductor_version, source = "bio
 
   tryCatch({
       message("Installing ", package, " v", version, " from local GitHub tarball...", appendLF = FALSE)
-      install_and_verify(tmp_file, package)
+      install_and_verify(tmp_file, package, version)
     }, error = function(e) {
       message("\t[FAILED - EXIT] ", e$message)
       message("Installation of ", package, " v", version, " from local tarball failed. Stopping installation.")
@@ -393,12 +399,7 @@ install.cran("fontLiberation", version="0.1.0") # Dependency of ggiraph
 install.cran("fontquiver", version="0.2.1") # Dependency of ggiraph
 install.cran("gdtools", version="0.5.1") # Dependency of ggiraph
 install.cran("ggiraph", version="0.9.6") # Dependency of ggtree
-install.cran("ggnewscale", version="0.5.2") # Dependency of enrichplot
-install.cran("ggrepel", version="0.9.8") # Dependency of enrichplot
-install.cran("ggtangle", version="0.1.2") # Dependency of enrichplot
 install.cran("tidydr", version="0.0.6") # Dependency of enrichplot
-install.cran("ggforce", version="0.5.0") # Dependency of scatterpie
-install.cran("scatterpie", version="0.2.6") # Dependency of enrichplot
 
 # Bioconductor packages
 # Note: Upgraded to 3.22 for the version of R we use ('4.5'). 3.23 requires R version '4.6'

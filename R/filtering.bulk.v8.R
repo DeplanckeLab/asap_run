@@ -155,7 +155,12 @@ if (args$method == "min_counts") {
     keep <- rowSums(matrix_gxc >= args$min_counts) >= args$min_samples
   }
 } else if (args$method == "cpm") {
-  cpm_mat <- cpm(matrix_gxc)   # edgeR cpm() expects genes × samples ✓
+  # edgeR cpm() expects genes × samples ✓. It rejects (or gives NaN for) samples with zero library size,
+  # so compute CPM on the non-empty samples and count empty samples as CPM = 0 (they pass no threshold).
+  empty   <- colSums(matrix_gxc) == 0
+  cpm_mat <- matrix(0, nrow = nrow(matrix_gxc), ncol = ncol(matrix_gxc))
+  if (any(!empty)) cpm_mat[, !empty] <- cpm(matrix_gxc[, !empty, drop = FALSE])
+  if (any(empty)) warn_env$w <- c(warn_env$w, paste0(sum(empty), " sample(s) with zero total counts treated as CPM = 0."))
   if (args$min_samples == 0L) {
     keep <- rowSums(cpm_mat) >= args$min_cpm
   } else {

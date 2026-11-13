@@ -326,10 +326,12 @@ if (args$method %in% c("LogNormalize", "CLR", "RC")) {
     sparse_counts_sct <- sparse_counts
   }
 
-  # Inject regression variables as cell metadata (on the full seurat_obj, before zero-cell subset)
+  # Inject regression variables as cell metadata (vars_meta has one value per input cell: drop the excluded zero-count cells)
   if (!is.null(vars_meta)) {
     for (vname in names(vars_meta)) {
-      seurat_obj[[vname]] <- vars_meta[[vname]]
+      vals <- vars_meta[[vname]]
+      if (length(zero_cells) > 0) vals <- vals[-zero_cells]
+      seurat_obj[[vname]] <- vals
     }
   }
 

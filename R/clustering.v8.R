@@ -207,11 +207,14 @@ ca_len   <- h5_in[[CELL_ID_PATH]]$dims
 cell_ids <- as.character(h5_in[[CELL_ID_PATH]][])
 h5_in$close_all()
 
-# Orientation: R-written = already cells x pcs; Python-written = needs transpose.
-if (nrow(raw_emb) == ca_len) {
-  emb_cxp <- raw_emb
+# Orientation: v8 writers store embeddings as (n_cells x k) on disk, which hdf5r reads as (k x n_cells).
+# Test that layout first so a square embedding (k == n_cells) is not used transposed.
+if (ncol(raw_emb) == ca_len) {
+  emb_cxp <- t(raw_emb)       # standard layout: transpose to cells x pcs
+} else if (nrow(raw_emb) == ca_len) {
+  emb_cxp <- raw_emb          # legacy layout: already cells x pcs
 } else {
-  emb_cxp <- t(raw_emb)
+  ErrorJSON(paste0("Embedding dims (", nrow(raw_emb), " x ", ncol(raw_emb), ") do not match the number of cells (", ca_len, ")."))
 }
 n_cells <- nrow(emb_cxp)
 n_pcs   <- ncol(emb_cxp)

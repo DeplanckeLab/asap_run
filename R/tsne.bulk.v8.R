@@ -136,8 +136,9 @@ n_samples <- as.integer(mat_dims[1])
 if (is_embedding_input) {
   raw <- h5_in[[src_path]][,]
   if (is.null(dim(raw))) raw <- matrix(raw, ncol = 1L)
-  if (nrow(raw) == n_samples)      data_obs <- raw
-  else if (ncol(raw) == n_samples) data_obs <- t(raw)
+  # v8 writers store embeddings as (n_samples x k) on disk = (k x n_samples) in hdf5r: test that layout first (k == n_samples)
+  if (ncol(raw) == n_samples)      data_obs <- t(raw)
+  else if (nrow(raw) == n_samples) data_obs <- raw
   else ErrorJSON(paste0("Embedding dims (", nrow(raw), " x ", ncol(raw), ") do not match n_samples (", n_samples, ")."))
   n_feat_total <- ncol(data_obs)
   if (!is.null(args$n_dims)) {
