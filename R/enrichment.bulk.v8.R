@@ -223,6 +223,10 @@ if (!is.null(args$filter_meta)) {
   fmask_path <- sub("^/", "", args$filter_meta)
   if (!h5_in$exists(fmask_path)) ErrorJSON(paste0("Filter mask '", args$filter_meta, "' not found in LOOM."))
   filter_mask <- as.logical(h5_in[[fmask_path]][])
+  # The mask is in LOOM gene order, but de.bulk.v8.R writes the DEA rows sorted by significance:
+  # keep the LOOM accessions so the mask can be realigned to the DEA rows below.
+  if (!h5_in$exists("row_attrs/Accession")) ErrorJSON("--filter_meta requires /row_attrs/Accession in the LOOM, to align the filter mask with the DEA matrix rows.")
+  filter_mask_acc <- as.character(h5_in[["row_attrs/Accession"]][])
 }
 
 h5_in$close_all()
@@ -254,6 +258,9 @@ dbid_to_ens <- db_data$dbid_to_ens
 
 if (!is.null(filter_mask)) {
   if (length(filter_mask) != n_genes_total) ErrorJSON(paste0("Filter mask length (", length(filter_mask), ") != number of genes in DEA matrix (", n_genes_total, ")."))
+  # Realign the LOOM-ordered mask to the (sorted) DEA row order by accession; unmatched or NA -> not kept
+  filter_mask <- filter_mask[match(ensembl_ids, filter_mask_acc)]
+  filter_mask[is.na(filter_mask)] <- FALSE
   bg_mask <- filter_mask & !is.na(ensembl_ids) & (ensembl_ids %in% names(ens_to_dbid))
   warn_env$w <- c(warn_env$w, paste0("Background restricted to ", sum(filter_mask), " filter-passing genes (--filter_meta)."))
 } else {

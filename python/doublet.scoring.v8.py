@@ -158,8 +158,17 @@ def doublet_score(args):
     doublet_scores, predicted_doublets_auto = scrub.scrub_doublets(n_prin_comps=args.n_pcs, verbose=False)
     doublet_scores = np.array(doublet_scores, dtype=DEFAULT_NP_DTYPE)
 
-    threshold_auto  = float(scrub.threshold_)
-    auto_n_doublets = int(np.sum(predicted_doublets_auto))
+    # Scrublet returns None (and never sets threshold_) when it cannot find an automatic threshold
+    # (e.g. unimodal simulated-score histogram, common for small or homogeneous samples)
+    if predicted_doublets_auto is None or not hasattr(scrub, "threshold_"):
+        if args.doublet_rate is None:
+            ErrorJSON("Scrublet could not determine an automatic doublet-score threshold for this dataset "
+                      "(the simulated doublet scores are not bimodal). Please set --doublet_rate to call the top-scoring cells instead.")
+        warnings.append("Scrublet could not determine an automatic threshold; doublets were called from --doublet_rate only.")
+        threshold_auto, auto_n_doublets = None, None
+    else:
+        threshold_auto  = float(scrub.threshold_)
+        auto_n_doublets = int(np.sum(predicted_doublets_auto))
     result["doublet_score"]["threshold_auto"]          = threshold_auto
     result["doublet_score"]["threshold_auto_n_doublets"] = auto_n_doublets
 

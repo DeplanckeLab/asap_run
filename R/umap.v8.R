@@ -269,6 +269,8 @@ seurat_obj <- capture_warnings(suppressMessages(RunUMAP(
   reduction     = "pca",
   dims          = seq_len(n_dims),
   umap.method   = "uwot",
+  n.neighbors   = args$n_neighbors, # RunUMAP(dims=) builds its own kNN: FindNeighbors' k.param/annoy.metric do not reach it
+  metric        = args$metric,
   n.components  = args$n_components,
   min.dist      = args$min_dist,
   seed.use      = args$seed_use,

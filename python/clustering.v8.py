@@ -172,6 +172,12 @@ def clustering(args):
         )
         cluster_key = "leiden"
     else:  # louvain
+        # scanpy's default "vtraag" flavor needs the 'louvain' package. Its "igraph" flavor would run without it,
+        # but silently ignores --resolution, so fail clearly instead of returning clusters for the wrong resolution.
+        try:
+            import louvain  # noqa: F401
+        except ImportError:
+            ErrorJSON("Louvain clustering is not available in this ASAP version (the 'louvain' Python package is not installed). Please use Leiden clustering instead.")
         import warnings as _warnings
         with _warnings.catch_warnings():
             _warnings.simplefilter("ignore", FutureWarning)

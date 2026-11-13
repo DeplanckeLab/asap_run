@@ -1,5 +1,6 @@
 # Imports
 import sys
+import time
 import h5py
 import numpy
 import json
