@@ -5,6 +5,7 @@ import argparse        # Argument parsing
 import json            # For writing output files
 import os              # For path/directory operations
 import sys             # For ErrorJSON exit
+import tempfile        # Unique temp names for the expression cache
 import time            # For retry sleep
 import warnings        # For non-fatal warnings
 from contextlib import contextmanager, nullcontext
@@ -261,16 +262,34 @@ class LoomHandler:
 
 
 def _expression_npy_cache_path(loom_path: str, input_dataset: str) -> Path:
-    """Sidecar cache next to the loom: loom path segments with '/' replaced by '_', plus '.npy'."""
-    name = input_dataset.replace("/", "_") + ".npy"
-    return Path(loom_path).resolve().parent / name
+    """Sidecar cache next to the loom, named after the loom and the dataset ('/' -> '_'):
+    output.loom + /layers/norm -> output_layers_norm.de_cache.npz (two looms in one folder never share a cache)."""
+    p = Path(loom_path).resolve()
+    return p.parent / f"{p.stem}{input_dataset.replace('/', '_')}.de_cache.npz"
 
 
-def _write_expression_npy_cache(cache_path: Path, matrix: np.ndarray) -> None:
-    """Write float32 matrix atomically for smaller disk use; readers promote to float64."""
-    tmp_path = cache_path.parent / f"{cache_path.stem}._tmp_.npy"
-    np.save(tmp_path, np.asarray(matrix, dtype=np.float32, order="C"))
-    os.replace(str(tmp_path), str(cache_path))
+def _legacy_expression_npy_cache_path(loom_path: str, input_dataset: str) -> Path:
+    """Cache name used before the loom name and source fingerprint were added (no longer read)."""
+    return Path(loom_path).resolve().parent / (input_dataset.replace("/", "_") + ".npy")
+
+
+def _write_expression_npy_cache(cache_path: Path, matrix: np.ndarray, fingerprint: str) -> None:
+    """Write the float32 matrix and its source fingerprint atomically: a unique temp file per job, then os.replace,
+    so concurrent jobs never truncate each other's file or publish a partial one."""
+    fd, tmp_path = tempfile.mkstemp(dir=str(cache_path.parent), prefix=f".{cache_path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            np.savez(fh, matrix=np.asarray(matrix, dtype=np.float32, order="C"), fingerprint=np.array(fingerprint))
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp_path, 0o666 & ~umask)  # mkstemp creates 0600; keep the usual permissions for other jobs
+        os.replace(tmp_path, str(cache_path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _load_expression_matrix_with_optional_npy_cache(
@@ -279,33 +298,38 @@ def _load_expression_matrix_with_optional_npy_cache(
     input_dataset: str,
 ) -> np.ndarray | None:
     """
-    Load dense expression matrix from a .npy sidecar next to the loom when that file exists.
-    The loom file mtime is not used (the loom is often updated elsewhere, e.g. attrs). When the
-    loom exposes a matrix shape without loading data, the cache must match that shape; otherwise
-    the cache is trusted as-is. If there is no sidecar, read from the loom and write the cache.
+    Load the dense expression matrix (float32) from a sidecar cache next to the loom when it is valid.
+    The loom file mtime is not used (the loom is often updated elsewhere, e.g. attrs). Instead the cache
+    stores a fingerprint of the source dataset (HDF5 object address, size, shape, dtype, sampled values),
+    so a regenerated matrix with the same path and shape is detected and the cache rebuilt.
+    First runs return float32 too, so repeated runs give identical results.
     """
+    f = loom._require_open()
+    if input_dataset not in f:
+        return None
     cache_path = _expression_npy_cache_path(loom_path, input_dataset)
-    expected_shape = loom.read_matrix_shape(input_dataset)
+    fingerprint = de_stream.source_dataset_fingerprint(f, input_dataset)
 
     if cache_path.is_file():
-        cached = np.load(cache_path, allow_pickle=False)
-        if expected_shape is not None:
-            if tuple(cached.shape) == expected_shape:
-                return np.asarray(cached, dtype=np.float32, order="C")
-            warnings.warn(
-                f"Expression npy cache {str(cache_path)!r} shape {cached.shape} does not match "
-                f"loom {expected_shape}; loading from loom."
-            )
-        else:
-            return np.asarray(cached, dtype=np.float32, order="C")
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                if str(cached["fingerprint"]) == fingerprint:
+                    return np.asarray(cached["matrix"], dtype=np.float32, order="C")
+            warnings.warn(f"Expression cache {str(cache_path)!r} was built from another version of {input_dataset!r}; loading from loom.")
+        except Exception as exc:
+            warnings.warn(f"Could not read expression cache {str(cache_path)!r}: {exc}; loading from loom.")
 
     data_matrix = loom.read_matrix(input_dataset)
     if data_matrix is None:
         return None
+    data_matrix = np.asarray(data_matrix, dtype=np.float32, order="C")
     try:
-        _write_expression_npy_cache(cache_path, data_matrix)
+        _write_expression_npy_cache(cache_path, data_matrix, fingerprint)
+        legacy = _legacy_expression_npy_cache_path(loom_path, input_dataset)
+        if legacy.is_file():
+            legacy.unlink()  # old-style cache: never read any more, only wastes disk
     except OSError as exc:
-        warnings.warn(f"Could not write expression npy cache {str(cache_path)!r}: {exc}")
+        warnings.warn(f"Could not write expression cache {str(cache_path)!r}: {exc}")
     return data_matrix
 
 
@@ -477,9 +501,12 @@ def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[st
     try:
         import plotly.graph_objects as go
 
-        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
+        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals < 0))
         x      = logfc[not_na]
-        y      = -np.log10(pvals[not_na])
+        # p-values that underflow to 0 are the strongest hits: plot them at the smallest non-zero p-value instead of dropping them
+        p_pos  = pvals[not_na & (pvals > 0)]
+        p_min  = float(p_pos.min()) if p_pos.size else float(np.finfo(np.float64).tiny)
+        y      = -np.log10(np.maximum(pvals[not_na], p_min))
         na_idx = np.where(not_na)[0]
         text   = [
             f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
@@ -710,7 +737,7 @@ def _column_sums_blocked(matrix, gblock: int | None = None) -> np.ndarray:
 def _library_sizes_for_specificity(matrix, loom_path: str, n_cells: int) -> np.ndarray:
     """Library sizes from /col_attrs/_Depth when usable, else summed from the matrix (one extra pass)."""
     try:
-        with h5py.File(loom_path, "r") as f:
+        with de_stream.open_h5_with_retry(loom_path, "r") as f:
             if "/col_attrs/_Depth" in f:
                 depth = np.asarray(f["/col_attrs/_Depth"][:], dtype=np.float64).ravel()
                 if int(depth.shape[0]) == int(n_cells):
@@ -965,7 +992,7 @@ def run_scanpy_method(
         # Normalize to 10 000 counts per cell, then log1p-transform. This ensures rank_genes_groups computes LFC on a comparable log scale.
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
-    # If data is already normalized+logged, scanpy's LFC = mean(expr_g1) − mean(expr_g2) in log space  =  valid log fold-change.
+    # scanpy's LFC = log2((expm1(mean_g1) + 1e-9) / (expm1(mean_g2) + 1e-9)) on the log1p-scale means, i.e. it assumes log1p (natural log) input.
     with warnings.catch_warnings(): # PerformanceWarning: DataFrame is highly fragmented. [...]
         warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module="scanpy")
         sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
@@ -1102,7 +1129,7 @@ def _expression_matrix_for_test(data_matrix: np.ndarray, is_count: bool) -> np.n
 
     Count data (is_count=True):
       Copy to float64 C-contiguous, apply _normalize_total_log1p_inplace. All DE statistics
-      (Welch, LFC as mean difference on this scale) use this matrix.
+      (Welch, log2 fold change from the group means on this scale) use this matrix.
 
     Non-count (is_count=False):
       Use the input as the "expression" scale for the test (already normalized/logged in the pipeline).
@@ -1173,8 +1200,9 @@ def _welch_ttest_from_mean_var(
 
     Two-sided p-value: 2 * P(T_dof > |t|) = 2 * scipy.stats.t.sf(abs(t), dof).
 
-    Log fold change on the working expression scale (same matrix as means):
-      lfc = mean1 - mean2  (difference of means; for log1p counts this is not log2 ratio of raw counts).
+    Log2 fold change, same formula as scanpy rank_genes_groups (the other methods of this script), on the
+    working expression scale (log1p values):
+      lfc = log2( (expm1(mean1) + 1e-9) / (expm1(mean2) + 1e-9) )
 
     Undefined / NaN: if n1 or n2 <= 1, or se^2 is non-positive or non-finite after sanitizing t.
 
@@ -1202,7 +1230,8 @@ def _welch_ttest_from_mean_var(
     # Two-sided: upper tail of |t| doubled (symmetric t distribution).
     pvals = scipy_stats.t.sf(np.abs(t), dof) * 2.0
     pvals = np.where(np.isfinite(pvals) & (sum_vn > 0), pvals, np.nan)
-    lfc = mean1 - mean2
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        lfc = np.log2((np.expm1(mean1) + 1e-9) / (np.expm1(mean2) + 1e-9))
     return pvals, lfc
 
 def _bh_fdr(pvals: np.ndarray) -> np.ndarray:
@@ -1259,7 +1288,7 @@ def run_t_test_approx_pairwise(
       4) Per gene, sum of expression in group 1 is (X @ w1)_g = sum_{cells in G1} X[g,cell]. Similarly
          sumsq uses elementwise X2 = X*X and X2 @ w1 gives sum of squares in G1.
       5) _mean_var_from_sums converts (sum, sumsq, n) to mean and unbiased variance per gene per group.
-      6) _welch_ttest_from_mean_var gives p-values and mean1-mean2 (reported as lfc).
+      6) _welch_ttest_from_mean_var gives p-values and the log2 fold change (scanpy formula).
       7) _bh_fdr adjusts p-values across genes (FDR within this contrast only).
       8) ave_g1, ave_g2: for counts, means on raw integer/float counts (R @ w / n) for JSON parity with
          scanpy path; for non-count, means on the same X used for the test.
@@ -1430,13 +1459,17 @@ def run_deseq2(
     cell_ids = [f"cell_{i}" for i in range(n_cells)]
 
     meta = pd.DataFrame({"group": [str(g) for g in group_labels]}, index=cell_ids)
+    # Covariates get internal names (batch_0, batch_1, ...): the loom column names can contain characters that are
+    # invalid in a design formula (".", "-", spaces, leading digit), collide after "_" stripping, or be called "group".
+    batch_factors: list[str] = []
     if batch_data is not None:
-        for j, bname in enumerate(batch_names):
-            meta[bname] = batch_data[:, j].astype(str)
+        for j, _bname in enumerate(batch_names):
+            batch_factors.append(f"batch_{j}")
+            meta[f"batch_{j}"] = batch_data[:, j].astype(str)
 
     gene_keys      = [str(i) for i in range(n_genes)] # Positional keys: gene names can be duplicated (reindex would fail)
     counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_keys)
-    design_factors = (batch_names + ["group"]) if batch_names else ["group"]
+    design_factors = batch_factors + ["group"]
     design = "~ " + " + ".join(design_factors)
 
     dds = DeseqDataSet(counts=counts_df, metadata=meta, design=design, quiet=True, n_cpus = 1) # n_cpus intentionally set to 1: pydeseq2 multiprocessing triggers a Python 3.12 ResourceTracker bug (ChildProcessError on worker cleanup). Single-threaded is also typically faster for per-group DESeq2 runs due to joblib spawn overhead.
@@ -1698,11 +1731,12 @@ def run(args: argparse.Namespace) -> None:
                 universe = np.ones(n_cells, dtype=bool)
             else:
                 # Streaming path: keep full matrix axis, blank labels outside the universe.
+                # object dtype: assigning into the fixed-width '<U..' label array would truncate the sentinel (to '').
                 sentinel = OUT_OF_UNIVERSE_SENTINEL
-                groups_1 = np.array(groups_1, copy=True)
+                groups_1 = np.array(groups_1, dtype=object)
                 groups_1[~universe] = sentinel
                 if groups_2 is not None:
-                    groups_2 = np.array(groups_2, copy=True)
+                    groups_2 = np.array(groups_2, dtype=object)
                     groups_2[~universe] = sentinel
 
     # Loom file is now closed
@@ -1746,10 +1780,14 @@ def run(args: argparse.Namespace) -> None:
             if cnt < 3:
                 ErrorJSON(f"Group {grp!r} contains only {cnt} cell(s); at least 3 are required.")
 
-        n_cells_full_am = int(n_cells)
+        n_cells_full_am = int(universe.sum())
         cell_keep_am: np.ndarray | None = None
+        if use_t_test_approx_stream and not bool(np.all(universe)):
+            # Streaming keeps the full cell axis: cells outside the universe must not count as "rest".
+            cell_keep_am = universe.copy()
         if preview_active:
-            cell_idx = _preview_stratified_cell_indices(groups_1, preview_fr, rng, preview_min_cells, preview_max_cells)
+            in_universe = np.flatnonzero(universe)  # never sample out-of-universe cells (streaming path)
+            cell_idx = in_universe[_preview_stratified_cell_indices(groups_1[in_universe], preview_fr, rng, preview_min_cells, preview_max_cells)]
             if preview_fr is None or preview_fr >= 1.0:
                 cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
             g1_sub = groups_1[cell_idx]
@@ -1760,7 +1798,7 @@ def run(args: argparse.Namespace) -> None:
                         "increase --preview-cell-fraction or disable preview."
                     )
             if use_t_test_approx_stream:
-                cell_keep_am = np.zeros(n_cells_full_am, dtype=bool)
+                cell_keep_am = np.zeros(n_cells, dtype=bool)  # full cell axis; cell_idx is already inside the universe
                 cell_keep_am[cell_idx] = True
                 n_cells_preview = int(cell_idx.size)
                 data_warnings.append(
@@ -1796,7 +1834,7 @@ def run(args: argparse.Namespace) -> None:
                             cell_keep=cell_keep_am,
                             **_t_test_approx_stream_callables(),
                         )
-                    except ValueError as exc:
+                    except (ValueError, OSError) as exc:  # OSError: loom still locked after the retry window
                         ErrorJSON(str(exc))
                 else:
                     all_results = run_t_test_approx_all_markers(data_matrix, groups_1, is_count=is_count_table)
@@ -1813,7 +1851,7 @@ def run(args: argparse.Namespace) -> None:
                     unique_groups,
                     keep_mask=cell_keep_am,
                     is_count=is_count_table,
-                    loom_path=str(input_path),
+                    loom_path=str(input_path) if de_stream.depth_describes_dataset(args.input_dataset) else None,  # _Depth is for /matrix only
                 )
         for grp in unique_groups:
             all_results[grp] = tuple(all_results[grp]) + (tau_all, spec_by_group[grp])
@@ -1929,9 +1967,10 @@ def run(args: argparse.Namespace) -> None:
         if group2_size < 3:
             ErrorJSON("Group 2 (all other cells) contains fewer than 3 cells.")
 
-        n_cells_full_sm = int(n_cells)
+        n_cells_full_sm = int(universe.sum())
         if preview_active:
-            cell_idx = _preview_stratified_cell_indices(cell_group, preview_fr, rng, preview_min_cells, preview_max_cells)
+            in_universe = np.flatnonzero(universe)  # never sample out-of-universe cells (streaming path)
+            cell_idx = in_universe[_preview_stratified_cell_indices(cell_group[in_universe], preview_fr, rng, preview_min_cells, preview_max_cells)]
             if preview_fr is None or preview_fr >= 1.0:
                 cell_idx = _preview_cap_total_cells(cell_idx, preview_max_cells, rng)
             cg_sub = cell_group[cell_idx]
@@ -1943,7 +1982,7 @@ def run(args: argparse.Namespace) -> None:
                     )
             if use_t_test_approx_stream:
                 # Keep full-length masks; zero out non-preview cells
-                keep = np.zeros(n_cells_full_sm, dtype=bool)
+                keep = np.zeros(n_cells, dtype=bool)  # full cell axis; cell_idx is already inside the universe
                 keep[cell_idx] = True
                 cell_group = np.where(keep, cell_group, 0)
                 group1_size = int((cell_group == 1).sum())
@@ -1982,7 +2021,7 @@ def run(args: argparse.Namespace) -> None:
                             is_count=is_count_table,
                             **_t_test_approx_stream_callables(),
                         )
-                    except ValueError as exc:
+                    except (ValueError, OSError) as exc:  # OSError: loom still locked after the retry window
                         ErrorJSON(str(exc))
                 else:
                     out_pvals, out_fdr, out_lfc, ave_g1, ave_g2 = run_t_test_approx_pairwise(
@@ -2004,7 +2043,7 @@ def run(args: argparse.Namespace) -> None:
                     tau_scope=tau_scope,
                     is_count=is_count_table,
                     exclude_labels=(OUT_OF_UNIVERSE_SENTINEL,),
-                    loom_path=str(input_path),
+                    loom_path=str(input_path) if de_stream.depth_describes_dataset(args.input_dataset) else None,  # _Depth is for /matrix only
                 )
 
         data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2, out_tau, out_spec])  # (7, n_genes)
@@ -2180,7 +2219,7 @@ def run(args: argparse.Namespace) -> None:
                             is_count=is_count_table,
                             **_t_test_approx_stream_callables(),
                         )
-                    except ValueError as exc:
+                    except (ValueError, OSError) as exc:  # OSError: loom still locked after the retry window
                         ErrorJSON(str(exc))
                 else:
                     m1 = cell_group_sub == 1
@@ -2206,7 +2245,7 @@ def run(args: argparse.Namespace) -> None:
                     tau_scope=tau_scope,
                     is_count=is_count_table,
                     exclude_labels=(OUT_OF_UNIVERSE_SENTINEL,),
-                    loom_path=str(input_path),
+                    loom_path=str(input_path) if de_stream.depth_describes_dataset(args.input_dataset) else None,  # _Depth is for /matrix only
                 )
 
         data_out = np.vstack([out_lfc, out_pvals, out_fdr, ave_g1, ave_g2, out_tau, out_spec])  # (7, n_genes)
@@ -2377,15 +2416,15 @@ Options:
                              of X and X^2 over cells), Benjamini-Hochberg across genes per contrast. Counts:
                              normalize each cell to 10k then log1p for the test; Avg. Exp. columns use raw counts.
                              Non-count: test and Avg. Exp. use the loaded matrix values (e.g. normalized from loom).
-                             Large dense looms (>=2 GiB float32 footprint) stream via a float32 .npy
-                             sidecar (built once next to the loom, same as the in-memory cache name),
-                             memmap'd in gene blocks with BLAS GEMM. ASAP_DE_FORCE_STREAM=1 forces that path.
+                             Large dense looms (>=2 GiB float32 footprint) stream from a compressed,
+                             gene-chunked sidecar loom (<loom>.chunked_by_gene.loom, built once) in gene
+                             blocks with BLAS GEMM. ASAP_DE_FORCE_STREAM=1 forces that path.
   --input-dataset            Loom path to the expression matrix (e.g. /layers/norm_data). On first use,
-                             a float32 .npy sidecar is written next to the loom (slashes in the path
-                             replaced by underscores, e.g. _layers_norm_1_seurat.npy). If that file
-                             already exists it is used for loads (loom mtime is ignored because the
-                             loom may be updated without changing this matrix). Delete the sidecar to
-                             force a refresh from the loom.
+                             a float32 cache is written next to the loom (loom name + dataset path with
+                             slashes replaced by underscores, e.g. output_layers_norm_1_seurat.de_cache.npz).
+                             It stores a fingerprint of the source dataset and is rebuilt when that dataset
+                             is rewritten (the loom mtime is ignored because the loom may be updated without
+                             changing this matrix). Delete the sidecar to force a refresh from the loom.
   --batch                    Comma-separated loom paths for batch/covariate columns, or "null".
                              Only used by deseq2.
 

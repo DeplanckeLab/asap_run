@@ -45,6 +45,9 @@ COUNT_ONLY_METHODS: Final[set] = {"deseq2"}
 BATCH_SUPPORT:      Final[set] = {"deseq2"}
 DE_HEADERS: Final[list] = ["log Fold-Change", "p-value", "FDR", "Avg. Exp. Group 1", "Avg. Exp. Group 2"]
 DE_NB_COLS: Final[int] = len(DE_HEADERS)  # Number of DE output columns stored per gene
+# Column layout written to /attrs (must match nber_cols / headers in output.json)
+DE_METADATA_HEADERS_PAIRWISE: Final[list] = ["ensembl_id", "gene_name"] + DE_HEADERS
+DE_METADATA_HEADERS_ALL_MARKERS: Final[list] = ["group", "ensembl_id", "gene_name"] + DE_HEADERS
 DEFAULT_DB_PORT: Final[int] = 5432
 DEFAULT_CONNECT_TIMEOUT: Final[int] = 10
 
@@ -233,9 +236,12 @@ def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[st
     try:
         import plotly.graph_objects as go
 
-        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
+        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals < 0))
         x      = logfc[not_na]
-        y      = -np.log10(pvals[not_na])
+        # p-values that underflow to 0 are the strongest hits: plot them at the smallest non-zero p-value instead of dropping them
+        p_pos  = pvals[not_na & (pvals > 0)]
+        p_min  = float(p_pos.min()) if p_pos.size else float(np.finfo(np.float64).tiny)
+        y      = -np.log10(np.maximum(pvals[not_na], p_min))
         na_idx = np.where(not_na)[0]
         text   = [
             f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
@@ -251,23 +257,23 @@ def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[st
         warnings.warn(f"Could not generate volcano plot: {exc}")
         return None
 
-def build_result_json(output_dataset: str | None, n_genes: int, unique_groups:  list[str] | None = None) -> dict:
+def build_result_json(output_dataset: str | None, nber_rows: int, unique_groups:  list[str] | None = None) -> dict:
     """
-    Build the output.json metadata dict.
-    If unique_groups is provided (Mode A), produces multi-group metadata with flat headers labelled by group name.
-    Otherwise (Modes B/C), produces single-comparison metadata.
+    Build the output.json metadata dict for the /attrs dataset.
+    nber_cols and headers match the matrix from build_metadata_matrix_* (same order as column_names on the
+    HDF5 node). Uses key "headers" (plural), which Rails reads (same convention as de.v8.py).
+    If unique_groups is provided (Mode A, tall format with a leading group column), also lists the groups.
     """
     if unique_groups is not None:
-        all_headers_flat = [f"{h} ({grp})" for grp in unique_groups for h in DE_HEADERS]
         return {
             "metadata": [
                 {
                     "name":      output_dataset,
                     "on":        "GLOBAL",
                     "type":      "NUMERIC",
-                    "nber_cols": len(all_headers_flat),
-                    "nber_rows": n_genes,
-                    "header":   all_headers_flat,
+                    "nber_cols": len(DE_METADATA_HEADERS_ALL_MARKERS),
+                    "nber_rows": nber_rows,
+                    "headers":   list(DE_METADATA_HEADERS_ALL_MARKERS),
                     "groups":    unique_groups,
                 }
             ]
@@ -278,15 +284,15 @@ def build_result_json(output_dataset: str | None, n_genes: int, unique_groups:  
                 "name":      output_dataset,
                 "on":        "GLOBAL",
                 "type":      "NUMERIC",
-                "nber_cols": DE_NB_COLS,
-                "nber_rows": n_genes,
-                "header":   DE_HEADERS,
+                "nber_cols": len(DE_METADATA_HEADERS_PAIRWISE),
+                "nber_rows": nber_rows,
+                "headers":   list(DE_METADATA_HEADERS_PAIRWISE),
             }
         ]
     }
 
 def build_metadata_matrix_single(ens_ids: list[str], gene_names: list[str], lfc: np.ndarray, pvals: np.ndarray, fdr: np.ndarray, ave_g1: np.ndarray, ave_g2: np.ndarray) -> tuple[np.ndarray, list[str]]:
-    headers = ["ensembl_id", "gene_name"] + DE_HEADERS
+    headers = list(DE_METADATA_HEADERS_PAIRWISE)
     # Sort: ascending p-value (NaN last), secondary: descending lfc
     pvals_for_sort = np.where(np.isnan(pvals), np.inf, pvals)
     sort_idx = np.lexsort((-lfc, pvals_for_sort))
@@ -311,7 +317,7 @@ def build_metadata_matrix_all_markers(ens_ids: list[str], gene_names: list[str],
     one row per gene per group, sorted by ascending p-value then descending lfc,
     with a leading 'group' column. Matches write_tsv() output exactly.
     """
-    headers = ["group", "ensembl_id", "gene_name"] + DE_HEADERS
+    headers = list(DE_METADATA_HEADERS_ALL_MARKERS)
     rows = []
     for grp in unique_groups:
         pvals, padj, lfc, ave_g1, ave_g2 = all_results[grp]
@@ -375,7 +381,7 @@ def run_scanpy_method(
         # Normalize to 10 000 counts per cell, then log1p-transform. This ensures rank_genes_groups computes LFC on a comparable log scale.
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
-    # If data is already normalized+logged, scanpy's LFC = mean(expr_g1) − mean(expr_g2) in log space  =  valid log fold-change.
+    # scanpy's LFC = log2((expm1(mean_g1) + 1e-9) / (expm1(mean_g2) + 1e-9)) on the log1p-scale means, i.e. it assumes log1p (natural log) input.
     with warnings.catch_warnings(): # PerformanceWarning: DataFrame is highly fragmented. [...]
         warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module="scanpy")
         sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
@@ -491,13 +497,17 @@ def run_deseq2(
     cell_ids = [f"cell_{i}" for i in range(n_cells)]
 
     meta = pd.DataFrame({"group": [str(g) for g in group_labels]}, index=cell_ids)
+    # Covariates get internal names (batch_0, batch_1, ...): the loom column names can contain characters that are
+    # invalid in a design formula (".", "-", spaces, leading digit), collide after "_" stripping, or be called "group".
+    batch_factors: list[str] = []
     if batch_data is not None:
-        for j, bname in enumerate(batch_names):
-            meta[bname] = batch_data[:, j].astype(str)
+        for j, _bname in enumerate(batch_names):
+            batch_factors.append(f"batch_{j}")
+            meta[f"batch_{j}"] = batch_data[:, j].astype(str)
 
     gene_keys      = [str(i) for i in range(n_genes)] # Positional keys: gene names can be duplicated (reindex would fail)
     counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_keys)
-    design_factors = (batch_names + ["group"]) if batch_names else ["group"]
+    design_factors = batch_factors + ["group"]
     design = "~ " + " + ".join(design_factors)
 
     dds = DeseqDataSet(counts=counts_df, metadata=meta, design=design, quiet=True, n_cpus = 1) # n_cpus intentionally set to 1: pydeseq2 multiprocessing triggers a Python 3.12 ResourceTracker bug (ChildProcessError on worker cleanup). Single-threaded is also typically faster for per-group DESeq2 runs due to joblib spawn overhead.
@@ -835,7 +845,7 @@ def run(args: argparse.Namespace) -> None:
             metadata_path = write_metadata_dataset(str(input_path), args.write_metadata, metadata_data, metadata_headers)
 
         # JSON metadata
-        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes * len(unique_groups))
+        result = build_result_json(args.write_metadata if write_metadata_output else None, n_genes * len(unique_groups), unique_groups)
         result["mode"] = "FindAllMarkers"
         result["number_of_groups"] = len(unique_groups)
         result["group_sizes"] = group_sizes

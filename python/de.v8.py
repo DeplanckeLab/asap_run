@@ -321,9 +321,12 @@ def write_volcano_json(logfc: np.ndarray, pvals: np.ndarray, gene_names: list[st
     try:
         import plotly.graph_objects as go
 
-        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals <= 0))
+        not_na = ~(np.isnan(logfc) | np.isnan(pvals) | (pvals < 0))
         x      = logfc[not_na]
-        y      = -np.log10(pvals[not_na])
+        # p-values that underflow to 0 are the strongest hits: plot them at the smallest non-zero p-value instead of dropping them
+        p_pos  = pvals[not_na & (pvals > 0)]
+        p_min  = float(p_pos.min()) if p_pos.size else float(np.finfo(np.float64).tiny)
+        y      = -np.log10(np.maximum(pvals[not_na], p_min))
         na_idx = np.where(not_na)[0]
         text   = [
             f"log FC: {lfc:.3f}<br>p-value: {pv:.3e}"
@@ -722,7 +725,7 @@ def run_scanpy_method(
         # Normalize to 10 000 counts per cell, then log1p-transform. This ensures rank_genes_groups computes LFC on a comparable log scale.
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
-    # If data is already normalized+logged, scanpy's LFC = mean(expr_g1) − mean(expr_g2) in log space  =  valid log fold-change.
+    # scanpy's LFC = log2((expm1(mean_g1) + 1e-9) / (expm1(mean_g2) + 1e-9)) on the log1p-scale means, i.e. it assumes log1p (natural log) input.
     with warnings.catch_warnings(): # PerformanceWarning: DataFrame is highly fragmented. [...]
         warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning, module="scanpy")
         sc.tl.rank_genes_groups(adata, groupby="group", groups=["1"], reference="2", method=method, use_raw=False, n_genes=n_genes)
@@ -838,13 +841,17 @@ def run_deseq2(
     cell_ids = [f"cell_{i}" for i in range(n_cells)]
 
     meta = pd.DataFrame({"group": [str(g) for g in group_labels]}, index=cell_ids)
+    # Covariates get internal names (batch_0, batch_1, ...): the loom column names can contain characters that are
+    # invalid in a design formula (".", "-", spaces, leading digit), collide after "_" stripping, or be called "group".
+    batch_factors: list[str] = []
     if batch_data is not None:
-        for j, bname in enumerate(batch_names):
-            meta[bname] = batch_data[:, j].astype(str)
+        for j, _bname in enumerate(batch_names):
+            batch_factors.append(f"batch_{j}")
+            meta[f"batch_{j}"] = batch_data[:, j].astype(str)
 
     gene_keys      = [str(i) for i in range(n_genes)] # Positional keys: gene names can be duplicated (reindex would fail)
     counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_keys)
-    design_factors = (batch_names + ["group"]) if batch_names else ["group"]
+    design_factors = batch_factors + ["group"]
     design = "~ " + " + ".join(design_factors)
 
     dds = DeseqDataSet(counts=counts_df, metadata=meta, design=design, quiet=True, n_cpus = 1) # n_cpus intentionally set to 1: pydeseq2 multiprocessing triggers a Python 3.12 ResourceTracker bug (ChildProcessError on worker cleanup). Single-threaded is also typically faster for per-group DESeq2 runs due to joblib spawn overhead.

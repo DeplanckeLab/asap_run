@@ -19,8 +19,10 @@ normalize_total(1e4) + log1p; Avg. Exp. uses raw.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import shutil
+import sys
 import time
 import warnings
 from contextlib import contextmanager
@@ -36,6 +38,7 @@ _STREAM_IF_DENSE_BYTES = 2 * 1024 ** 3
 _CHUNKED_BY_GENE_SUFFIX = ".chunked_by_gene.loom"
 _ASAP_CACHE_ATTR = "asap_cache"
 _ASAP_CACHE_SOURCE_ATTR = "asap_cache_source_dataset"
+_ASAP_CACHE_FINGERPRINT_ATTR = "asap_cache_source_fingerprint"
 # HDF5 chunk target (~64 MiB uncompressed float32) for gene-friendly layout.
 _HDF5_CHUNK_TARGET_BYTES = 64 * 1024 * 1024
 
@@ -59,6 +62,40 @@ def loom_path_is_dense_dataset(loom_file: h5py.File, dataset_path: str) -> bool:
     if dataset_path not in loom_file:
         return False
     return isinstance(loom_file[dataset_path], h5py.Dataset)
+
+
+def source_dataset_fingerprint(loom_file: h5py.File, dataset_path: str) -> str:
+    """
+    Identity of the source matrix, used to validate expression caches.
+
+    Unlike the loom mtime, it does not change when other datasets or attrs of the loom are written,
+    but it does change when this matrix is rewritten: HDF5 object address, on-disk size, shape and
+    dtype of the dataset(s), plus a hash of a few small, cheap-to-read pieces of the values.
+    """
+    node = loom_file[dataset_path]
+    h = hashlib.sha1()
+
+    def _add(ds: h5py.Dataset) -> None:
+        h.update(repr((ds.name, tuple(ds.shape), str(ds.dtype),
+                       int(h5py.h5o.get_info(ds.id).addr), int(ds.id.get_storage_size()))).encode())
+
+    if isinstance(node, h5py.Dataset):
+        _add(node)
+        if node.ndim == 2 and node.shape[0] > 0 and node.shape[1] > 0:
+            r, c = min(64, int(node.shape[0])), min(64, int(node.shape[1]))
+            h.update(np.ascontiguousarray(node[:r, :c]).tobytes())
+            h.update(np.ascontiguousarray(node[-r:, -c:]).tobytes())
+    else:  # sparse group (data / indices / indptr)
+        for key in ("data", "indices", "indptr"):
+            if key in node:
+                ds = node[key]
+                _add(ds)
+                n = int(ds.shape[0]) if ds.ndim else 0
+                if n > 0:
+                    h.update(np.ascontiguousarray(ds[: min(n, 4096)]).tobytes())
+                    h.update(np.ascontiguousarray(ds[max(0, n - 4096):]).tobytes())
+        h.update(repr(sorted((str(k), str(v)) for k, v in node.attrs.items())).encode())
+    return h.hexdigest()
 
 
 def chunked_by_gene_loom_path(loom_path: str) -> Path:
@@ -108,10 +145,23 @@ def _perf_enabled() -> bool:
 
 def _perf_log(msg: str) -> None:
     if _perf_enabled():
-        print(msg, flush=True)
+        print(msg, file=sys.stderr, flush=True)  # stdout carries the output JSON when -o is not set
 
 
-def _cache_dataset_valid(dset: h5py.Dataset, shape: tuple[int, int], source_dataset: str) -> bool:
+def open_h5_with_retry(path, mode: str = "r", max_wait: int = 600) -> h5py.File:
+    """Open an HDF5 file, retrying every second while it is locked by another job (same 600 s limit as the other v8 scripts)."""
+    elapsed = 0
+    while True:
+        try:
+            return h5py.File(path, mode)
+        except BlockingIOError:  # HDF5 file lock held by another process; other errors fail immediately
+            if elapsed >= max_wait:
+                raise
+            time.sleep(1)
+            elapsed += 1
+
+
+def _cache_dataset_valid(dset: h5py.Dataset, shape: tuple[int, int], source_dataset: str, fingerprint: str) -> bool:
     if tuple(dset.shape) != shape:
         return False
     if dset.dtype != np.float32:
@@ -123,7 +173,12 @@ def _cache_dataset_valid(dset: h5py.Dataset, shape: tuple[int, int], source_data
         return False
     if isinstance(src, bytes):
         src = src.decode("utf-8", errors="replace")
-    return str(src) == str(source_dataset)
+    if str(src) != str(source_dataset):
+        return False
+    fp = dset.attrs.get(_ASAP_CACHE_FINGERPRINT_ATTR)  # absent on caches built before fingerprints: rebuild
+    if isinstance(fp, bytes):
+        fp = fp.decode("utf-8", errors="replace")
+    return fp is not None and str(fp) == str(fingerprint)
 
 
 def _try_chunked_by_gene_cache_hit(
@@ -131,6 +186,7 @@ def _try_chunked_by_gene_cache_hit(
     dest_ds_path: str,
     shape: tuple[int, int],
     input_dataset: str,
+    fingerprint: str,
 ) -> bool:
     if not cache_loom.is_file():
         return False
@@ -138,10 +194,10 @@ def _try_chunked_by_gene_cache_hit(
         with h5py.File(cache_loom, "r") as cached:
             if dest_ds_path not in cached:
                 return False
-            if not _cache_dataset_valid(cached[dest_ds_path], shape, input_dataset):
+            if not _cache_dataset_valid(cached[dest_ds_path], shape, input_dataset, fingerprint):
                 warnings.warn(
                     f"Expression chunked_by_gene cache {str(cache_loom)!r}::{dest_ds_path} "
-                    f"shape/dtype/attrs do not match source; rebuilding that dataset."
+                    f"shape/dtype/attrs/source fingerprint do not match source; rebuilding that dataset."
                 )
                 return False
             _perf_log(
@@ -183,6 +239,7 @@ def _build_chunked_by_gene_dataset(
     cache_loom: Path,
     dest_ds_path: str,
     shape: tuple[int, int],
+    fingerprint: str,
 ) -> None:
     n_genes, n_cells = shape
     tmp_path = cache_loom.parent / f"{cache_loom.name}._tmp_.{os.getpid()}"
@@ -206,9 +263,11 @@ def _build_chunked_by_gene_dataset(
         f"shape={shape} chunks={chunks} gene_block={gblock}"
     )
     try:
-        with h5py.File(loom_path, "r") as src:
+        with open_h5_with_retry(loom_path, "r") as src:
             if not loom_path_is_dense_dataset(src, input_dataset):
                 raise ValueError(f"chunked_by_gene cache requires a dense dataset at {input_dataset!r}")
+            if source_dataset_fingerprint(src, input_dataset) != fingerprint:
+                raise ValueError(f"{input_dataset!r} was rewritten while building its chunked_by_gene cache; please retry.")
             dataset = src[input_dataset]
             with h5py.File(tmp_path, mode) as dst:
                 if "layers" not in dst:
@@ -226,6 +285,7 @@ def _build_chunked_by_gene_dataset(
                 )
                 out.attrs[_ASAP_CACHE_ATTR] = 1
                 out.attrs[_ASAP_CACHE_SOURCE_ATTR] = str(input_dataset)
+                out.attrs[_ASAP_CACHE_FINGERPRINT_ATTR] = str(fingerprint)
                 for g0 in range(0, n_genes, gblock):
                     g1 = min(n_genes, g0 + gblock)
                     out[g0:g1, :] = np.asarray(dataset[g0:g1, :], dtype=np.float32)
@@ -266,22 +326,23 @@ def ensure_expression_chunked_by_gene_cache(
     cache_loom = Path(cache_loom_path) if cache_loom_path is not None else chunked_by_gene_loom_path(loom_path)
     dest_ds_path = chunked_by_gene_dataset_path(input_dataset)
 
-    with h5py.File(loom_path, "r") as src:
+    with open_h5_with_retry(loom_path, "r") as src:
         if not loom_path_is_dense_dataset(src, input_dataset):
             raise ValueError(f"chunked_by_gene cache requires a dense dataset at {input_dataset!r}")
         shape = (int(src[input_dataset].shape[0]), int(src[input_dataset].shape[1]))
+        fingerprint = source_dataset_fingerprint(src, input_dataset)
 
-    if _try_chunked_by_gene_cache_hit(cache_loom, dest_ds_path, shape, input_dataset):
+    if _try_chunked_by_gene_cache_hit(cache_loom, dest_ds_path, shape, input_dataset, fingerprint):
         return cache_loom, dest_ds_path
 
     lock_path = cache_loom.with_name(f"{cache_loom.name}.lock")
     with _exclusive_file_lock(lock_path):
         # Another process may have finished while we waited.
-        if _try_chunked_by_gene_cache_hit(cache_loom, dest_ds_path, shape, input_dataset):
+        if _try_chunked_by_gene_cache_hit(cache_loom, dest_ds_path, shape, input_dataset, fingerprint):
             return cache_loom, dest_ds_path
-        _build_chunked_by_gene_dataset(loom_path, input_dataset, cache_loom, dest_ds_path, shape)
+        _build_chunked_by_gene_dataset(loom_path, input_dataset, cache_loom, dest_ds_path, shape, fingerprint)
 
-    if not _try_chunked_by_gene_cache_hit(cache_loom, dest_ds_path, shape, input_dataset):
+    if not _try_chunked_by_gene_cache_hit(cache_loom, dest_ds_path, shape, input_dataset, fingerprint):
         raise RuntimeError(
             f"chunked_by_gene cache {str(cache_loom)!r}::{dest_ds_path} missing after build"
         )
@@ -314,11 +375,16 @@ def open_chunked_by_gene_matrix(
 ) -> Iterator[h5py.Dataset]:
     """Build/reuse sidecar and yield the float32 gene-chunked dataset (file stays open)."""
     cache_loom, dest_ds = ensure_expression_chunked_by_gene_cache(loom_path, input_dataset)
-    f = h5py.File(cache_loom, "r")
+    f = open_h5_with_retry(cache_loom, "r")
     try:
         yield f[dest_ds]
     finally:
         f.close()
+
+
+def depth_describes_dataset(input_dataset: str) -> bool:
+    """/col_attrs/_Depth holds the library sizes of /matrix only; other count layers use their own column sums."""
+    return (input_dataset or "").strip().strip("/") == "matrix"
 
 
 def _library_sizes_from_loom(loom_file: h5py.File, n_cells: int) -> np.ndarray | None:
@@ -382,11 +448,9 @@ def _accumulate_gene_blocks(
         raw_sum_all = np.zeros(n_genes, dtype=np.float64)
         if scale is None or scale.shape[0] != n_cells:
             raise ValueError("count path requires per-cell scale")
-        ones = np.ones(n_cells, dtype=np.float32)
     else:
         raw_sum_g = None
         raw_sum_all = None
-        ones = None
 
     kept = (W.sum(axis=1) > 0).astype(np.float32, copy=False)
     W64 = W.astype(np.float64, copy=False)
@@ -399,8 +463,7 @@ def _accumulate_gene_blocks(
         g1 = min(n_genes, g0 + gblock)
         raw32 = np.asarray(matrix[g0:g1, :], dtype=np.float32, order="C")
         if is_count:
-            ones64 = ones.astype(np.float64, copy=False)
-            raw_sum_all[g0:g1] = raw32.astype(np.float64, copy=False) @ ones64
+            raw_sum_all[g0:g1] = raw32.astype(np.float64, copy=False) @ kept64  # kept cells only, like sum_all
             raw_sum_g[:, g0:g1] = (raw32.astype(np.float64, copy=False) @ W64).T
             work = raw32.astype(np.float64, copy=False)
             work *= scale64
@@ -502,8 +565,10 @@ def run_t_test_approx_all_markers_stream(
 
         scale = None
         if is_count:
-            with h5py.File(loom_path, "r") as f:
-                lib = _library_sizes_from_loom(f, n_cells)
+            lib = None
+            if depth_describes_dataset(input_dataset):
+                with open_h5_with_retry(loom_path, "r") as f:
+                    lib = _library_sizes_from_loom(f, n_cells)
             if lib is None:
                 lib = _library_sizes_from_matrix(matrix, gblock)
             scale = _count_scale(lib)
@@ -543,8 +608,10 @@ def run_t_test_approx_pairwise_stream(
 
         scale = None
         if is_count:
-            with h5py.File(loom_path, "r") as f:
-                lib = _library_sizes_from_loom(f, n_cells)
+            lib = None
+            if depth_describes_dataset(input_dataset):
+                with open_h5_with_retry(loom_path, "r") as f:
+                    lib = _library_sizes_from_loom(f, n_cells)
             if lib is None:
                 lib = _library_sizes_from_matrix(matrix, gblock)
             scale = _count_scale(lib)
