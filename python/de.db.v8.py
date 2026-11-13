@@ -55,7 +55,7 @@ class ErrorJSON(Exception):
     """
     def __init__(self, message: str):
         super().__init__(message)
-        print(json.dumps({"displayed_error": message}, ensure_ascii=False))
+        print(json.dumps({"displayed_error": message}, ensure_ascii=False), flush=True) # flush: os._exit() skips stdio flushing, so a piped stdout would lose the message
         os._exit(1)
 
 ## Loom File I/O class
@@ -367,7 +367,7 @@ def run_scanpy_method(
 
     adata = ad.AnnData(X=data_matrix.T.astype(np.float32))
     adata.obs_names = [f"cell_{i}" for i in range(n_cells)]
-    adata.var_names = gene_names
+    adata.var_names = [str(i) for i in range(n_genes)] # Positional keys: gene names can be duplicated, so they cannot be used to map results back
     adata.obs["group"] = pd.Categorical([str(g) for g in group_labels], categories=["1", "2"])
 
     sc.settings.verbosity = 0
@@ -386,11 +386,8 @@ def run_scanpy_method(
     result_padj  = np.array(res["pvals_adj"]["1"])
     result_lfc   = np.array(res["logfoldchanges"]["1"])
 
-    # Build an index mapping: gene name → original position
-    gene_to_idx = {g: i for i, g in enumerate(gene_names)}
-
     # Map result_genes (scanpy order) → original indices in one shot
-    original_idx = np.array([gene_to_idx[g] for g in result_genes])
+    original_idx = np.asarray(result_genes).astype(np.intp) # var_names are positional keys
 
     pvals = np.full(n_genes, np.nan)
     lfc   = np.full(n_genes, np.nan)
@@ -433,7 +430,7 @@ def run_scanpy_all_markers(
 
     adata = ad.AnnData(X=data_matrix.T.astype(np.float32))
     adata.obs_names = [f"cell_{i}" for i in range(n_cells)]
-    adata.var_names = gene_names
+    adata.var_names = [str(i) for i in range(n_genes)] # Positional keys: gene names can be duplicated, so they cannot be used to map results back
     adata.obs["group"] = pd.Categorical(group_labels.tolist(), categories=unique_groups)
 
     sc.settings.verbosity = 0
@@ -447,8 +444,6 @@ def run_scanpy_all_markers(
         sc.tl.rank_genes_groups(adata, groupby="group", reference="rest", method=method, use_raw=False, n_genes=n_genes)
 
     res = adata.uns["rank_genes_groups"]
-    # Build an index mapping: gene name → original position
-    gene_to_idx = {g: i for i, g in enumerate(gene_names)}
 
     results: dict = {}
     for grp in unique_groups:
@@ -458,7 +453,7 @@ def run_scanpy_all_markers(
         result_lfc   = np.array(res["logfoldchanges"][grp])
 
         # Map result_genes (scanpy order) → original indices in one shot
-        original_idx = np.array([gene_to_idx[g] for g in result_genes])
+        original_idx = np.asarray(result_genes).astype(np.intp) # var_names are positional keys
 
         pvals = np.full(n_genes, np.nan)
         lfc   = np.full(n_genes, np.nan)
@@ -500,7 +495,8 @@ def run_deseq2(
         for j, bname in enumerate(batch_names):
             meta[bname] = batch_data[:, j].astype(str)
 
-    counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_names)
+    gene_keys      = [str(i) for i in range(n_genes)] # Positional keys: gene names can be duplicated (reindex would fail)
+    counts_df      = pd.DataFrame(counts, index=cell_ids, columns=gene_keys)
     design_factors = (batch_names + ["group"]) if batch_names else ["group"]
     design = "~ " + " + ".join(design_factors)
 
@@ -513,8 +509,8 @@ def run_deseq2(
     stat_res.summary()
     df = stat_res.results_df
 
-    # Reindex by gene_names in one vectorised step; genes absent from results become NaN.
-    df_reindexed = df.reindex(gene_names)
+    # Reindex by gene_keys in one vectorised step; genes absent from results become NaN.
+    df_reindexed = df.reindex(gene_keys)
     pvals = df_reindexed["pvalue"].to_numpy()
     padj  = df_reindexed["padj"].to_numpy()
     lfc   = df_reindexed["log2FoldChange"].to_numpy()
