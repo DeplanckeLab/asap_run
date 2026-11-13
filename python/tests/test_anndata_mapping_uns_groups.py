@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import types
 import unittest
 
 import h5py
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # python/ (scripts live there)
 
 from anndata_mapping_loom_export import (
     copy_loom_attr_groups_to_h5ad_uns,
