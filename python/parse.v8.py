@@ -1433,13 +1433,22 @@ class RdsHandler:
             if str(list(_counts_ok(obj, assay_name))[0]) == "MISSING":
                 ErrorJSON(f"Assay '{assay_name}' does not contain retrievable 'counts' data (checked both the Seurat v5 'counts' layer and the v4 'counts' slot).")
             
-            # Get dimensions
-            n_cells = int(list(r['ncol'](obj))[0])
-            n_genes = int(list(r['nrow'](obj))[0])
-            
-            # Get gene and cell names
-            gene_names = list(r['rownames'](obj))
-            cell_ids = list(r['colnames'](obj))
+            # Dimensions and names of the *selected* assay's counts matrix. nrow()/rownames() on the
+            # Seurat object itself describe the default assay, which may not be assay_name.
+            _counts_dimnames = r('''
+                function(obj, assay) {
+                    d <- tryCatch(
+                        GetAssayData(obj, assay = assay, layer = "counts"),
+                        error = function(e) GetAssayData(obj, assay = assay, slot = "counts")
+                    )
+                    list(as.integer(nrow(d)), as.integer(ncol(d)), as.character(rownames(d)), as.character(colnames(d)))
+                }
+            ''')
+            _dimnames = _counts_dimnames(obj, assay_name)
+            n_genes = int(_dimnames[0][0])
+            n_cells = int(_dimnames[1][0])
+            gene_names = list(_dimnames[2])
+            cell_ids = list(_dimnames[3])
             
             # Block reader (returns genes×cells). Seurat v5 layer= / v4 slot= are both
             # handled by the tryCatch fallback, so this works for either version.
@@ -1619,11 +1628,13 @@ class RdsHandler:
             # Transfer dimensional reductions (PCA, UMAP, tSNE, etc.)
             try:
                 reductions = list(r['Reductions'](obj))
-                
+                # Reduction names come from the uploaded file: pass them as R arguments, never paste them into R source
+                _get_embeddings = r('function(obj, reduction) Embeddings(obj, reduction = reduction)')
+
                 for reduction_name in reductions:
                     try:
                         # Get embedding coordinates
-                        embedding_r = r(f'''function(obj) {{ Embeddings(obj, reduction="{reduction_name}") }}''')(obj)
+                        embedding_r = _get_embeddings(obj, reduction_name)
                         embedding = _rmat_to_np(embedding_r)
                         
                         # Check dimensions
@@ -2183,7 +2194,11 @@ class MexHandler:
                     idx += 1
         except Exception as e:
             ErrorJSON(f"Failed to read MTX data from {matrix_path}: {str(e)}")
-        
+
+        # Every declared entry must have been read: unfilled slots would silently become (gene 1, cell 1) entries
+        if idx != nnz:
+            ErrorJSON(f"MTX file {matrix_path} is truncated or malformed: header declares {nnz} entries but {idx} valid data lines were read.")
+
         # Create COO matrix (genes x cells)
         coo = sp.coo_matrix((data, (rows, cols)), shape=(n_genes, n_cells), dtype=DEFAULT_NP_DTYPE)
         
@@ -3081,17 +3096,11 @@ class LoomFile:
                     # Sums on sparse matrices are much faster
                     cell_depth[start:end] = np.ravel(block.sum(axis=1))
 
-                    # Number of detected genes per cell. np.add.reduceat requires
-                    # every index to be < len(arr); empty trailing rows in a CSR
-                    # block produce indptr values equal to len(block.data), which
-                    # would raise IndexError. Pad block.data's non-zero mask with
-                    # one False so the boundary index is valid (the padding never
-                    # affects any non-empty row's reduction).
-                    if block.nnz > 0:
-                        data_mask = np.concatenate([(block.data != 0), np.zeros(1, dtype=bool)])
-                        cell_detected[start:end] = np.add.reduceat(data_mask, block.indptr[:-1]).astype(np.int64)
-                    else:
-                        cell_detected[start:end] = 0
+                    # Number of detected genes per cell = non-zero stored values per CSR row.
+                    # Use a cumulative sum rather than np.add.reduceat: reduceat returns the
+                    # *next* row's first element for an empty row, so empty cells would count 1.
+                    nz_cumsum = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(block.data != 0, dtype=np.int64)])
+                    cell_detected[start:end] = nz_cumsum[block.indptr[1:]] - nz_cumsum[block.indptr[:-1]]
 
                     gene_sum += np.ravel(block.sum(axis=0))
 

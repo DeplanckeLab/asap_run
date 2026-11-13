@@ -1166,29 +1166,43 @@ class RdsHandler:
             # Check available assays
             seurat_assays = [str(a) for a in r["Assays"](obj)]
             
+            # Preview of one assay's counts. The assay name is passed as an R argument (never pasted into R source),
+            # and dims/names come from that assay's counts matrix (nrow()/rownames() of the object = default assay).
+            _assay_preview = r('''
+                function(obj, assay) {
+                    layers <- as.character(Layers(obj[[assay]]))
+                    if (!("counts" %in% layers)) return(list(layers = layers))
+                    m  <- GetAssayData(obj, assay = assay, layer = "counts")
+                    nr <- min(10L, nrow(m))
+                    nc <- min(10L, ncol(m))
+                    list(layers  = layers,
+                         n_genes = as.integer(nrow(m)),
+                         n_cells = as.integer(ncol(m)),
+                         genes   = as.character(head(rownames(m), nr)),
+                         cells   = as.character(head(colnames(m), nc)),
+                         matrix  = as.matrix(m[seq_len(nr), seq_len(nc), drop = FALSE]))
+                }
+            ''')
+
             # Iterate through each assay
             for assay in seurat_assays:
                 try:
-                    layers_r = r(f'''
-                    function(obj) {{
-                      assay <- "{assay}"
-                      Layers(obj[[assay]])
-                    }}
-                    ''')(obj)
-                    layers = [str(x) for x in layers_r]
+                    preview = _assay_preview(obj, assay)
+                    layers = [str(x) for x in preview.rx2("layers")]
                     if "counts" in layers:
-                        # 10x10 matrix        
-                        matrix_r = r(f'function(obj) as(GetAssayData(obj, layer="counts", assay="{assay}")[1:10, 1:10], "matrix")')(obj)
-                        matrix = np.array(matrix_r).tolist()
-                        
+                        # Up to 10x10 matrix (genes x cells). R matrices are column-major: rebuild the 2-D shape explicitly
+                        matrix_r = preview.rx2("matrix")
+                        n_r, n_c = (int(x) for x in matrix_r.dim)
+                        matrix = np.array(list(matrix_r), dtype=float).reshape((n_r, n_c), order="F").tolist()
+
                         # Global dims
-                        nCells = int(list(r['ncol'](obj))[0])
-                        nGenes = int(list(r['nrow'](obj))[0])
-                        
-                        # Gene and cell names
-                        genes = list(r['rownames'](obj)[1:10])
-                        cells = list(r['colnames'](obj)[1:10])
-                                    
+                        nCells = int(preview.rx2("n_cells")[0])
+                        nGenes = int(preview.rx2("n_genes")[0])
+
+                        # Gene and cell names (same first rows/columns as the matrix preview)
+                        genes = list(preview.rx2("genes"))
+                        cells = list(preview.rx2("cells"))
+
                         entry = {
                             "group": assay,
                             "nber_cols": nCells,
