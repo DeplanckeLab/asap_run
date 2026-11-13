@@ -118,15 +118,35 @@ def hvg(args):
         s0, s1 = int(node.shape[0]), int(node.shape[1])
         ra_len = f_in[_GENE_ID_PATH].shape[0]
         ca_len = f_in[_CELL_ID_PATH].shape[0]
+        # scanpy needs the whole matrix: read it once, converting to float64 while reading (no extra copy)
+        matrix = np.empty((s0, s1), dtype=DEFAULT_NP_DTYPE)
+        node.read_direct(matrix)
         if s0 == ca_len and s1 == ra_len:
             n_genes, n_cells = s1, s0
-            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE).T
+            matrix_cxg = matrix          # stored cells × genes
         else:
             n_genes, n_cells = s0, s1
-            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE)
+            matrix_cxg = matrix.T        # stored genes × cells: transposed view, no copy
+        del matrix
 
         gene_ids = _read_string_dataset(f_in, _GENE_ID_PATH)
         cell_ids = _read_string_dataset(f_in, _CELL_ID_PATH)
+
+        # Log base of the input layer (flavor=seurat undoes the log with expm1, which assumes ln unless told otherwise).
+        # --log_base wins; otherwise use the base normalize.v8.py records on the layer; otherwise natural log.
+        log_base = args.log_base
+        if log_base is None and "log1p_base" in node.attrs:
+            log_base = float(node.attrs["log1p_base"])
+
+        # Batch labels: --batch_key is a /col_attrs/ name or full path
+        batch_values = None
+        if args.batch_key is not None:
+            batch_path = args.batch_key if args.batch_key.startswith("/") else f"/col_attrs/{args.batch_key}"
+            if batch_path not in f_in or not isinstance(f_in[batch_path], h5py.Dataset):
+                ErrorJSON(f"--batch_key {args.batch_key!r}: no cell metadata found at {batch_path}.")
+            batch_values = _read_string_dataset(f_in, batch_path)
+            if len(batch_values) != n_cells:
+                ErrorJSON(f"--batch_key {args.batch_key!r}: {batch_path} has {len(batch_values)} values, expected one per cell ({n_cells}).")
 
     result["parameters"] = {
         "loom_path":        str(input_path),
@@ -140,13 +160,21 @@ def hvg(args):
         "span":             args.span             if args.method == "seurat_v3"                            else None,
         "n_bins":           args.n_bins,
         "batch_key":        args.batch_key,
+        "log_base":         log_base,
     }
 
     # Build AnnData (cells x genes) and run sc.pp.highly_variable_genes
     import anndata
-    adata = anndata.AnnData(X=matrix_gxc.T.astype(DEFAULT_NP_DTYPE))
+    adata = anndata.AnnData(X=matrix_cxg)
+    del matrix_cxg   # adata.X is now the only reference to the matrix
     adata.obs_names = list(cell_ids)
     adata.var_names = list(gene_ids)
+    if log_base is not None:
+        adata.uns["log1p"] = {"base": log_base}
+    batch_col = None
+    if batch_values is not None:
+        batch_col = "batch"
+        adata.obs[batch_col] = batch_values
 
     try:
         sc.pp.highly_variable_genes(
@@ -158,7 +186,7 @@ def hvg(args):
             min_disp    = args.min_disp,
             span        = args.span,
             n_bins      = args.n_bins,
-            batch_key   = args.batch_key,
+            batch_key   = batch_col,
             inplace     = True,
         )
     except (ValueError, ImportError) as e:
@@ -273,7 +301,11 @@ Options:
   --min_disp      Min dispersion threshold.                  [default: 0.5]
   --span          Span for loess (seurat_v3 only).           [default: 0.3]
   --n_bins        Number of bins for mean expression.        [default: 20]
-  --batch_key     Column in obs for batch correction.        [default: None]
+  --batch_key     Cell metadata holding the batch: a /col_attrs/ name or path
+                    (e.g. batch or /col_attrs/batch).         [default: None]
+  --log_base      Log base of --input_meta (seurat flavor undoes the log before
+                    computing dispersions). [default: the log1p_base attribute
+                    normalize.v8.py stores on the layer, else natural log]
 
   --help         Show this message and exit.
 """
@@ -296,9 +328,15 @@ def main():
     parser.add_argument("--span",        type=float, default=0.3)
     parser.add_argument("--n_bins",      type=int,   default=20)
     parser.add_argument("--batch_key",   type=str,   default=None)
+    parser.add_argument("--log_base",    type=float, default=None)
 
     args = parser.parse_args()
     hvg(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

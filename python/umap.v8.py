@@ -254,4 +254,9 @@ def main():
     umap(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

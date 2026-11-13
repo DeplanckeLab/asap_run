@@ -461,6 +461,7 @@ def _write_h5ad_streamed_from_scratch(
         copy_loom_attr_groups_to_h5ad_uns,
         copy_loom_attrs_to_uns,
         index_only_var_frame,
+        use_legacy_string_encoding_adata,
     )
     from scipy import sparse
 
@@ -482,6 +483,8 @@ def _write_h5ad_streamed_from_scratch(
     copy_loom_attrs_to_uns(loom_file, shell, mapping)
     ensure_feature_name_from_loom(shell)
     drop_loom_index_columns(shell)
+    # pandas 3 str columns would otherwise be written as nullable-string-array.
+    use_legacy_string_encoding_adata(shell)
 
     try:
         dataset_kwargs = {"compression": "gzip"}

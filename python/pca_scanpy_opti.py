@@ -40,7 +40,7 @@ def error_json(message, jsonfile):
         data_json['displayed_error'] = message
         with open(jsonfile, 'w') as outfile:
             json.dump(data_json, outfile)
-    sys.exit()
+    sys.exit(1)
 
 # Open the Loom file while handling potential locking
 def open_with_lock(loomfile, mode):
@@ -86,24 +86,20 @@ pca_ = IncrementalPCA(n_components=n_comps)
 
 # Run chunks of all genes x n cells
 totalChunks = math.ceil(m.shape[1] / chunksize)
-for x in range(1, m.shape[1], chunksize):
-    currentChunk = int((x - 1) / chunksize) + 1
-    print ("Processing chunk", currentChunk, "(",currentChunk, "/", totalChunks, ":", '%.1f'%((currentChunk / totalChunks) * 100),"%)", time.ctime()) 
-    start = x - 1
-    end = x + chunksize - 2
-    if(end > m.shape[1] - 1): end = m.shape[1] - 1
-    chunk = m[:,start:(end+1)].transpose() # Lines = genes / Cols = cells
+# gen_batches covers every cell (range(1, n, chunksize) skipped the last one when n % chunksize == 1).
+# min_batch_size: partial_fit needs >= n_comps cells per batch, so a short tail is merged into the previous batch.
+from sklearn.utils import gen_batches
+fit_batches = list(gen_batches(m.shape[1], max(chunksize, n_comps), min_batch_size=n_comps))
+for currentChunk, sl in enumerate(fit_batches, start=1):
+    print ("Processing chunk", currentChunk, "(",currentChunk, "/", len(fit_batches), ":", '%.1f'%((currentChunk / len(fit_batches)) * 100),"%)", time.ctime()) 
+    chunk = m[:,sl].transpose() # Lines = genes / Cols = cells
     pca_.partial_fit(chunk)
 
 # Do it again, this time to generate the final PCs
-for x in range(1, m.shape[1], chunksize):
-    currentChunk = int((x - 1) / chunksize) + 1
+for currentChunk, sl in enumerate(gen_batches(m.shape[1], chunksize), start=1):
     print ("Processing chunk", currentChunk, "(",currentChunk, "/", totalChunks, ":", '%.1f'%((currentChunk / totalChunks) * 100),"%)", time.ctime()) 
-    start = x - 1
-    end = x + chunksize - 2
-    if(end > m.shape[1] - 1): end = m.shape[1] - 1
-    chunk = m[:,start:(end+1)].transpose() # Lines = genes / Cols = cells
-    X_pca[start:(end+1)] = pca_.transform(chunk)
+    chunk = m[:,sl].transpose() # Lines = genes / Cols = cells
+    X_pca[sl] = pca_.transform(chunk)
 
 # Close the Loom file (reading mode)
 f.close()

@@ -172,20 +172,26 @@ def clustering(args):
         )
         cluster_key = "leiden"
     else:  # louvain
-        # scanpy's default "vtraag" flavor needs the 'louvain' package. Its "igraph" flavor would run without it,
-        # but silently ignores --resolution, so fail clearly instead of returning clusters for the wrong resolution.
-        try:
-            import louvain  # noqa: F401
-        except ImportError:
-            ErrorJSON("Louvain clustering is not available in this ASAP version (the 'louvain' Python package is not installed). Please use Leiden clustering instead.")
-        import warnings as _warnings
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("ignore", FutureWarning)
-            sc.tl.louvain(
-                adata,
-                resolution   = args.resolution,
-                random_state = args.random_state,
-            )
+        # sc.tl.louvain's default flavor needs the unmaintained 'louvain' package (not installed), and its "igraph"
+        # flavor ignores --resolution. So run igraph's multilevel (Louvain) algorithm on the same kNN graph directly.
+        import random
+        import igraph as ig
+        # Undirected weighted graph built like scanpy's get_igraph_from_adjacency
+        adjacency = adata.obsp["connectivities"]
+        sources, targets = adjacency.nonzero()
+        weights = np.asarray(adjacency[sources, targets]).ravel()
+        g = ig.Graph(directed=False)
+        g.add_vertices(adjacency.shape[0])
+        g.add_edges(list(zip(sources, targets)))
+        g.es["weight"] = weights
+        random.seed(args.random_state)  # python-igraph draws from Python's random module
+        membership = np.asarray(g.community_multilevel(weights="weight", resolution=args.resolution).membership)
+        # Relabel by decreasing cluster size (0 = largest), as leidenalg does
+        order = np.argsort(-np.bincount(membership), kind="stable")
+        relabel = np.empty_like(order)
+        relabel[order] = np.arange(order.size)
+        adata.obs["louvain"] = relabel[membership]
+        result["clustering"]["implementation"] = f"python-igraph {ig.__version__} community_multilevel"
         cluster_key = "louvain"
 
     cluster_labels = adata.obs[cluster_key].astype(int).values.astype(np.int32)
@@ -226,7 +232,7 @@ HELP_TEXT = """
 Clustering Script — scanpy backend
 
 Reads PCA cell embeddings from a LOOM file, runs sc.pp.neighbors +
-sc.tl.leiden or sc.tl.louvain, writes cluster labels into the input LOOM,
+sc.tl.leiden or Louvain (igraph community_multilevel), writes cluster labels into the input LOOM,
 and writes output.json.
 
 Options:
@@ -243,7 +249,7 @@ Options:
   --n_neighbors     k for kNN graph.                         [default: 15]
   --metric          Distance metric.                         [default: euclidean]
 
-  -- sc.tl.leiden / sc.tl.louvain parameters ───────────────────────────────────
+  -- Leiden / Louvain parameters ───────────────────────────────────────────────
   --resolution      Clustering resolution.                   [default: 0.5]
   --random_state    Random seed.                             [default: 0]
 
@@ -271,4 +277,9 @@ def main():
     clustering(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

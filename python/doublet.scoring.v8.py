@@ -107,17 +107,18 @@ def doublet_score(args):
         ca_len = f_in[_CELL_ID_PATH].shape[0]
         s0, s1 = int(node.shape[0]), int(node.shape[1])
 
-        # Scrublet needs cells × genes (dense or sparse)
-        # Orientation detection: compare s0/s1 against n_cells
-        from scipy.sparse import csc_matrix
-        if s0 == ca_len:
-            # Python-written: on-disk (n_cells, n_genes) — cells already on axis 0
-            counts_matrix = csc_matrix(node[:, :])
-            n_cells, n_genes = s0, s1
-        else:
-            # R-written: on-disk (n_genes, n_cells) due to hdf5r transpose — transpose back
-            counts_matrix = csc_matrix(node[:, :].T)
-            n_cells, n_genes = s1, s0
+        # Scrublet needs cells × genes (dense or sparse). Build the sparse matrix one block of cells at a time
+        # so the dense matrix is never held in memory. Orientation detection: compare s0/s1 against n_cells
+        from scipy import sparse
+        cells_first = s0 == ca_len   # Python-written: on-disk (n_cells, n_genes); R-written: (n_genes, n_cells) due to hdf5r transpose
+        n_cells, n_genes = (s0, s1) if cells_first else (s1, s0)
+        step  = max(64, (64 * 1024**2 // (max(1, n_genes) * node.dtype.itemsize)) // 64 * 64)
+        parts = []
+        for c0 in range(0, n_cells, step):
+            c1 = min(c0 + step, n_cells)
+            parts.append(sparse.csr_matrix(node[c0:c1, :] if cells_first else node[:, c0:c1].T))
+        counts_matrix = sparse.vstack(parts, format="csc") if parts else sparse.csc_matrix((n_cells, n_genes), dtype=node.dtype)
+        del parts
 
     # Expected doublet rate
     if args.doublet_rate is not None:
@@ -153,9 +154,27 @@ def doublet_score(args):
                   f"Scrublet requires raw integer counts, not normalized data. "
                   f"Use the raw count matrix (e.g. /matrix).")
 
-    # Run Scrublet
+    # Run Scrublet. Its PCA (arpack) needs n_pcs < min(n_cells, n_genes kept by its variability filter).
+    n_pcs = args.n_pcs
+    if n_pcs >= min(n_cells, n_genes):
+        n_pcs = min(n_cells, n_genes) - 1
+        warnings.append(f"--n_pcs ({args.n_pcs}) capped to {n_pcs} (must be < min(n_cells, n_genes)).")
+    if n_pcs < 1:
+        ErrorJSON(f"Too few cells or genes for Scrublet ({n_cells} cells x {n_genes} genes).")
     scrub = scr.Scrublet(counts_matrix, expected_doublet_rate=expected_dr, random_state=args.random_state)
-    doublet_scores, predicted_doublets_auto = scrub.scrub_doublets(n_prin_comps=args.n_pcs, verbose=False)
+    try:
+        doublet_scores, predicted_doublets_auto = scrub.scrub_doublets(n_prin_comps=n_pcs, verbose=False)
+    except ValueError as e:
+        # The gene filter left too few genes for n_pcs: retry once on a fresh object with the largest valid n_pcs
+        n_kept = len(getattr(scrub, "_gene_filter", []))
+        max_pcs = min(n_cells, n_kept) - 1
+        if "n_components" not in str(e) or max_pcs < 1 or max_pcs >= n_pcs:
+            raise
+        warnings.append(f"--n_pcs ({n_pcs}) capped to {max_pcs}: Scrublet kept only {n_kept} variable genes.")
+        n_pcs = max_pcs
+        scrub = scr.Scrublet(counts_matrix, expected_doublet_rate=expected_dr, random_state=args.random_state)
+        doublet_scores, predicted_doublets_auto = scrub.scrub_doublets(n_prin_comps=n_pcs, verbose=False)
+    result["parameters"]["n_pcs"] = n_pcs
     doublet_scores = np.array(doublet_scores, dtype=DEFAULT_NP_DTYPE)
 
     # Scrublet returns None (and never sets threshold_) when it cannot find an automatic threshold
@@ -258,4 +277,9 @@ def main():
     doublet_score(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

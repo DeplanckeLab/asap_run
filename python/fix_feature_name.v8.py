@@ -79,9 +79,16 @@ def _write_loom_string_vector(hf: h5py.File, path: str, values: list[str]) -> No
     )
 
 
-def _write_h5ad_feature_name(hf: h5py.File, values: list[str]) -> None:
-    """Replace var/feature_name as a categorical column (AnnData-compatible)."""
-    path = "var/feature_name"
+def _h5ad_index(hf: h5py.File, frame: str) -> list[str]:
+    """Index values of an AnnData dataframe group (var or raw/var)."""
+    g = hf[frame]
+    key = _decode_attr(g.attrs.get("_index", "_index"))
+    return _read_1d_strings(g[key])
+
+
+def _write_h5ad_feature_name(hf: h5py.File, values: list[str], frame: str = "var") -> None:
+    """Replace {frame}/feature_name as a categorical column (AnnData-compatible)."""
+    path = f"{frame}/feature_name"
     if path in hf:
         del hf[path]
 
@@ -99,20 +106,24 @@ def _write_h5ad_feature_name(hf: h5py.File, values: list[str]) -> None:
     g.attrs["encoding-type"] = "categorical"
     g.attrs["encoding-version"] = "0.2.0"
     g.attrs["ordered"] = False
-    g.create_dataset(
+    cats_ds = g.create_dataset(
         "categories",
         data=np.asarray(categories, dtype=object),
         dtype=h5py.string_dtype("utf-8"),
     )
-    g.create_dataset("codes", data=codes)
+    cats_ds.attrs["encoding-type"] = "string-array"
+    cats_ds.attrs["encoding-version"] = "0.2.0"
+    codes_ds = g.create_dataset("codes", data=codes)
+    codes_ds.attrs["encoding-type"] = "array"
+    codes_ds.attrs["encoding-version"] = "0.2.0"
 
     # Ensure column-order lists feature_name.
-    co = hf["var"].attrs.get("column-order")
+    co = hf[frame].attrs.get("column-order")
     if co is not None:
         cols = [_decode_attr(x) for x in (co.tolist() if isinstance(co, np.ndarray) else list(co))]
         if "feature_name" not in cols:
             cols.append("feature_name")
-            hf["var"].attrs["column-order"] = np.asarray(cols, dtype=object)
+            hf[frame].attrs["column-order"] = np.asarray(cols, dtype=object)
 
 
 def _parse_dburl(dburl: str) -> tuple[str, int, str]:
@@ -188,7 +199,9 @@ def _write_h5ad_uns_value(hf: h5py.File, key: str, value) -> None:
     """Write a scalar uns value with AnnData-compatible encoding attrs."""
     path = f"uns/{key}"
     if "uns" not in hf:
-        hf.create_group("uns")
+        uns = hf.create_group("uns")
+        uns.attrs["encoding-type"] = "dict"
+        uns.attrs["encoding-version"] = "0.1.0"
     if path in hf:
         del hf[path]
 
@@ -201,17 +214,17 @@ def _write_h5ad_uns_value(hf: h5py.File, key: str, value) -> None:
         return
     if isinstance(value, (bool, np.bool_)):
         ds = hf.create_dataset(path, data=bool(value))
-        ds.attrs["encoding-type"] = "numeric"
+        ds.attrs["encoding-type"] = "numeric-scalar"
         ds.attrs["encoding-version"] = "0.2.0"
         return
     if isinstance(value, (int, np.integer)):
         ds = hf.create_dataset(path, data=int(value))
-        ds.attrs["encoding-type"] = "numeric"
+        ds.attrs["encoding-type"] = "numeric-scalar"
         ds.attrs["encoding-version"] = "0.2.0"
         return
     if isinstance(value, (float, np.floating)):
         ds = hf.create_dataset(path, data=float(value))
-        ds.attrs["encoding-type"] = "numeric"
+        ds.attrs["encoding-type"] = "numeric-scalar"
         ds.attrs["encoding-version"] = "0.2.0"
         return
     # Fallback: stringify
@@ -227,7 +240,12 @@ def sync_loom_attrs_to_h5ad_uns(loom_path: str, h5ad_path: str) -> int:
             return 0
         items = []
         for key in loom["attrs"].keys():
-            items.append((key, _decode_attr(loom["attrs"][key][()])))
+            node = loom["attrs"][key]
+            if isinstance(node, h5py.Group):
+                # HDF5 groups (e.g. Visium /attrs/spatial) are copied into uns as groups by the
+                # h5ad converters (anndata_mapping uns_groups); this sync only handles scalars.
+                continue
+            items.append((key, _decode_attr(node[()])))
 
     # Always enforce scFAIR schema identity after sync.
     items = [
@@ -255,6 +273,7 @@ def fix_h5ad(
     dry_run: bool,
     schema_only: bool,
 ) -> dict:
+    update_raw = False
     with h5py.File(h5ad_path, "r") as hf:
         old_fn = (
             _read_1d_strings(hf["var/feature_name"])
@@ -269,12 +288,23 @@ def fix_h5ad(
                 old_ref = _decode_attr(hf["uns/schema_reference"][()])
             if "schema_version" in hf["uns"]:
                 old_ver = _decode_attr(hf["uns/schema_version"][()])
-        if not schema_only and names is not None and old_fn is not None:
-            if len(old_fn) != len(names):
+        if not schema_only and names is not None:
+            var_index = _h5ad_index(hf, "var")
+            if len(var_index) != len(names):
                 raise ValueError(
-                    f"h5ad n_vars={len(old_fn)} != loom feature_name length "
+                    f"h5ad n_vars={len(var_index)} != loom feature_name length "
                     f"{len(names)} for {h5ad_path}"
                 )
+            # h5ad files exported before raw.var became index-only still carry raw/var/feature_name:
+            # keep it in sync with var when raw holds the same genes.
+            if "raw/var/feature_name" in hf:
+                if _h5ad_index(hf, "raw/var") == var_index:
+                    update_raw = True
+                else:
+                    print(
+                        f"WARNING {h5ad_path}: raw.var genes differ from var; raw/var/feature_name left unchanged",
+                        file=sys.stderr,
+                    )
 
     fn_changed = (
         0
@@ -287,6 +317,7 @@ def fix_h5ad(
         "schema_reference_changed": old_ref != SCFAIR_SCHEMA_REFERENCE,
         "schema_version_changed": old_ver != SCFAIR_SCHEMA_VERSION,
         "uns_keys_before": uns_keys,
+        "raw_feature_name_updated": update_raw,
         "dry_run": dry_run,
     }
     if dry_run:
@@ -295,6 +326,8 @@ def fix_h5ad(
     with h5py.File(h5ad_path, "a") as hf:
         if not schema_only and names is not None:
             _write_h5ad_feature_name(hf, names)
+            if update_raw:
+                _write_h5ad_feature_name(hf, names, frame="raw/var")
     if loom_path:
         n = sync_loom_attrs_to_h5ad_uns(loom_path, h5ad_path)
         report["uns_attrs_synced"] = n
@@ -402,18 +435,24 @@ def fix_loom(
                 "subdomain": subdomain,
                 "feature_name_changed": changed,
                 "had_feature_name": old_fn is not None,
+                "feature_names": new_fn,
             }
         )
 
     if dry_run:
         return report
 
+    write_loom_fix(loom_path, new_fn)
+    return report
+
+
+def write_loom_fix(loom_path: str, new_fn: list[str] | None) -> None:
+    """Write the feature_name / schema fields computed by fix_loom."""
     with h5py.File(loom_path, "a") as hf:
-        if not schema_only and new_fn is not None:
+        if new_fn is not None:
             _write_loom_string_vector(hf, "row_attrs/feature_name", new_fn)
         _write_loom_scalar(hf, "attrs/schema_reference", SCFAIR_SCHEMA_REFERENCE)
         _write_loom_scalar(hf, "attrs/schema_version", SCFAIR_SCHEMA_VERSION)
-    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,14 +499,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+    if args.h5ad and not os.path.isfile(args.h5ad):
+        print(f"ERROR h5ad not found: {args.h5ad}", file=sys.stderr)
+        return 1
+
+    # Compute and validate everything (loom and h5ad) before writing anything, so a bad h5ad
+    # cannot leave the loom updated and the h5ad not (or the other way round).
     loom_report = fix_loom(
         loom,
         dburl=args.dburl,
         ensembl_db_name=args.ensembl_db_name,
         ensembl_subdomain=args.ensembl_subdomain,
-        dry_run=args.dry_run,
+        dry_run=True,
         schema_only=args.schema_only,
     )
+    names = loom_report.pop("feature_names", None)
+    if args.h5ad:
+        fix_h5ad(args.h5ad, loom_path=loom, names=names, dry_run=True, schema_only=args.schema_only)
+
+    if not args.dry_run:
+        write_loom_fix(loom, names)
     print(
         f"loom feature_name_changed={loom_report.get('feature_name_changed', 0)}"
         f"/{loom_report.get('n_genes', 0)} "
@@ -478,26 +529,6 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.h5ad:
-        if not os.path.isfile(args.h5ad):
-            print(f"ERROR h5ad not found: {args.h5ad}", file=sys.stderr)
-            return 1
-        names = None
-        if not args.schema_only:
-            with h5py.File(loom, "r") as hf:
-                accessions = _read_1d_strings(hf["row_attrs/Accession"])
-                biotypes = (
-                    _read_1d_strings(hf["row_attrs/feature_biotype"])
-                    if "row_attrs/feature_biotype" in hf
-                    else ["gene"] * len(accessions)
-                )
-                release = int(_decode_attr(hf["attrs/ensembl_release"][()]))
-            names = compute_feature_names(
-                accessions=accessions,
-                biotypes=biotypes,
-                ensembl_subdomain=loom_report["subdomain"],
-                ensembl_db_name=loom_report["ensembl_db_name"],
-                release=int(loom_report["ensembl_release"]),
-            )
         h5_report = fix_h5ad(
             args.h5ad,
             loom_path=loom,

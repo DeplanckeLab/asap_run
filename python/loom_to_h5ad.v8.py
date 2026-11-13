@@ -263,6 +263,9 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isfile(loom_file):
         fail(f"Input loom not found: {loom_file}", output_json)
 
+    # Write to a sibling .partial file and rename only once complete, so a failed
+    # conversion never leaves a half-written (or stale) h5ad that looks ready.
+    partial_file = f"{h5ad_file}.partial"
     try:
         apply_numpy_compat()
         import loompy  # noqa: F401 - load before patching AttributeManager
@@ -272,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
             apply_anndata_mapping,
             copy_loom_attr_groups_to_h5ad_uns,
             load_anndata_mapping,
+            use_legacy_string_encoding_adata,
         )
 
         install_loompy_none_attr_recovery()
@@ -298,24 +302,31 @@ def main(argv: list[str] | None = None) -> int:
         apply_anndata_mapping(adata, loom_file, mapping)
         ensure_feature_name_from_loom(adata)
         drop_loom_index_columns(adata)
+        # pandas 3 str columns would otherwise be written as nullable-string-array.
+        use_legacy_string_encoding_adata(adata)
+        if os.path.exists(partial_file):
+            os.remove(partial_file)
         # gzip is HDF5-native (scFAIR-safe); shrinks CSR X/layers vs uncompressed default.
-        adata.write_h5ad(h5ad_file, compression="gzip")
-        copy_loom_attr_groups_to_h5ad_uns(loom_file, h5ad_file, mapping)
+        adata.write_h5ad(partial_file, compression="gzip")
+        copy_loom_attr_groups_to_h5ad_uns(loom_file, partial_file, mapping)
+
+        import h5py
+
+        with h5py.File(partial_file, "r") as hf:
+            if "X" not in hf:
+                raise RuntimeError("H5AD output is missing matrix X (incomplete write)")
+        os.replace(partial_file, h5ad_file)
     except Exception as exc:  # noqa: BLE001 - surface any convert failure in output.json
+        for path in (h5ad_file, partial_file):
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
         fail(f"Loom to H5AD conversion failed: {exc}", output_json)
 
     if not os.path.isfile(h5ad_file) or os.path.getsize(h5ad_file) <= 0:
         fail("H5AD output was not written or is empty", output_json)
-
-    import h5py
-
-    with h5py.File(h5ad_file, "r") as hf:
-        if "X" not in hf:
-            try:
-                os.remove(h5ad_file)
-            except OSError:
-                pass
-            fail("H5AD output is missing matrix X (incomplete write)", output_json)
 
     payload = {
         "status": "success",

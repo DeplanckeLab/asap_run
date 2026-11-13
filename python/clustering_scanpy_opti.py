@@ -43,7 +43,7 @@ def error_json(message, jsonfile):
         data_json['displayed_error'] = message
         with open(jsonfile, 'w') as outfile:
             json.dump(data_json, outfile)
-    sys.exit()
+    sys.exit(1)
 
 # Open the Loom file while handling potential locking
 def open_with_lock(loomfile, mode):

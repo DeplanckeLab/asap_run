@@ -44,7 +44,7 @@ def error_json(message, jsonfile):
         data_json['displayed_error'] = message
         with open(jsonfile, 'w') as outfile:
             json.dump(data_json, outfile)
-    sys.exit()
+    sys.exit(1)
 
 # Open the Loom file while handling potential locking
 def open_with_lock(loomfile, mode):
@@ -111,7 +111,7 @@ var = numpy.zeros(m.shape[0], m.dtype) # Shape = (nbgenes)
 totalChunks = math.ceil(m.shape[0] / chunksize)
 
 # Calculate mean and var by chunk
-for x in range(1, m.shape[0], chunksize):
+for x in range(1, m.shape[0] + 1, chunksize): # + 1: x is 1-based, else the last gene is skipped when n_genes % chunksize == 1
     currentChunk = int((x - 1) / chunksize) + 1
     start = x - 1
     end = x + chunksize - 2

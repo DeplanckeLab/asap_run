@@ -95,44 +95,57 @@ def doublet_call(args):
     if n_cells != ca_len:
         ErrorJSON(f"Score length ({n_cells}) does not match cell count ({ca_len}).")
 
+    # Cells without a score (NaN/inf, e.g. an imported score with missing cells) are never called doublets
+    # and are left out of the threshold detection.
+    scored     = np.isfinite(scores)
+    scored_idx = np.flatnonzero(scored)
+    n_scored   = int(scored_idx.size)
+    if n_scored == 0:
+        ErrorJSON(f"Score path {args.input_score_meta!r} has no finite values; cannot call doublets.")
+    if n_scored < n_cells:
+        warnings.append(f"{n_cells - n_scored} cells have no score (NaN) and were called singlets.")
+    valid_scores = scores[scored_idx]
+
     # Apply threshold strategy
     calls = np.zeros(n_cells, dtype=np.int32)
 
     if args.method == "threshold":
-        calls[scores >= args.threshold] = 1
+        calls[scored & (scores >= args.threshold)] = 1
         threshold_used = float(args.threshold)
-    elif args.method == "top_n":
-        n_d     = min(args.n_doublets, n_cells)
-        top_idx = np.argsort(scores)[::-1][:n_d]
+    elif args.method in ("top_n", "top_pct"):
+        if args.method == "top_n":
+            n_d = min(args.n_doublets, n_scored)
+        else:
+            n_d = min(round(args.doublet_rate * n_scored), n_scored)
+        top_idx = scored_idx[np.argsort(valid_scores)[::-1][:n_d]]
         calls[top_idx] = 1
         # threshold_used = minimum score among called doublets
         threshold_used = float(scores[top_idx[-1]]) if n_d > 0 else None
-    elif args.method == "top_pct":
-        n_d     = round(args.doublet_rate * n_cells)
-        top_idx = np.argsort(scores)[::-1][:n_d]
-        calls[top_idx] = 1
-        threshold_used = float(scores[top_idx[-1]]) if n_d > 0 else None
     elif args.method == "valley":  # histogram valley detection on the observed score distribution
         from scipy.signal import find_peaks
-        hist_counts, bin_edges = np.histogram(scores, bins=100)
+        hist_counts, bin_edges = np.histogram(valid_scores, bins=100)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         valleys, _ = find_peaks(-hist_counts.astype(float))
         if len(valleys) > 0:
-            mid = (scores.max() + scores.min()) / 2
+            mid = (valid_scores.max() + valid_scores.min()) / 2
             best_valley = valleys[np.argmin(np.abs(bin_centers[valleys] - mid))]
             threshold_used = float(bin_centers[best_valley])
         else:
-            threshold_used = float(np.mean(scores) + np.std(scores))
+            threshold_used = float(np.mean(valid_scores) + np.std(valid_scores))
             warnings.append("No valley found in score distribution; using mean+std fallback.")
-        calls[scores >= threshold_used] = 1
-    else:  # auto — uses skimage.filters.threshold_minimum (scrublet's actual algorithm)
+        calls[scored & (scores >= threshold_used)] = 1
+    else:  # auto — skimage.filters.threshold_minimum, the function scrublet uses, but applied to the observed
+           # scores: scrublet applies it to its simulated-doublet scores, so the cutoff can differ from scrublet's own.
         try:
             from skimage.filters import threshold_minimum
-            threshold_used = float(threshold_minimum(scores))
+            threshold_used = float(threshold_minimum(valid_scores))
         except Exception as e_thresh:
-            threshold_used = float(np.mean(scores) + np.std(scores))
+            threshold_used = float(np.mean(valid_scores) + np.std(valid_scores))
             warnings.append(f"skimage threshold_minimum failed ({e_thresh}); using mean+std fallback.")
-        calls[scores >= threshold_used] = 1
+        calls[scored & (scores >= threshold_used)] = 1
+
+    if threshold_used is not None and not np.isfinite(threshold_used):
+        threshold_used = None  # keep output.json valid JSON (no bare NaN)
 
     n_doublets = int(calls.sum())
     n_singlets = n_cells - n_doublets
@@ -183,12 +196,17 @@ Doublet Call Script (Python)
 Re-calls doublets from a pre-computed doublet score saved in a LOOM file.
 Tool-agnostic: works with scores from DoubletFinder, scrublet, or any other tool.
 
-Four strategies (--method):
-  threshold   Score > --threshold → Doublet.    Requires --threshold.
+Five strategies (--method):
+  threshold   Score >= --threshold → Doublet.   Requires --threshold.
   top_n       Top --n_doublets cells → Doublet. Requires --n_doublets.
   top_pct     Top --doublet_rate fraction.      Requires --doublet_rate.
-  auto        Re-detect threshold automatically from the score distribution
-              using bimodal valley detection (same logic as scrublet).
+  valley      Threshold at the histogram valley closest to the middle of
+              the observed score range.
+  auto        Threshold from skimage threshold_minimum on the observed
+              scores. Scrublet uses the same function but on its simulated
+              doublet scores, so the cutoff can differ from scrublet's.
+
+Cells with a missing (NaN) score are never called doublets.
 
 Options:
   -f                     Input LOOM file.                                   [required]
@@ -196,13 +214,13 @@ Options:
                            Example: /col_attrs/doublet_score_scr
   --output_call_meta     Path in /col_attrs/ for the new binary call.       [required]
                            Example: /col_attrs/doublet_call_scr_t02
-  --method               threshold | top_n | top_pct                        [required]
+  --method               threshold | top_n | top_pct | valley | auto        [required]
   -o                     Output folder for output.json. [optional: stdout]
 
   -- Parameters (method-specific) ─────────────────────────────────────────────
   --threshold            Fixed threshold (method=threshold).
   --n_doublets           Number of doublets to call (method=top_n).
-  --doublet_rate         Fraction of cells to call as doublets (method=top_pct).
+  --doublet_rate         Fraction of scored cells to call as doublets (method=top_pct).
 
   --help                 Show this message and exit.
 
@@ -210,7 +228,7 @@ Output JSON doublet_call block:
   threshold_used   float  — actual score cutoff applied
                              threshold: the value passed
                              top_n / top_pct: min score among called doublets
-                             auto: detected valley in score histogram
+                             valley / auto: detected cutoff (null if none)
   doublet_rate     float  — actual fraction of cells called as doublets
 """
 
@@ -241,4 +259,9 @@ def main():
     doublet_call(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

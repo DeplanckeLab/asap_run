@@ -46,13 +46,19 @@ def _read_string_dataset(f: h5py.File, path: str) -> list[str]:
         return [raw.decode("utf-8", errors="replace")]
     return [v.decode("utf-8", errors="replace") if isinstance(v, (bytes, np.bytes_)) else str(v) for v in raw.ravel()]
 
-def _write_dataset(f_out: h5py.File, path: str, data: np.ndarray, n_genes: int, n_cells: int) -> int:
-    """Write a genes×cells matrix with standard chunking/compression. Returns on-disk size in bytes."""
-    chunk = (min(n_genes, LOOM_CHUNK_GENES), min(n_cells, LOOM_CHUNK_CELLS))
-    if path in f_out:
-        del f_out[path]
-    ds = f_out.create_dataset(path, data=data.astype(LOOM_DTYPE, copy=False), shape=(n_genes, n_cells), chunks=chunk, compression=LOOM_COMPRESSION, compression_opts=LOOM_COMPRESSION_LEVEL)
-    return int(ds.id.get_storage_size())
+## Block helpers (bounded RAM: the matrix is never held in memory as a whole)
+BLOCK_BYTES = 64 * 1024**2  # target size of one float64 block
+
+def _block_len(other_dim: int, chunk: int) -> int:
+    """Block length so that one float64 (block x other_dim) slab stays near BLOCK_BYTES; a multiple of the loom chunk."""
+    n = BLOCK_BYTES // (8 * max(1, other_dim))
+    return max(chunk, n // chunk * chunk)
+
+def _read_genes(node: h5py.Dataset, g0: int, g1: int, cells_first: bool) -> np.ndarray:
+    """cells x genes float64 block for genes [g0, g1) (same memory layout as a full read)."""
+    if cells_first:
+        return node[:, g0:g1].astype(DEFAULT_NP_DTYPE, copy=False)
+    return node[g0:g1, :].astype(DEFAULT_NP_DTYPE, copy=False).T
 
 def _open_loom_with_retry(path: str, mode: str, max_wait: int = 600) -> tuple:
     """Try to open a LOOM/HDF5 file, retrying every second if locked.
@@ -104,55 +110,68 @@ def scale(args):
         "warnings":   [],
     }
 
-    f_in, wt = _open_loom_with_retry(str(input_path), "r")
-    result["wait_time"] += wt
-    with f_in:
-        src_path = args.input_meta
-        if src_path not in f_in:
-            ErrorJSON(f"Source path {src_path!r} not found in LOOM file.")
-        node = f_in[src_path]
-        if not isinstance(node, h5py.Dataset) or len(node.shape) != 2:
-            ErrorJSON(f"Expected a 2-D dataset at {src_path}, got shape {getattr(node, 'shape', '?')}")
+    result["parameters"] = {
+        "loom_path":        str(input_path),
+        "input_loom_path":  args.input_meta,
+        "output_loom_path": args.output_meta,
+        "method":           args.method,
+        "zero_center":      args.zero_center,
+        "max_value":        args.max_value,
+    }
 
-        s0, s1 = int(node.shape[0]), int(node.shape[1])
-        ra_len = f_in[_GENE_ID_PATH].shape[0]
-        ca_len = f_in[_CELL_ID_PATH].shape[0]
-        if s0 == ca_len and s1 == ra_len:
-            # Matrix stored cells×genes — transpose to canonical genes×cells
-            n_genes, n_cells = s1, s0
-            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE).T
-        else:
-            # Standard genes×cells
-            n_genes, n_cells = s0, s1
-            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE)
+    # Scaling is per gene, so run sc.pp.scale on one block of genes (all cells) at a time. The scaled layer is
+    # built in a scratch HDF5 file, then copied into the LOOM: RAM stays near one block, and a failure never
+    # leaves a half-written layer in the LOOM.
+    import os, tempfile, anndata
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".scaling_", suffix=".h5", dir=str(out_dir))
+    os.close(tmp_fd)
+    try:
+        f_in, wt = _open_loom_with_retry(str(input_path), "r")
+        result["wait_time"] += wt
+        with f_in, h5py.File(tmp_path, "w") as f_tmp:
+            src_path = args.input_meta
+            if src_path not in f_in:
+                ErrorJSON(f"Source path {src_path!r} not found in LOOM file.")
+            node = f_in[src_path]
+            if not isinstance(node, h5py.Dataset) or len(node.shape) != 2:
+                ErrorJSON(f"Expected a 2-D dataset at {src_path}, got shape {getattr(node, 'shape', '?')}")
 
-        result["parameters"] = {
-            "loom_path":        str(input_path),
-            "input_loom_path":  args.input_meta,
-            "output_loom_path": args.output_meta,
-            "method":           args.method,
-            "zero_center":      args.zero_center,
-            "max_value":        args.max_value,
-        }
+            s0, s1 = int(node.shape[0]), int(node.shape[1])
+            ra_len = f_in[_GENE_ID_PATH].shape[0]
+            ca_len = f_in[_CELL_ID_PATH].shape[0]
+            cells_first = s0 == ca_len and s1 == ra_len   # matrix stored cells×genes (else canonical genes×cells)
+            n_genes, n_cells = (s1, s0) if cells_first else (s0, s1)
+            step = _block_len(n_cells, LOOM_CHUNK_GENES)
 
-        # Build AnnData (cells × genes) and run sc.pp.scale
-        import anndata
-        adata = anndata.AnnData(X=matrix_gxc.T)   # cells × genes
-        sc.pp.scale(adata, zero_center=args.zero_center, max_value=args.max_value)
-        scaled_gxc = adata.X.T   # back to genes × cells
+            out = f_tmp.create_dataset("layer", shape=(n_genes, n_cells), dtype=LOOM_DTYPE,
+                                       chunks=(min(n_genes, LOOM_CHUNK_GENES), min(n_cells, LOOM_CHUNK_CELLS)),
+                                       compression=LOOM_COMPRESSION, compression_opts=LOOM_COMPRESSION_LEVEL)
+            is_count_scaled = 1
+            for g0 in range(0, n_genes, step):
+                g1 = min(g0 + step, n_genes)
+                adata = anndata.AnnData(X=_read_genes(node, g0, g1, cells_first))   # cells × genes block
+                sc.pp.scale(adata, zero_center=args.zero_center, max_value=args.max_value)
+                scaled_gxc = adata.X.T   # back to genes × cells
+                if is_count_scaled and not np.all(scaled_gxc == np.floor(scaled_gxc)):
+                    is_count_scaled = 0
+                out[g0:g1, :] = scaled_gxc
+                del adata, scaled_gxc
 
-    # Append scaled layer directly into the input LOOM (no copy needed)
-    f_rw, wt = _open_loom_with_retry(str(input_path), "r+")
-    result["wait_time"] += wt
-    with f_rw:
-        if args.output_meta in f_rw:
-            warnings.append(f"Path '{args.output_meta}' already exists in the LOOM file and will be overwritten.")
-            del f_rw[args.output_meta]
-        f_rw.require_group("/layers")
-        scaled_size = _write_dataset(f_rw, args.output_meta, scaled_gxc, n_genes, n_cells)
+        # Append scaled layer into the input LOOM
+        f_rw, wt = _open_loom_with_retry(str(input_path), "r+")
+        result["wait_time"] += wt
+        with f_rw, h5py.File(tmp_path, "r") as f_tmp:
+            if args.output_meta in f_rw:
+                warnings.append(f"Path '{args.output_meta}' already exists in the LOOM file and will be overwritten.")
+                del f_rw[args.output_meta]
+            f_rw.require_group("/layers")
+            f_rw.copy(f_tmp["layer"], args.output_meta)
+            scaled_size = int(f_rw[args.output_meta].id.get_storage_size())
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
     # Metadata entry — mirrors the Metadata dataclass from parse_v8.py
-    is_count_scaled = int(np.all(scaled_gxc == np.floor(scaled_gxc)))
     result["metadata"].append({
         "name":            args.output_meta,
         "on":              "EXPRESSION_MATRIX",
@@ -244,4 +263,9 @@ def main():
     scale(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

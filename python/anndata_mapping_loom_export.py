@@ -317,6 +317,26 @@ def copy_loom_attrs_to_uns(loom_file: str, adata, mapping: dict[str, Any] | None
     return n
 
 
+def _add_anndata_encoding_attrs(node) -> None:
+    """Tag a copied loom group tree with anndata encoding attrs (else read_h5ad warns OldFormatWarning)."""
+
+    def _tag(obj) -> None:
+        if "encoding-type" in obj.attrs:
+            return
+        if isinstance(obj, h5py.Group):
+            enc, ver = "dict", "0.1.0"
+        elif obj.dtype.kind in ("S", "O", "U"):
+            enc, ver = ("string", "0.2.0") if obj.shape == () else ("string-array", "0.2.0")
+        else:
+            enc, ver = ("numeric-scalar", "0.2.0") if obj.shape == () else ("array", "0.2.0")
+        obj.attrs["encoding-type"] = enc
+        obj.attrs["encoding-version"] = ver
+
+    _tag(node)
+    if isinstance(node, h5py.Group):
+        node.visititems(lambda _name, obj: _tag(obj))
+
+
 def copy_loom_attr_groups_to_h5ad_uns(
     loom_file: str,
     h5ad,
@@ -358,6 +378,7 @@ def copy_loom_attr_groups_to_h5ad_uns(
                 if uns_key in uns:
                     del uns[uns_key]
                 src.copy(node, uns, name=uns_key)
+                _add_anndata_encoding_attrs(uns[uns_key])
                 n += 1
                 print(
                     f"Copied loom {loom_path} group into uns/{uns_key} "
@@ -369,6 +390,44 @@ def copy_loom_attr_groups_to_h5ad_uns(
         if close_dst:
             dst.close()
 
+
+
+def _is_nullable_string_dtype(dtype) -> bool:
+    import pandas as pd
+
+    return isinstance(dtype, pd.StringDtype)
+
+
+def use_legacy_string_encoding(frame) -> None:
+    """Cast a DataFrame's string index/columns/categories to object dtype, in place.
+
+    pandas 3 infers the nullable ``str`` dtype for text, which anndata writes as
+    ``nullable-string-array`` groups (unreadable by anndata < 0.11 and most non-Python
+    readers). object dtype keeps the legacy ``string-array`` encoding. Columns holding
+    missing values stay nullable: an object column with NaN cannot be written as strings.
+    """
+    import pandas as pd
+
+    if frame is None:
+        return
+    if _is_nullable_string_dtype(frame.index.dtype) and not frame.index.hasnans:
+        frame.index = pd.Index(frame.index, dtype=object, name=frame.index.name)
+    for col in list(frame.columns):
+        s = frame[col]
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            cats = s.cat.categories
+            if _is_nullable_string_dtype(cats.dtype):
+                frame[col] = s.cat.rename_categories(pd.Index(cats, dtype=object))
+        elif _is_nullable_string_dtype(s.dtype) and not s.isna().any():
+            frame[col] = s.astype(object)
+
+
+def use_legacy_string_encoding_adata(adata) -> None:
+    """Apply use_legacy_string_encoding to obs, var and raw.var before writing an h5ad."""
+    use_legacy_string_encoding(adata.obs)
+    use_legacy_string_encoding(adata.var)
+    if adata.raw is not None:
+        use_legacy_string_encoding(adata.raw.var)
 
 
 def index_only_var_frame(var_df):

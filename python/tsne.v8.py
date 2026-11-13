@@ -136,7 +136,9 @@ def tsne(args):
     if args.n_dims is not None and args.n_dims > n_pcs:
         warnings.append(f"--n_dims ({args.n_dims}) exceeds available PCs ({n_pcs}); using all {n_pcs}.")
 
-    # Perplexity must be less than n_cells / 3
+    # Perplexity must be less than n_cells / 3 (and > 0), which needs at least 4 cells
+    if n_cells < 4:
+        ErrorJSON(f"t-SNE needs at least 4 cells; this dataset has {n_cells}.")
     max_perplexity = (n_cells - 1) / 3
     perplexity = args.perplexity
     if perplexity >= max_perplexity:
@@ -254,4 +256,9 @@ def main():
     tsne(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")

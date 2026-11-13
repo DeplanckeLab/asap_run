@@ -119,12 +119,8 @@ def pca(args):
         s0, s1 = int(node.shape[0]), int(node.shape[1])
         ra_len = f_in[_GENE_ID_PATH].shape[0]
         ca_len = f_in[_CELL_ID_PATH].shape[0]
-        if s0 == ca_len and s1 == ra_len:
-            n_genes, n_cells = s1, s0
-            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE).T   # genes x cells
-        else:
-            n_genes, n_cells = s0, s1
-            matrix_gxc = node[:, :].astype(DEFAULT_NP_DTYPE)
+        cells_first = s0 == ca_len and s1 == ra_len   # matrix stored cells×genes (else canonical genes×cells)
+        n_genes, n_cells = (s1, s0) if cells_first else (s0, s1)
 
         cell_ids = _read_string_dataset(f_in, _CELL_ID_PATH)
         gene_ids = _read_string_dataset(f_in, _GENE_ID_PATH)
@@ -141,6 +137,26 @@ def pca(args):
                 ErrorJSON("No genes selected by --features (all flags are 0).")
         else:
             feature_mask = np.ones(n_genes, dtype=bool)
+
+        # Load only the selected genes, block by block, into a single float64 buffer
+        # (cells x features when stored cells-first, else features x cells; same memory layout as a full read)
+        n_sel    = int(feature_mask.sum())
+        selected = np.empty((n_cells, n_sel) if cells_first else (n_sel, n_cells), dtype=DEFAULT_NP_DTYPE)
+        step = max(LOOM_CHUNK_GENES, (64 * 1024**2 // (8 * max(1, n_cells))) // LOOM_CHUNK_GENES * LOOM_CHUNK_GENES)
+        j = 0
+        for g0 in range(0, n_genes, step):
+            g1   = min(g0 + step, n_genes)
+            keep = feature_mask[g0:g1]
+            k    = int(keep.sum())
+            if k == 0:
+                continue
+            if cells_first:
+                selected[:, j:j + k] = node[:, g0:g1][:, keep]
+            else:
+                selected[j:j + k] = node[g0:g1, :][keep]
+            j += k
+        mat_cx = selected if cells_first else selected.T   # cells x selected genes (no copy)
+        del selected
 
     n_features   = int(feature_mask.sum())
     n_pcs_actual = min(args.n_pcs, n_features - 1, n_cells - 1)
@@ -165,10 +181,8 @@ def pca(args):
 
     # Build AnnData (cells x genes), subsetting to selected features
     import anndata
-    mat_cx = matrix_gxc.T.astype(DEFAULT_NP_DTYPE)   # cells x genes
-    if not feature_mask.all():
-        mat_cx = mat_cx[:, feature_mask]
     adata = anndata.AnnData(X=mat_cx)
+    del mat_cx   # adata.X is now the only reference to the matrix
 
     sc.pp.pca(
         adata,
@@ -260,4 +274,9 @@ def main():
     pca(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:  # uncaught library error: still report a displayed_error (ErrorJSON itself exits via SystemExit)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        ErrorJSON(f"Unexpected error: {type(e).__name__}: {e}")
