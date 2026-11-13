@@ -170,7 +170,8 @@ def build_obs_var_obsm_varm(hf: h5py.File, mapping: dict[str, Any], n_genes: int
 
     # _index is AnnData-reserved (H5AD index dataset name); loom often has a redundant copy.
     reserved_obs = {obs_index_key, "obs_names", "cell_names", "CellName", "_index"}
-    reserved_var = {var_index_key, "var_names", "gene_ids", "_index"}
+    # gene_ids is kept (unless it is the index itself): it is not always a copy of the var index.
+    reserved_var = {var_index_key, "var_names", "_index"}
     mapped_obsm_paths = {str(p) for p in obsm_map.values()}
     mapped_varm_paths = {str(p) for p in varm_map.values()}
 

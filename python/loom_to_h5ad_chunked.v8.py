@@ -483,6 +483,9 @@ def _write_h5ad_streamed_from_scratch(
     copy_loom_attrs_to_uns(loom_file, shell, mapping)
     ensure_feature_name_from_loom(shell)
     drop_loom_index_columns(shell)
+    # Same as AnnData.write_h5ad (which write_elem bypasses): string obs/var columns with repeated values become
+    # categoricals, as CELLxGENE / scFAIR expect for metadata such as *_ontology_term_id.
+    shell.strings_to_categoricals()
     # pandas 3 str columns would otherwise be written as nullable-string-array.
     use_legacy_string_encoding_adata(shell)
 
