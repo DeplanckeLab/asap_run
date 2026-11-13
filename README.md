@@ -1,10 +1,19 @@
 # Building asap_run
 
+`Dockerfile` is a local, git-ignored symlink to the current `Dockerfile.vX` (currently `Dockerfile.v8.7`).
+It must be a symlink, not a copy: `docker-compose.yml` builds from it.
+
 ```bash
 # Edit new Dockerfile.vX
-# Update Dockerfile symlink
+ln -sfn Dockerfile.vX Dockerfile   # Update Dockerfile symlink
 # Edit image tag in docker-compose.yml
 docker-compose build
+```
+
+If you changed anything in `java/src`, rebuild `java/bin/ASAP.jar` first (the image only copies the JAR, not the classes).
+When only some classes changed, you can refresh them in the JAR from the IDE build output:
+```bash
+cd java/bin && jar uf ASAP.jar ASAP.class path/to/Changed.class
 ```
 
 # asap_run
@@ -12,7 +21,7 @@ ASAP container for running all pipeline code
 
 # How to build the latest asap_run Docker from this git clone
 ```bash
-docker build . -t asap_run:v8 -f Dockerfile.v8.1
+docker build . -t asap_run:v8 -f Dockerfile.v8.7
 ```
 
 # How to use pre-built Docker images

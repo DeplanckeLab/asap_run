@@ -1,17 +1,26 @@
+# Editor / OS leftovers
 *~
 *#
+.vscode/
+.ipynb_checkpoints/
+
+# Local build files
+# Dockerfile is a local symlink to the current Dockerfile.vX (see README.md)
 Dockerfile
 build.log
 .env
 
-R/normalization.asap.3.R.bkp
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Backup copies of scripts (git history already keeps old versions)
+*.bkp
+*.bak
+*.bak_*
 python/de.v8.*.py
 
-# Ignore temporary notebooks
-.ipynb_checkpoints
-
-# Ignore all compiled Java classes except ASAP.jar
+# Compiled Java classes are build output (Eclipse / VS Code rebuild them into java/bin).
+# Only the packaged ASAP.jar is tracked: rebuild it whenever java/src changes.
 java/bin/*
 !java/bin/ASAP.jar
-
-*.pyc

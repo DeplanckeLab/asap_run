@@ -10,7 +10,7 @@ if ! docker image inspect fabdavid/asap_run:v6.1 >/dev/null 2>&1; then
 fi
 
 echo "Building v6 from v6.1 package base + latest scripts..."
-docker build -f Dockerfile.v6.2 -t fabdavid/asap_run:v6 .
+docker build -f Dockerfile.old/Dockerfile.v6.2 -t fabdavid/asap_run:v6 .
 docker tag fabdavid/asap_run:v6 fabdavid/asap_run:v6.2
 
 echo "Verifying Seurat version..."
