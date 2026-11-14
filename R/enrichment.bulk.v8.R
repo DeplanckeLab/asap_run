@@ -91,6 +91,19 @@ ErrorJSON <- function(message, output_path = NULL) {
   quit(save = "no", status = 1)
 }
 
+# Open the loom, waiting while another process holds its HDF5 file lock: several runs of a project can use the same loom
+# at the same time (e.g. normalization and gene filtering). Any other error is raised at once.
+h5_open_wait <- function(path, mode, max_wait = 600) {
+  start <- Sys.time()
+  repeat {
+    h5 <- tryCatch(H5File$new(path, mode = mode), error = function(e) e)
+    if (!inherits(h5, "error")) return(h5)
+    waited <- as.numeric(difftime(Sys.time(), start, units = "secs"))
+    if (!grepl("lock", conditionMessage(h5), ignore.case = TRUE) || waited >= max_wait) stop(h5)
+    Sys.sleep(2)
+  }
+}
+
 OUTPUT_JSON_NAME   <- "output.json"
 OUTPUT_TSV_NAME    <- "output.tsv"
 ENRICHMENT_COLUMNS <- c("name", "description", "p-value", "adjusted p-value", "effect_size", "size", "overlap")
@@ -207,7 +220,7 @@ fetch_db_data <- function(conn, geneset_db_id) {
 
 ## ── Read DEA results from LOOM ────────────────────────────────────────────────
 
-h5_in    <- tryCatch(H5File$new(input_path, mode="r"), error = function(e) ErrorJSON(paste0("Could not open '", args$file, "': ", conditionMessage(e))))
+h5_in    <- tryCatch(h5_open_wait(input_path, mode = "r"), error = function(e) ErrorJSON(paste0("Could not open '", args$file, "': ", conditionMessage(e))))
 dea_path <- sub("^/", "", args$input_meta)
 if (!h5_in$exists(dea_path)) ErrorJSON(paste0("DEA matrix '", args$input_meta, "' not found in LOOM. Run dea_bulk.R first."))
 
@@ -514,7 +527,7 @@ write.table(tsv_df, file=output_tsv_path, sep="\t", row.names=FALSE, quote=FALSE
 
 if (n_results > 0) {
   out_path_h5 <- sub("^/", "", args$output_meta)
-  h5_loom <- tryCatch(H5File$new(input_path, mode="a"), error = function(e) ErrorJSON(paste0("Could not open LOOM in append mode: ", conditionMessage(e))))
+  h5_loom <- tryCatch(h5_open_wait(input_path, mode = "a"), error = function(e) ErrorJSON(paste0("Could not open LOOM in append mode: ", conditionMessage(e))))
   if (!h5_loom$exists("attrs")) h5_loom$create_group("attrs")
   if (h5_loom$exists(out_path_h5)) {
     warn_env$w <- c(warn_env$w, paste0("'", args$output_meta, "' already exists and will be overwritten."))

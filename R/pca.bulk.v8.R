@@ -55,6 +55,19 @@ ErrorJSON <- function(message, output_path = NULL) {
   quit(save = "no", status = 1)
 }
 
+# Open the loom, waiting while another process holds its HDF5 file lock: several runs of a project can use the same loom
+# at the same time (e.g. normalization and gene filtering). Any other error is raised at once.
+h5_open_wait <- function(path, mode, max_wait = 600) {
+  start <- Sys.time()
+  repeat {
+    h5 <- tryCatch(H5File$new(path, mode = mode), error = function(e) e)
+    if (!inherits(h5, "error")) return(h5)
+    waited <- as.numeric(difftime(Sys.time(), start, units = "secs"))
+    if (!grepl("lock", conditionMessage(h5), ignore.case = TRUE) || waited >= max_wait) stop(h5)
+    Sys.sleep(2)
+  }
+}
+
 LOOM_CHUNK_CELLS <- 1024L
 LOOM_GZIP_LEVEL  <- 4L
 OUTPUT_JSON_NAME <- "output.json"
@@ -95,7 +108,7 @@ warn_env$w <- character(0)
 ## ── Read normalized matrix from LOOM ─────────────────────────────────────────
 
 h5_in <- tryCatch(
-  H5File$new(input_path, mode = "r"),
+  h5_open_wait(input_path, mode = "r"),
   error = function(e) ErrorJSON(paste0("Could not open '", args$file, "' as HDF5/LOOM."))
 )
 
@@ -164,7 +177,7 @@ pc_coords       <- pca_res$x   # (n_samples × n_pcs) matrix
 # hdf5r reverses dims on write: writing t(pc_coords) (n_pcs × n_samples) → HDF5 (n_samples × n_pcs) ✓
 out_path_h5 <- sub("^/", "", args$output_meta)
 h5_loom <- tryCatch(
-  H5File$new(input_path, mode = "a"),
+  h5_open_wait(input_path, mode = "a"),
   error = function(e) ErrorJSON(paste0("Could not open '", args$file, "' in append mode: ", conditionMessage(e)))
 )
 if (!h5_loom$exists("col_attrs")) h5_loom$create_group("col_attrs")

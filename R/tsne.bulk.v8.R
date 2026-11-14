@@ -70,6 +70,19 @@ ErrorJSON <- function(message, output_path = NULL) {
   quit(save = "no", status = 1)
 }
 
+# Open the loom, waiting while another process holds its HDF5 file lock: several runs of a project can use the same loom
+# at the same time (e.g. normalization and gene filtering). Any other error is raised at once.
+h5_open_wait <- function(path, mode, max_wait = 600) {
+  start <- Sys.time()
+  repeat {
+    h5 <- tryCatch(H5File$new(path, mode = mode), error = function(e) e)
+    if (!inherits(h5, "error")) return(h5)
+    waited <- as.numeric(difftime(Sys.time(), start, units = "secs"))
+    if (!grepl("lock", conditionMessage(h5), ignore.case = TRUE) || waited >= max_wait) stop(h5)
+    Sys.sleep(2)
+  }
+}
+
 LOOM_CHUNK_DIM   <- 64L
 LOOM_GZIP_LEVEL  <- 2L
 OUTPUT_JSON_NAME <- "output.json"
@@ -125,7 +138,7 @@ is_embedding_input <- startsWith(args$input_meta, "/col_attrs/")
 
 ## ── Read input matrix from LOOM ──────────────────────────────────────────────
 
-h5_in <- tryCatch(H5File$new(input_path, mode = "r"), error = function(e) ErrorJSON(paste0("Could not open '", args$file, "' as HDF5/LOOM.")))
+h5_in <- tryCatch(h5_open_wait(input_path, mode = "r"), error = function(e) ErrorJSON(paste0("Could not open '", args$file, "' as HDF5/LOOM.")))
 src_path <- sub("^/", "", args$input_meta)
 if (!h5_in$exists(src_path)) ErrorJSON(paste0("Source path '", args$input_meta, "' not found in LOOM file."))
 
@@ -209,7 +222,7 @@ n_components_out <- ncol(tsne_embeddings)
 
 ## ── Append t-SNE embeddings into the LOOM (/col_attrs/) ──────────────────────
 
-h5_loom <- tryCatch(H5File$new(input_path, mode = "a"), error = function(e) ErrorJSON(paste0("Could not open LOOM in append mode: ", conditionMessage(e))))
+h5_loom <- tryCatch(h5_open_wait(input_path, mode = "a"), error = function(e) ErrorJSON(paste0("Could not open LOOM in append mode: ", conditionMessage(e))))
 out_path_h5 <- sub("^/", "", args$output_meta)
 if (!h5_loom$exists("col_attrs")) h5_loom$create_group("col_attrs")
 if (h5_loom$exists(out_path_h5)) {
