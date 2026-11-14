@@ -1,4 +1,11 @@
 from __future__ import annotations
+# OpenBLAS in the numpy/scipy wheels supports at most 64 threads. On nodes with more cores, OpenMP code that calls BLAS from
+# every thread (e.g. scikit-learn neighbour search in t-SNE) overflows that limit and segfaults ("OpenBLAS warning:
+# precompiled NUM_THREADS exceeded ... Segmentation fault"). Cap both pools before numpy/scipy/sklearn are loaded.
+import os as _os
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    _n = _os.environ.get(_v, "").strip()
+    _os.environ[_v] = str(max(1, min(int(_n) if _n.isdigit() else (_os.cpu_count() or 1), 64)))
 import argparse
 import json
 import sys
