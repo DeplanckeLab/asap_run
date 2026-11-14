@@ -631,7 +631,9 @@ class H5ADHandler:
             for layer_name in f["/layers"].keys():
                 layer_path = f"/layers/{layer_name}"
                 dest_path = f"/layers/{layer_name}"
-                
+                if layer_path == input_group:
+                    continue # already written as the main matrix
+
                 if dest_path in existing_paths:
                     result.setdefault("warnings", []).append(f"Skipping {layer_path} -> {dest_path} transfer: already exists.")
                     continue

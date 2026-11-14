@@ -960,6 +960,37 @@ class H5ADHandler:
             return [f"{orientation}_{i+1}" for i in range(n)]
 
     @staticmethod
+    def sample_value_stats(f, path, max_values=200000):
+        """Tell counts from normalized data using up to max_values stored values: the non-zeros of a sparse matrix, or
+        the first rows of a dense one. The 10x10 preview corner is often all zeros, which looks like counts.
+        Returns (is_count, dtype): 1 = non-negative integers, 0 = not, -1 = unknown (no non-zero value read)."""
+        node = f[path]
+        if isinstance(node, h5py.Group):
+            if "data" not in node:
+                return -1, None
+            ds = node["data"]
+            n = int(ds.shape[0]) if ds.shape else 0
+            vals = ds[:min(n, max_values)] if n > 0 else np.empty(0, dtype=ds.dtype)
+        else:
+            ds = node
+            if len(ds.shape) != 2 or ds.shape[0] == 0 or ds.shape[1] == 0:
+                return -1, str(ds.dtype)
+            rows = max(1, min(int(ds.shape[0]), max_values // int(ds.shape[1])))
+            vals = ds[:rows]
+        dtype = str(ds.dtype)
+        vals = np.asarray(vals).ravel()
+        vals = vals[vals != 0]  # zeros say nothing about integer-ness
+        if vals.size == 0:
+            return -1, dtype
+        if np.issubdtype(vals.dtype, np.integer) or np.issubdtype(vals.dtype, np.bool_):
+            return int(vals.min() >= 0), dtype
+        if not np.issubdtype(vals.dtype, np.floating):
+            return -1, dtype
+        if not np.all(np.isfinite(vals)):
+            return 0, dtype
+        return int(bool(vals.min() >= 0 and np.all(np.floor(vals) == vals))), dtype
+
+    @staticmethod
     def extract_matrix(f, path, nCells, nGenes, n=10):
         """Extract the top-left n x n submatrix from a sparse or dense dataset, as genes x cells (like the other formats)."""
         nr, nc = min(n, nCells), min(n, nGenes)
@@ -1074,11 +1105,20 @@ class H5ADHandler:
                     matrix = []
                     is_count = -1
 
+                dtype = None
+                try:
+                    sampled, dtype = H5ADHandler.sample_value_stats(f, path)
+                    if sampled != -1:
+                        is_count = sampled
+                except Exception:
+                    pass # keep the preview-based guess
+
                 entry = {
                     "group": path,
                     "nber_cols": nC,   # cells
                     "nber_rows": nG,   # genes
                     "is_count": is_count,
+                    "dtype": dtype,
                     "genes": g,
                     "cells": c,
                     "matrix": matrix
