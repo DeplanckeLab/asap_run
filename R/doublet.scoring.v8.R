@@ -209,6 +209,11 @@ cell_ids <- as.character(h5_in[[CELL_ID_PATH]][])
 gene_ids <- as.character(h5_in[[GENE_ID_PATH]][])
 rownames(matrix_gxc) <- gene_ids; colnames(matrix_gxc) <- cell_ids
 
+# DoubletFinder normalizes and scales internally: it needs raw counts (same checks as doublet.scoring.v8.py / Scrublet)
+min_val <- min(matrix_gxc, na.rm = TRUE); max_val <- max(matrix_gxc, na.rm = TRUE)
+if (min_val < 0) ErrorJSON(sprintf("--input_meta appears to contain negative values (min=%.3f). DoubletFinder requires raw integer counts, not normalized or scaled data. Use the raw count matrix (e.g. /matrix).", min_val))
+if (max_val < 1 && n_genes > 100) ErrorJSON(sprintf("--input_meta values are all < 1 (max=%.4f). DoubletFinder requires raw integer counts, not normalized data. Use the raw count matrix (e.g. /matrix).", max_val))
+
 # Cluster labels (optional)
 cluster_labels <- NULL
 if (!is.null(args$clustering_meta)) {
@@ -246,17 +251,22 @@ if (!is.null(cluster_labels)) {
   null_fd <- file("/dev/null", open = "w")
   sink(null_fd, type = "output")
   sink(null_fd, type = "message")
+  err <- NULL
   result <- tryCatch(
     withCallingHandlers(suppressMessages(expr), warning = function(w) {
       warn_env$w <- c(warn_env$w, conditionMessage(w))
       invokeRestart("muffleWarning")
     }),
+    error = function(e) { err <<- e; NULL },
     finally = {
       sink(NULL, type = "message")
       sink(NULL, type = "output")
       close(null_fd)
     }
   )
+  # An uncaught error would be printed while stderr is still sunk to /dev/null, leaving only "Execution halted" in the
+  # run log. Report it once the sinks are restored.
+  if (!is.null(err)) ErrorJSON(paste0("DoubletFinder failed: ", conditionMessage(err)))
   invisible(result)
 }
 
