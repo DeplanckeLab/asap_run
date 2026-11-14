@@ -268,7 +268,9 @@ if (!is.null(args$vars_to_regress)) {
   for (vp in vtr_paths) {
     vp_h5 <- sub("^/", "", vp)
     if (!h5_in$exists(vp_h5)) ErrorJSON(paste0("--vars_to_regress path '", vp, "' not found in LOOM file."))
-    vname <- basename(vp_h5)
+    # Internal syntactic name: Seurat writes the names unquoted into a formula ("GENE ~ <vars>"), so a loom column such as
+    # "_Depth", "percent.mt-2" or "1st_batch" fails to parse. Also avoids clashes with Seurat's own meta columns.
+    vname <- paste0("asap_regress_", length(vars_meta) + 1L)
     vars_meta[[vname]] <- as.numeric(h5_in[[vp_h5]][])
   }
 }
