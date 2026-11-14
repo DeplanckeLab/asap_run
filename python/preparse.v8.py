@@ -860,10 +860,13 @@ class H5ADHandler:
         idx_attr = grp.attrs.get('_index', None)
         if isinstance(idx_attr, bytes):
             idx_attr = idx_attr.decode()
-        if idx_attr and idx_attr in grp and isinstance(grp[idx_attr], h5py.Dataset):
-            return int(grp[idx_attr].shape[0])
-        if '_index' in grp and isinstance(grp['_index'], h5py.Dataset):
-            return int(grp['_index'].shape[0])
+        for key in ([idx_attr] if idx_attr else []) + ['_index']:
+            item = grp[key] if key in grp else None
+            if isinstance(item, h5py.Dataset):
+                return int(item.shape[0])
+            # Nullable-string-array index {values, mask} (anndata >= 0.11 with pandas >= 3)
+            if isinstance(item, h5py.Group) and 'values' in item and isinstance(item['values'], h5py.Dataset):
+                return int(item['values'].shape[0])
 
         # Otherwise scan columns until we find one with a recoverable length
         for key in grp.keys():
@@ -947,7 +950,15 @@ class H5ADHandler:
                     else:
                         idx_data.append(v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else str(v))
             elif isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
-                cats = [v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else str(v) for v in item['categories'][:]]
+                cat_node = item['categories']
+                if isinstance(cat_node, h5py.Group): # anndata >= 0.11 with pandas >= 3: nullable-string-array {values, mask}
+                    cat_values = cat_node['values'][:]
+                    cat_mask = np.asarray(cat_node['mask'][:], dtype=bool)
+                else:
+                    cat_values = cat_node[:]
+                    cat_mask = np.zeros(cat_values.shape, dtype=bool)
+                cats = ['nan' if m else (v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else str(v))
+                        for v, m in zip(cat_values.flat, cat_mask.flat)]
                 codes = item['codes'][:]
                 idx_data = [cats[c] if 0 <= c < len(cats) else 'nan' for c in codes] # -1 = missing; out-of-range = corrupted
             else:

@@ -164,7 +164,10 @@ class H5ADHandler:
                     return [str(v) for v in decoded.ravel()]
                 # Categorical index: {categories, codes}
                 if "categories" in item and "codes" in item:
-                    cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item["categories"][:]]
+                    cats = H5ADHandler._decode_categories(item["categories"])
+                    if cats is None:
+                        ErrorJSON(f"Unsupported categories of the index column at {full_path} "
+                                  f"(keys={list(item['categories'].keys())})")
                     codes = item["codes"][:]
                     return [cats[c] if 0 <= c < len(cats) else "nan" for c in codes] # -1 = missing; out-of-range = corrupted
                 enc = item.attrs.get("encoding-type", None)
@@ -297,7 +300,21 @@ class H5ADHandler:
         out = values.astype(np.float64, copy=True)
         out[mask] = np.nan
         return out
-    
+
+    @staticmethod
+    def _decode_categories(item) -> list[str] | None:
+        """Labels of a categorical column, as strings. anndata >= 0.11 with pandas >= 3 stores them as a
+        nullable-string-array group {values, mask} instead of a dataset. Returns None for any other group."""
+        if isinstance(item, h5py.Group):
+            if "values" not in item or "mask" not in item:
+                return None
+            values = item["values"][:]
+            mask = np.asarray(item["mask"][:], dtype=bool)
+        else:
+            values = item[:]
+            mask = np.zeros(values.shape, dtype=bool)
+        return ["nan" if m else (v.decode() if isinstance(v, (bytes, np.bytes_)) else str(v)) for v, m in zip(values.flat, mask.flat)]
+
     @staticmethod
     def _detect_sparse_encoding(node: h5py.Group, n_cells: int, n_genes: int) -> str:
         # Declared encoding first (AnnData "encoding-type", h5sparse "h5sparse_format"): the indptr length alone
@@ -463,7 +480,12 @@ class H5ADHandler:
                 
                 # New-style categorical group: {categories, codes}
                 if isinstance(item, h5py.Group) and 'categories' in item and 'codes' in item:
-                    cats = [v.decode() if isinstance(v, bytes) else str(v) for v in item['categories'][:]]
+                    cats = H5ADHandler._decode_categories(item['categories'])
+                    if cats is None:
+                        result.setdefault("warnings", []).append(
+                            f"Skipping {group_path}/{col}: unsupported categories (keys={list(item['categories'].keys())})."
+                        )
+                        continue
                     codes = item['codes'][:]
                     values = np.array([cats[c] if 0 <= c < len(cats) else "nan" for c in codes], dtype=object) # -1 = missing; out-of-range = corrupted
 
