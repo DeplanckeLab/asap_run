@@ -118,6 +118,29 @@ class H5ADHandler:
         ErrorJSON(f"Could not determine shape for {path}")
 
     @staticmethod
+    def index_or_fallback(f: h5py.File, path: str, candidates: tuple[str, ...], n_expected: int, orientation: str, result: dict) -> tuple[list[str], str]:
+        """Names of the obs/var table at `path`, and the table actually used.
+
+        Some exporters write no /var or /obs at all (seen with a Bgee h5ad). Then another table with the right number of
+        rows is used (e.g. /raw/var). Failing that, cells get generated names (Cell_1 ...), as preparse shows them in its
+        preview. Genes cannot: they must be matched to the gene database, so a clear error is raised instead.
+        """
+        if path in f:
+            return H5ADHandler.extract_index(f, path), path
+        what = "gene" if orientation == "GENE" else "cell"
+        for alt in candidates:
+            if alt != path and alt in f:
+                names = H5ADHandler.extract_index(f, alt)
+                if len(names) == n_expected:
+                    result.setdefault("warnings", []).append(f"No {path} table in the file: {what} names were read from {alt}.")
+                    return names, alt
+        if orientation == "CELL":
+            result.setdefault("warnings", []).append(f"No {path} table in the file: cells are named Cell_1 ... Cell_{n_expected}.")
+            return [f"Cell_{i + 1}" for i in range(n_expected)], path
+        ErrorJSON(f"This H5AD file has no gene table ({path}), so the gene names or IDs are unknown and cannot be matched to "
+                  f"our database. Please add them to the AnnData object (adata.var_names) and upload the file again.")
+
+    @staticmethod
     def extract_index(f: h5py.File, path: str) -> list[str]:
         node = f[path]
         if isinstance(node, h5py.Group):
@@ -938,8 +961,8 @@ class H5ADHandler:
                 obsm_path = "/raw/obsm" if "/raw/obsm" in f else obsm_path
                 varm_path = "/raw/varm" if "/raw/varm" in f else varm_path
 
-            gene_names = H5ADHandler.extract_index(f, var_path)
-            cell_ids = H5ADHandler.extract_index(f, obs_path)
+            gene_names, var_path = H5ADHandler.index_or_fallback(f, var_path, ("/var", "/raw/var", "/raw.var"), n_genes, "GENE", result)
+            cell_ids, obs_path = H5ADHandler.index_or_fallback(f, obs_path, ("/obs", "/raw/obs", "/raw.obs"), n_cells, "CELL", result)
 
             # Which scFAIR feature_* columns does the original file already carry?
             # These come from var_path (and /var, since the fallback sweep also
