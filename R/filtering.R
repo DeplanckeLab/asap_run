@@ -213,13 +213,13 @@ if (std_method_name == "hvg"){
   # If not genes, output error JSON
   if(is.null(data.hvg) || sum(data.hvg) == 0) error.json("The output matrix has no more genes. You should put less stringent thresholds.")
   
-  # Preparing JSON for filtering using the Java software
+  # Preparing JSON for filtering with filter.v8.py (Python port of ASAP.jar -T FilterRows)
   stats = list() 
   stats$kept_genes = as.numeric(which(data.hvg)) - 1 # These are the indexes to filter
   write(jsonlite::toJSON(stats, method="C", auto_unbox=T, digits = NA), file = paste0(output_dir,"/to_keep.json"), append=F)
   
-  # Run Java for filtering the rows in the main matrix and all metadata
-  system(paste0("java -jar ASAP.jar -T FilterRows -loom ", input_matrix_filename, " -o ", output_dir, " -m keep -row_names_file ", paste0(output_dir,"/to_keep.json")))
+  # Filter the rows of the main matrix and of all metadata
+  system(paste0("python3 /srv/filter.v8.py -T FilterRows -loom ", input_matrix_filename, " -o ", output_dir, " -m keep -row_names_file ", paste0(output_dir,"/to_keep.json")))
 } else if (std_method_name == "m3drop"){
   
   suppressPackageStartupMessages(require(M3Drop))
@@ -241,13 +241,13 @@ if (std_method_name == "hvg"){
   # If not genes, output error JSON
   if(nrow(data.DE.Genes) == 0) error.json("The output matrix has no more genes. You should put less stringent thresholds.")
   
-  # Preparing JSON for filtering using the Java software
+  # Preparing JSON for filtering with filter.v8.py (Python port of ASAP.jar -T FilterRows)
   stats = list() 
   stats$kept_genes = as.numeric(data.DE.Genes$Gene) - 1
   write(jsonlite::toJSON(stats, method="C", auto_unbox=T, digits = NA), file = paste0(output_dir,"/to_keep.json"), append=F)
   
-  # Run Java for filtering the rows in the main matrix and all metadata
-  system(paste0("java -jar ASAP.jar -T FilterRows -loom ", input_matrix_filename, " -o ", output_dir, " -m keep -row_names_file ", paste0(output_dir,"/to_keep.json")))
+  # Filter the rows of the main matrix and of all metadata
+  system(paste0("python3 /srv/filter.v8.py -T FilterRows -loom ", input_matrix_filename, " -o ", output_dir, " -m keep -row_names_file ", paste0(output_dir,"/to_keep.json")))
 } else error.json("This filtering method is not implemented")
 
 # Check generated JSON file, and add stuff to it
